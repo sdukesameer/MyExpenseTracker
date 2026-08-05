@@ -1,570 +1,940 @@
 <!DOCTYPE html>
-
 <html lang="en">
 
-    <head>
-        <meta charset="utf-8" />
-        <meta content="width=device-width, initial-scale=1.0" name="viewport" />
-        <title>Expense Tracker</title>
-        <!-- Favicon and Touch Icons Setup -->
-        <link href="/icons/favicon.ico" rel="icon" type="image/x-icon" />
-        <link href="/icons/favicon.ico" rel="shortcut icon" type="image/x-icon" />
-        <link href="/icons/favicon-32x32.png" rel="icon" sizes="32x32" type="image/png" />
-        <link href="/icons/favicon-16x16.png" rel="icon" sizes="16x16" type="image/png" />
-        <link href="/icons/apple-touch-icon.png" rel="apple-touch-icon" sizes="180x180" />
-        <link href="/icons/apple-touch-icon-152x152.png" rel="apple-touch-icon" sizes="152x152" />
-        <link href="/icons/apple-touch-icon-120x120.png" rel="apple-touch-icon" sizes="120x120" />
-        <link href="/icons/apple-touch-icon-76x76.png" rel="apple-touch-icon" sizes="76x76" />
-        <link href="/icons/android-chrome-192x192.png" rel="icon" sizes="192x192" type="image/png" />
-        <link href="/icons/android-chrome-512x512.png" rel="icon" sizes="512x512" type="image/png" />
-        <meta content="yes" name="mobile-web-app-capable" />
-        <meta content="yes" name="apple-mobile-web-app-capable" />
-        <meta content="black-translucent" name="apple-mobile-web-app-status-bar-style" />
-        <meta content="Expense Tracker" name="apple-mobile-web-app-title" />
-        <!-- End Favicon Setup -->
-        <link href="./manifest.json" rel="manifest" />
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-        <script src="https://unpkg.com/@supabase/supabase-js@2.39.0/dist/umd/supabase.js"></script>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-        <link href="style.css" rel="stylesheet" />
-    </head>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover" />
+    <title>Expense Tracker</title>
+    <meta name="description" content="Track your expenses with style and precision" />
 
-    <body>
-        <!-- Theme Toggle -->
-        <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">
-            <span id="theme-icon">🌙</span>
+    <!-- Status bar / theme colours (Safari + Chrome) -->
+    <meta name="theme-color" content="#f4f5fb" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0f1117" media="(prefers-color-scheme: dark)" />
+
+    <!-- Favicon and Touch Icons -->
+    <link href="/icons/favicon.ico" rel="icon" type="image/x-icon" />
+    <link href="/icons/favicon.ico" rel="shortcut icon" type="image/x-icon" />
+    <link href="/icons/favicon-32x32.png" rel="icon" sizes="32x32" type="image/png" />
+    <link href="/icons/favicon-16x16.png" rel="icon" sizes="16x16" type="image/png" />
+    <link href="/icons/apple-touch-icon.png" rel="apple-touch-icon" sizes="180x180" />
+    <link href="/icons/apple-touch-icon-152x152.png" rel="apple-touch-icon" sizes="152x152" />
+    <link href="/icons/apple-touch-icon-120x120.png" rel="apple-touch-icon" sizes="120x120" />
+    <link href="/icons/apple-touch-icon-76x76.png" rel="apple-touch-icon" sizes="76x76" />
+    <link href="/icons/android-chrome-192x192.png" rel="icon" sizes="192x192" type="image/png" />
+    <link href="/icons/android-chrome-512x512.png" rel="icon" sizes="512x512" type="image/png" />
+
+    <meta content="yes" name="mobile-web-app-capable" />
+    <meta content="yes" name="apple-mobile-web-app-capable" />
+    <meta content="default" name="apple-mobile-web-app-status-bar-style" />
+    <meta content="Expense Tracker" name="apple-mobile-web-app-title" />
+    <link href="./manifest.json" rel="manifest" />
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script src="https://unpkg.com/@supabase/supabase-js@2.39.0/dist/umd/supabase.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <link href="style.css?v=1.1.0" rel="stylesheet" />
+</head>
+
+<body>
+    <!-- Decorative background -->
+    <div class="app-backdrop" aria-hidden="true"></div>
+
+    <!-- Icon sprite -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+        <defs>
+            <symbol id="i-sun" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+            </symbol>
+            <symbol id="i-moon" viewBox="0 0 24 24">
+                <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+            </symbol>
+            <symbol id="i-book" viewBox="0 0 24 24">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+            </symbol>
+            <symbol id="i-plus" viewBox="0 0 24 24">
+                <path d="M12 5v14M5 12h14" />
+            </symbol>
+            <symbol id="i-pencil" viewBox="0 0 24 24">
+                <path d="m18 2 4 4-14 14H4v-4L18 2z" />
+                <path d="M14.5 5.5 18.5 9.5" />
+            </symbol>
+            <symbol id="i-minus" viewBox="0 0 24 24">
+                <path d="M5 12h14" />
+            </symbol>
+            <symbol id="i-trash" viewBox="0 0 24 24">
+                <path d="M3 6h18M8 6V4h8v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                <path d="M10 11v6M14 11v6" />
+            </symbol>
+            <symbol id="i-copy" viewBox="0 0 24 24">
+                <rect x="9" y="9" width="12" height="12" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </symbol>
+            <symbol id="i-check" viewBox="0 0 24 24">
+                <path d="m20 6-11 11-5-5" />
+            </symbol>
+            <symbol id="i-close" viewBox="0 0 24 24">
+                <path d="M18 6 6 18M6 6l12 12" />
+            </symbol>
+            <symbol id="i-search" viewBox="0 0 24 24">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+            </symbol>
+            <symbol id="i-chart" viewBox="0 0 24 24">
+                <path d="M3 3v18h18" />
+                <path d="M7 15l4-5 3 3 5-7" />
+            </symbol>
+            <symbol id="i-wallet" viewBox="0 0 24 24">
+                <path d="M3 7a2 2 0 0 1 2-2h13v4" />
+                <path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2H5a2 2 0 0 1-2-2z" />
+                <circle cx="17" cy="14" r="1.2" fill="currentColor" stroke="none" />
+            </symbol>
+        </defs>
+    </svg>
+
+    <!-- Floating utility buttons -->
+    <div class="floating-actions">
+        <button class="icon-btn icon-btn-float theme-toggle" onclick="toggleTheme()" title="Toggle theme"
+            aria-label="Toggle dark mode">
+            <svg class="icon" id="theme-icon"><use href="#i-moon" /></svg>
         </button>
-        <!-- Documentation Link -->
-        <a class="docs-toggle" href="https://github.com/sdukesameer/myExpenseTracker/blob/main/README.md"
-            id="docs-toggle" target="_blank" title="View Documentation">
-            <span>📚</span>
+        <a class="icon-btn icon-btn-float docs-toggle"
+            href="https://github.com/sdukesameer/myExpenseTracker/blob/main/README.md" id="docs-toggle"
+            target="_blank" rel="noopener" title="View documentation" aria-label="View documentation">
+            <svg class="icon"><use href="#i-book" /></svg>
         </a>
-        <!-- Loading Spinner -->
-        <div class="loading-spinner" id="loading-spinner">
-            <div class="spinner"></div>
-            <p>Loading your account...</p>
+    </div>
+
+    <!-- Loading Spinner -->
+    <div class="loading-spinner" id="loading-spinner">
+        <div class="spinner"></div>
+        <p>Loading your account…</p>
+    </div>
+
+    <!-- Notification Container -->
+    <div id="notification-container" aria-live="polite"></div>
+
+    <div class="container">
+        <!-- ============ Sign In ============ -->
+        <div class="auth-container" id="signin-form">
+            <div class="header">
+                <div class="brand-mark"><svg class="icon"><use href="#i-wallet" /></svg></div>
+                <h1>Expense Tracker</h1>
+                <p>Track your expenses with style and precision</p>
+            </div>
+            <div id="signin-alert"></div>
+            <form id="signin">
+                <div class="form-group">
+                    <label for="signin-email">Email</label>
+                    <input autocomplete="email" id="signin-email" required type="email" inputmode="email" />
+                </div>
+                <div class="form-group">
+                    <label for="signin-password">Password</label>
+                    <input autocomplete="current-password" id="signin-password" required type="password" />
+                </div>
+                <button class="btn" type="submit">Sign In</button>
+                <div class="auth-links">
+                    <button class="link-btn" onclick="showForgotPassword()" type="button">Forgot password?</button>
+                    <button class="link-btn" type="button" onclick="demoLogin()">Try the demo</button>
+                    <button class="link-btn" onclick="showSignUp()" type="button">Create an account</button>
+                </div>
+            </form>
         </div>
-        <!-- Notification Container -->
-        <div id="notification-container"></div>
-        <div class="container">
-            <!-- Sign In Form -->
-            <div class="auth-container" id="signin-form">
-                <div class="header">
-                    <h1>💰 Expense Tracker</h1>
-                    <p>Track your expenses with style and precision</p>
-                </div>
-                <div id="signin-alert"></div>
-                <form id="signin">
-                    <div class="form-group">
-                        <label for="signin-email">Email:</label>
-                        <input autocomplete="email" id="signin-email" required="" type="email" />
-                    </div>
-                    <div class="form-group">
-                        <label for="signin-password">Password:</label>
-                        <input autocomplete="current-password" id="signin-password" required="" type="password" />
-                    </div>
-                    <button class="btn" type="submit">Sign In</button>
-                    <button class="link-btn" onclick="showForgotPassword()" type="button">Forgot Password?</button>
-                    <button class="link-btn" type="button" onclick="demoLogin()">Demo Now! Click here</button>
-                    <button class="link-btn" onclick="showSignUp()" type="button">Don't have an account? Sign Up</button>
-                </form>
+
+        <!-- ============ Sign Up ============ -->
+        <div class="auth-container hidden" id="signup-form">
+            <div class="header">
+                <div class="brand-mark"><svg class="icon"><use href="#i-wallet" /></svg></div>
+                <h1>Create Account</h1>
+                <p>Join us to start tracking your expenses</p>
             </div>
-            <!-- Sign Up Form -->
-            <div class="auth-container hidden" id="signup-form">
-                <div class="header">
-                    <h1>💰 Create Account</h1>
-                    <p>Join us to start tracking your expenses</p>
+            <div id="signup-alert"></div>
+            <form id="signup">
+                <div class="form-group">
+                    <label for="signup-name">Full name</label>
+                    <input autocomplete="name" id="signup-name" required type="text" />
                 </div>
-                <div id="signup-alert"></div>
-                <form id="signup">
-                    <div class="form-group">
-                        <label for="signup-name">Full Name:</label>
-                        <input autocomplete="name" id="signup-name" required="" type="text" />
-                    </div>
-                    <div class="form-group">
-                        <label for="signup-email">Email:</label>
-                        <input autocomplete="email" id="signup-email" required="" type="email" />
-                    </div>
-                    <div class="form-group">
-                        <label for="signup-password">Password:</label>
-                        <input autocomplete="new-password" id="signup-password" minlength="6" required=""
-                            type="password" />
-                    </div>
-                    <div class="form-group">
-                        <label for="signup-confirm-password">Confirm Password:</label>
-                        <input autocomplete="new-password" id="signup-confirm-password" minlength="6" required=""
-                            type="password" />
-                    </div>
-                    <button class="btn" type="submit">Create Account</button>
-                    <button class="link-btn" onclick="showSignIn()" type="button">Already have an account? Sign
-                        In</button>
-                </form>
+                <div class="form-group">
+                    <label for="signup-email">Email</label>
+                    <input autocomplete="email" id="signup-email" required type="email" inputmode="email" />
+                </div>
+                <div class="form-group">
+                    <label for="signup-password">Password</label>
+                    <input autocomplete="new-password" id="signup-password" minlength="6" required type="password" />
+                </div>
+                <div class="form-group">
+                    <label for="signup-confirm-password">Confirm password</label>
+                    <input autocomplete="new-password" id="signup-confirm-password" minlength="6" required
+                        type="password" />
+                </div>
+                <button class="btn" type="submit">Create Account</button>
+                <div class="auth-links">
+                    <button class="link-btn" onclick="showSignIn()" type="button">Already have an account? Sign in</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- ============ Forgot Password ============ -->
+        <div class="auth-container hidden" id="forgot-password-form">
+            <div class="header">
+                <div class="brand-mark">🔐</div>
+                <h1>Reset Password</h1>
+                <p>Enter your email to receive a reset link</p>
             </div>
-            <!-- Forgot Password Form -->
-            <div class="auth-container hidden" id="forgot-password-form">
-                <div class="header">
-                    <h1>🔐 Reset Password</h1>
-                    <p>Enter your email to receive a password reset</p>
+            <div id="forgot-alert"></div>
+            <form id="forgot-password">
+                <div class="form-group">
+                    <label for="forgot-email">Email</label>
+                    <input autocomplete="email" id="forgot-email" required type="email" inputmode="email" />
                 </div>
-                <div id="forgot-alert"></div>
-                <form id="forgot-password">
-                    <div class="form-group">
-                        <label for="forgot-email">Email:</label>
-                        <input autocomplete="email" id="forgot-email" required="" type="email" />
-                    </div>
-                    <button class="btn" type="submit">Send Reset Password</button>
-                    <button class="link-btn" onclick="showSignIn()" type="button">Back to Sign In</button>
-                </form>
+                <button class="btn" type="submit">Send Reset Link</button>
+                <div class="auth-links">
+                    <button class="link-btn" onclick="showSignIn()" type="button">Back to sign in</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- ============ Password Reset ============ -->
+        <div class="auth-container hidden" id="password-reset-form">
+            <div class="header">
+                <div class="brand-mark">🔐</div>
+                <h1>Set New Password</h1>
+                <p>Enter your new password below</p>
             </div>
-            <!-- Password Reset Form -->
-            <div class="auth-container hidden" id="password-reset-form">
-                <div class="header">
-                    <h1>🔐 Set New Password</h1>
-                    <p>Enter your new password below</p>
+            <div id="reset-alert"></div>
+            <form id="password-reset" onsubmit="handlePasswordReset(event)">
+                <div class="form-group">
+                    <label for="reset-password">New password</label>
+                    <input autocomplete="new-password" id="reset-password" minlength="6" required type="password" />
                 </div>
-                <div id="reset-alert"></div>
-                <form id="password-reset" onsubmit="handlePasswordReset(event)">
-                    <div class="form-group">
-                        <label for="reset-password">New Password:</label>
-                        <input autocomplete="new-password" id="reset-password" minlength="6" required=""
-                            type="password" />
+                <div class="form-group">
+                    <label for="reset-confirm-password">Confirm new password</label>
+                    <input autocomplete="new-password" id="reset-confirm-password" minlength="6" required
+                        type="password" />
+                </div>
+                <button class="btn" type="submit">Update Password</button>
+            </form>
+        </div>
+
+        <!-- ============ Dashboard ============ -->
+        <div class="dashboard" id="dashboard">
+            <div class="dashboard-header">
+                <div class="user-info-text">
+                    <h2 id="user-name">Welcome Back!</h2>
+                    <p id="user-email"></p>
+                </div>
+                <div class="user-menu-wrap">
+                    <button class="user-avatar" id="user-avatar" onclick="toggleUserMenu(event)"
+                        aria-haspopup="true" aria-expanded="false">U</button>
+                    <div class="user-menu" id="user-menu" role="menu">
+                        <button class="user-menu-item" onclick="showEditProfile(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">👤</span> Edit Profile
+                        </button>
+                        <button class="user-menu-item" onclick="showInsightsModal(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">📊</span> Spending Insights
+                        </button>
+                        <button class="user-menu-item" onclick="showRecurringModal(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">🔁</span> Recurring Expenses
+                        </button>
+                        <button class="user-menu-item" onclick="showImportExpenses(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">📥</span> Import Expenses
+                        </button>
+                        <button class="user-menu-item" onclick="showSettingsModal(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">⚙️</span> Settings
+                        </button>
+                        <button class="user-menu-item" onclick="showChangePassword(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">🔐</span> Change Password
+                        </button>
+                        <div class="user-menu-sep"></div>
+                        <button class="user-menu-item danger" onclick="logout(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">🚪</span> Logout
+                        </button>
                     </div>
-                    <div class="form-group">
-                        <label for="reset-confirm-password">Confirm New Password:</label>
-                        <input autocomplete="new-password" id="reset-confirm-password" minlength="6" required=""
-                            type="password" />
-                    </div>
-                    <button class="btn" type="submit">Update Password</button>
-                </form>
+                </div>
             </div>
-            <!-- Dashboard -->
-            <div class="dashboard" id="dashboard">
-                <div class="dashboard-header">
-                    <div class="user-avatar" id="user-avatar" onclick="toggleUserMenu()">U</div>
-                    <div class="user-info-text">
-                        <h2 id="user-name">Welcome Back!</h2>
-                        <p id="user-email"></p>
+
+            <!-- ============ Budget ============ -->
+            <section class="budget-tracker" aria-labelledby="budget-header">
+                <div class="section-head">
+                    <h3 id="budget-header">Monthly Budget</h3>
+                    <button class="btn btn-small btn-ghost-light" id="budget-set-btn" onclick="setBudget()">Set
+                        Budget</button>
+                </div>
+
+                <!-- Total budget hero -->
+                <div class="budget-hero" id="total-budget-card">
+                    <div class="budget-hero-top">
+                        <div>
+                            <div class="budget-hero-label">Total spent</div>
+                            <div class="budget-hero-value" id="total-budget-spent">₹0</div>
+                        </div>
+                        <div class="budget-hero-right">
+                            <div class="budget-hero-label">Total budget</div>
+                            <div class="budget-hero-sub" id="total-budget-total">₹0</div>
+                        </div>
                     </div>
-                    <!-- User menu dropdown -->
-                    <div class="user-menu" id="user-menu" style="display: none;">
-                        <button class="user-menu-item" onclick="showEditProfile(); toggleUserMenu();">
-                            <span>👤</span> Edit Profile
-                        </button>
-                        <button class="user-menu-item" onclick="showInsightsModal(); toggleUserMenu();">
-                            <span>📊</span> Spending Insights
-                        </button>
-                        <button class="user-menu-item" onclick="showImportExpenses(); toggleUserMenu();">
-                            <span>📥</span> Import Expenses
-                        </button>
-                        <button class="user-menu-item" onclick="showChangePassword(); toggleUserMenu();">
-                            <span>🔐</span> Change Password
-                        </button>
-                        <button class="user-menu-item" onclick="logout(); toggleUserMenu();">
-                            <span>🚪</span> Logout
-                        </button>
+                    <div class="budget-progress budget-progress-lg">
+                        <div class="budget-progress-bar" id="total-budget-progress-bar" style="width: 0%"></div>
+                    </div>
+                    <div class="budget-hero-foot">
+                        <span id="total-budget-remaining">Remaining: ₹0</span>
+                        <span id="total-budget-pace" class="budget-pace"></span>
                     </div>
                 </div>
-                <!-- Statistics -->
-                <div class="stats">
-                    <div class="stat-card">
-                        <div class="stat-value" id="total-expenses">₹0</div>
-                        <div class="stat-label">Last Month</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value" id="monthly-expenses">₹0</div>
-                        <div class="stat-label">This Month</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value" id="expense-count">0</div>
-                        <div class="stat-label">Total Transactions</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value" id="billed-expenses">₹0</div>
-                        <div class="stat-label">Billed Expenses</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value" id="unbilled-expenses">₹0</div>
-                        <div class="stat-label">UnBilled Expenses</div>
-                    </div>
-                </div>
-                <!-- Budget Tracker -->
-                <div class="budget-tracker">
-                    <div
-                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3 id="budget-header">Monthly Budget</h3>
-                        <button class="btn btn-small" onclick="setBudget()">Set Budget</button>
-                    </div>
-                    <!-- Billed Budget -->
-                    <div style="margin-bottom: 1.5rem;">
-                        <h4 style="font-size: 0.9rem; margin-bottom: 0.5rem; color: #2d3436;">Billed Budget</h4>
+
+                <div class="budget-split" id="budget-split">
+                    <div class="budget-block" id="billed-budget-block">
+                        <div class="budget-block-head">
+                            <h4>Billed</h4>
+                            <span id="billed-budget-total">Budget: ₹0</span>
+                        </div>
                         <div class="budget-progress">
                             <div class="budget-progress-bar" id="billed-budget-progress-bar" style="width: 0%"></div>
                         </div>
-                        <div style="display: flex; justify-content: space-between; font-size: 0.9rem;">
-                            <span id="billed-budget-remaining">Billed Remaining: ₹0</span>
-                            <span id="billed-budget-total">Billed Budget: ₹0</span>
-                        </div>
+                        <div class="budget-block-foot"><span id="billed-budget-remaining">Remaining: ₹0</span></div>
                     </div>
-                    <!-- Unbilled Budget -->
-                    <div>
-                        <h4 style="font-size: 0.9rem; margin-bottom: 0.5rem; color: #2d3436;">Unbilled Budget</h4>
+                    <div class="budget-block" id="unbilled-budget-block">
+                        <div class="budget-block-head">
+                            <h4>Unbilled</h4>
+                            <span id="unbilled-budget-total">Budget: ₹0</span>
+                        </div>
                         <div class="budget-progress">
                             <div class="budget-progress-bar" id="unbilled-budget-progress-bar" style="width: 0%"></div>
                         </div>
-                        <div style="display: flex; justify-content: space-between; font-size: 0.9rem;">
-                            <span id="unbilled-budget-remaining">Unbilled Remaining: ₹0</span>
-                            <span id="unbilled-budget-total">Unbilled Budget: ₹0</span>
-                        </div>
+                        <div class="budget-block-foot"><span id="unbilled-budget-remaining">Remaining: ₹0</span></div>
                     </div>
                 </div>
-                <!-- Add Expense Form -->
-                <div class="expense-form">
-                    <h3 style="margin-bottom: 1.5rem; color: #374151; font-weight: 600;">Add New Expense</h3>
-                    <form id="expense-form">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="note">Note:</label>
-                                <input id="note" required="" placeholder="Summary/Description" type="text" />
-                            </div>
-                        </div>
-                        <div class="form-row two">
-                            <div class="form-group">
-                                <label for="type">Type:</label>
-                                <div class="type-input-container">
-                                    <select id="type" required="">
-                                        <option value="">Select Type</option>
-                                    </select>
-                                    <button class="add-type-btn" onclick="showAddTypeModal()" type="button">+</button>
-                                    <button class="edit-type-btn" onclick="showEditTypeModal()" title="Edit type" type="button">✎</button>
-                                    <button class="delete-type-btn" onclick="showDeleteTypeModal()" title="Delete type" type="button">-</button>
+            </section>
+
+            <!-- ============ Statistics ============ -->
+            <div class="stats">
+                <div class="stat-card accent-primary">
+                    <div class="stat-top"><span class="stat-label">This Month</span></div>
+                    <div class="stat-value-row">
+                        <span class="stat-value" id="monthly-expenses">₹0</span>
+                        <span class="stat-delta" id="month-delta"></span>
+                    </div>
+                </div>
+                <div class="stat-card accent-slate">
+                    <div class="stat-top"><span class="stat-label">Last Month</span></div>
+                    <div class="stat-value" id="total-expenses">₹0</div>
+                </div>
+                <div class="stat-card accent-amber">
+                    <div class="stat-top"><span class="stat-label">Transactions</span></div>
+                    <div class="stat-value" id="expense-count">0</div>
+                </div>
+                <div class="stat-card accent-green" id="stat-billed-card">
+                    <div class="stat-top"><span class="stat-label">Billed</span></div>
+                    <div class="stat-value" id="billed-expenses">₹0</div>
+                </div>
+                <div class="stat-card accent-rose" id="stat-unbilled-card">
+                    <div class="stat-top"><span class="stat-label">Unbilled</span></div>
+                    <div class="stat-value" id="unbilled-expenses">₹0</div>
+                </div>
+            </div>
+
+            <!-- ============ Recurring due ============ -->
+            <section class="card recurring-due" id="recurring-due" style="display: none;">
+                <div class="section-head">
+                    <h3 class="card-title" id="recurring-due-title">Recurring due</h3>
+                    <button class="btn btn-small btn-secondary" type="button"
+                        onclick="showRecurringModal()">Manage</button>
+                </div>
+                <div id="recurring-due-list"></div>
+                <button class="btn" type="button" id="recurring-add-all"
+                    onclick="addAllRecurringDue()">Add all</button>
+            </section>
+
+            <!-- ============ Add Expense ============ -->
+            <section class="expense-form card" id="add-expense-card">
+                <h3 class="card-title">Add New Expense</h3>
+
+                <div class="quick-add" id="quick-add">
+                    <label class="sr-only" for="quick-add-input">Quick add</label>
+                    <div class="quick-add-field">
+                        <span class="quick-add-bolt" aria-hidden="true">⚡</span>
+                        <input id="quick-add-input" type="text" autocomplete="off"
+                            placeholder="450 lunch swiggy" />
+                        <button type="button" class="btn btn-small" id="quick-add-submit"
+                            onclick="submitQuickAdd()">Add</button>
+                    </div>
+                    <div class="quick-add-preview" id="quick-add-preview" aria-live="polite"></div>
+                    <div class="preset-row" id="preset-row" style="display: none;">
+                        <div class="recent-types-label">One-tap add</div>
+                        <div class="preset-chips" id="preset-chips"></div>
+                    </div>
+                </div>
+
+                <div class="form-divider"><span>or fill in the details</span></div>
+
+                <form id="expense-form">
+                    <div class="form-group">
+                        <label for="note">Note</label>
+                        <input id="note" required placeholder="Summary / description" type="text" maxlength="500"
+                            autocomplete="off" />
+                    </div>
+                    <div class="form-row two">
+                        <div class="form-group">
+                            <label for="type">Type</label>
+                            <div class="type-input-container">
+                                <select id="type" required>
+                                    <option value="">Select Type</option>
+                                </select>
+                                <div class="type-actions">
+                                    <button class="icon-btn tone-green" onclick="showAddTypeModal()" type="button"
+                                        title="Add type" aria-label="Add type">
+                                        <svg class="icon"><use href="#i-plus" /></svg>
+                                    </button>
+                                    <button class="icon-btn tone-indigo" onclick="showEditTypeModal()" type="button"
+                                        title="Edit type" aria-label="Edit type">
+                                        <svg class="icon"><use href="#i-pencil" /></svg>
+                                    </button>
+                                    <button class="icon-btn tone-red" onclick="showDeleteTypeModal()" type="button"
+                                        title="Delete type" aria-label="Delete type">
+                                        <svg class="icon"><use href="#i-minus" /></svg>
+                                    </button>
                                 </div>
                             </div>
-                            <div class="form-group" id="recent-types-row" style="display: none;">
-                                <div class="recent-types-label">Quick select:</div>
-                                <div class="recent-types-bubbles" id="recent-types-bubbles"></div>
-                            </div>
-                            <div class="form-group">
-                                <label for="amount">Amount (₹):</label>
-                                <input id="amount" min="0" required="" step="0.01" type="number" />
-                            </div>
+                        </div>
+                        <div class="form-group" id="recent-types-row" style="display: none;">
+                            <div class="recent-types-label">Quick select</div>
+                            <div class="recent-types-bubbles" id="recent-types-bubbles"></div>
                         </div>
                         <div class="form-group">
-                            <label for="date">Date:</label>
-                            <input id="date" onchange="updateDateDisplay()" required="" type="date" />
-                            <div id="date-display" style="font-size: 0.9rem; color: #6b7280; margin-top: 0.5rem;"></div>
+                            <label for="amount">Amount (₹)</label>
+                            <!-- type=text, not number: a number input silently rejects
+                                 "120+80+45", which would kill the calculator. inputmode
+                                 keeps the numeric keypad on iOS. -->
+                            <input id="amount" required type="text" inputmode="decimal"
+                                autocomplete="off" placeholder="0 — or 120+80+45" />
+                            <div class="amount-chips" id="amount-chips"></div>
                         </div>
-                        <div class="form-group">
-                            <label style="margin-bottom: 1rem;">Billing Status:</label>
-                            <div style="display: flex; align-items: center; gap: 1rem;">
-                                <span style="font-size: 0.9rem; color: #374151; font-weight: 500;">Unbilled</span>
-                                <div class="billed-toggle" id="form-billed-toggle" onclick="toggleFormBilling()">
-                                </div>
-                                <span style="font-size: 0.9rem; color: #374151; font-weight: 500;">Billed</span>
-                                <input id="billed" style="display: none;" type="checkbox" />
+                    </div>
+                    <div class="form-group">
+                        <label for="date">Date</label>
+                        <div class="date-row">
+                            <input id="date" onchange="updateDateDisplay()" required type="date" />
+                            <div class="date-shortcuts">
+                                <button type="button" class="chip" onclick="setDateOffset(0)">Today</button>
+                                <button type="button" class="chip" onclick="setDateOffset(-1)">Yesterday</button>
                             </div>
                         </div>
-                        <button class="btn" type="submit">Add Expense</button>
-                    </form>
-                </div>
-                <!-- Expenses List -->
-                <div class="expenses-list">
-                    <div class="expenses-header">
-                        <h3>Recent Expenses</h3>
-                        <button class="btn btn-visualize" onclick="showVisualizationModal()">📊 Edit /
-                            Analytics</button>
+                        <div id="date-display" class="date-display"></div>
                     </div>
-                    <div id="expenses-container">
-                        <p style="text-align: center; color: #9ca3af; padding: 3rem;">No expenses added yet. Add your
-                            first expense above!</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <!-- Change Password Modal -->
-        <div class="modal" id="change-password-modal">
-            <div class="modal-content">
-                <button class="close-modal" onclick="closeChangePasswordModal()">×</button>
-                <h3 style="margin-bottom: 1.5rem; color: #374151;">Change Password</h3>
-                <div id="change-password-alert"></div>
-                <form id="change-password-form">
-                    <div class="form-group">
-                        <label for="new-password">New Password:</label>
-                        <input autocomplete="new-password" id="new-password" minlength="6" required=""
-                            type="password" />
-                    </div>
-                    <div class="form-group">
-                        <label for="confirm-new-password">Confirm New Password:</label>
-                        <input autocomplete="new-password" id="confirm-new-password" minlength="6" required=""
-                            type="password" />
-                    </div>
-                    <button class="btn" type="submit">Change Password</button>
-                </form>
-            </div>
-        </div>
-        <!-- Import Expenses Modal -->
-        <div class="modal" id="import-expenses-modal">
-            <div class="modal-content" style="max-width: 850px;">
-                <button class="close-modal" onclick="closeImportExpensesModal()">×</button>
-                <h3 style="margin-bottom: 1rem; color: #374151;">Import Expenses</h3>
-
-                <!-- Step 1: Instructions + Upload -->
-                <div id="import-step-upload">
-                    <div class="import-instructions">
-                        <p style="margin-bottom: 0.5rem;"><strong>File format:</strong> the first row (header) must
-                            contain exactly these columns, in any order:</p>
-                        <div class="import-header-pills">
-                            <span class="header-pill">Note</span>
-                            <span class="header-pill">Type</span>
-                            <span class="header-pill">Amount</span>
-                            <span class="header-pill">Date</span>
-                            <span class="header-pill">Billed/Unbilled</span>
+                    <div class="form-group" id="billing-status-group">
+                        <label>Billing status</label>
+                        <div class="billing-row">
+                            <span class="billing-side">Unbilled</span>
+                            <div class="billed-toggle" id="form-billed-toggle" onclick="toggleFormBilling()"
+                                role="switch" tabindex="0" aria-checked="false" aria-label="Billed"></div>
+                            <span class="billing-side">Billed</span>
+                            <input id="billed" style="display: none;" type="checkbox" />
                         </div>
-                        <p style="margin: 0.75rem 0 0;">Date should be in <code>DD/MM/YYYY</code> format, Amount as a
-                            whole number (no decimals), and Billed/Unbilled as <code>Billed</code> or
-                            <code>Unbilled</code>.
-                        </p>
-                        <a href="#" id="download-sample-csv" class="sample-csv-link">⬇ Download sample CSV</a>
                     </div>
-
-                    <div id="import-alert"></div>
-
-                    <div class="import-dropzone" id="import-dropzone">
-                        <input type="file" id="import-file-input" accept=".csv,.xlsx,.xls" hidden />
-                        <div class="import-dropzone-icon">📄</div>
-                        <p><strong>Click to choose a file</strong> or drag &amp; drop</p>
-                        <p style="font-size: 0.8rem; color: #9ca3af;">CSV, XLSX or XLS</p>
-                    </div>
-                </div>
-
-                <!-- Step 2: Loading / progress -->
-                <div id="import-step-progress" style="display: none;">
-                    <p id="import-progress-label" style="font-weight: 600; color: #374151; margin-bottom: 0.75rem;">
-                        Importing row 0 of 0…</p>
-                    <div class="budget-progress">
-                        <div class="budget-progress-bar" id="import-progress-bar" style="width: 0%"></div>
-                    </div>
-                    <div class="import-progress-stats">
-                        <span id="import-progress-success" class="import-stat success">✓ 0 valid</span>
-                        <span id="import-progress-failed" class="import-stat failed">✕ 0 failed</span>
-                    </div>
-                </div>
-
-                <!-- Step 3: Preview / review -->
-                <div id="import-step-review" style="display: none;">
-                    <div class="import-summary-banner" id="import-summary-banner"></div>
-                    <div class="import-preview-table-wrapper">
-                        <table class="import-preview-table">
-                            <thead>
-                                <tr>
-                                    <th>Status</th>
-                                    <th>Note</th>
-                                    <th>Type</th>
-                                    <th>Amount</th>
-                                    <th>Date</th>
-                                    <th>Billed</th>
-                                    <th>Issue</th>
-                                </tr>
-                            </thead>
-                            <tbody id="import-preview-body"></tbody>
-                        </table>
-                    </div>
-                    <p style="font-size: 0.85rem; color: #6b7280; margin: 0.75rem 0 1rem;">Only rows marked ✓ Valid
-                        will be uploaded. Fix and re-upload the file if you'd like to correct failed rows first.</p>
-                    <div class="import-review-actions">
-                        <button class="btn btn-secondary" type="button" onclick="cancelImportReview()">Cancel</button>
-                        <button class="btn" type="button" id="confirm-import-btn"
-                            onclick="confirmImportUpload()">Confirm &amp; Upload Valid Rows</button>
-                    </div>
-                </div>
-
-                <!-- Step 4: Final summary -->
-                <div id="import-step-done" style="display: none;">
-                    <div class="import-done-icon">✅</div>
-                    <h4 id="import-done-title" style="text-align: center; color: #374151;">Import complete</h4>
-                    <p id="import-done-summary" style="text-align: center; color: #6b7280;"></p>
-                    <button class="btn" type="button" onclick="closeImportExpensesModal()">Done</button>
-                </div>
-            </div>
-        </div>
-        <!-- Edit Profile Modal -->
-        <div class="modal" id="edit-profile-modal">
-            <div class="modal-content">
-                <button class="close-modal" onclick="closeEditProfileModal()">×</button>
-                <h3 style="margin-bottom: 1.5rem; color: #374151;">Edit Profile</h3>
-                <div id="edit-profile-alert"></div>
-                <form id="edit-profile-form">
-                    <div class="form-group">
-                        <label for="profile-name">Full Name:</label>
-                        <input autocomplete="name" id="profile-name" required="" type="text" />
-                    </div>
-                    <div class="form-group">
-                        <label for="profile-email">Email:</label>
-                        <input autocomplete="email" id="profile-email" required="" type="email" />
-                    </div>
-                    <button class="btn btn-profile-save" id="save-profile-btn" style="display: none;" type="submit">Save
-                        Changes</button>
+                    <button class="btn" type="submit" id="add-expense-btn">Add Expense</button>
                 </form>
-            </div>
-        </div>
-        <!-- Insights Modal -->
-        <div id="insights-modal" class="modal" style="display: none;">
-            <div class="modal-content" style="max-width: 800px;">
-                <span class="close-modal" onclick="closeInsightsModal()">&times;</span>
-                <h3>Spending Insights</h3>
-                <div id="insights-content"></div>
-            </div>
-        </div>
-        <!-- Add Type Modal -->
-        <div class="modal" id="add-type-modal">
-            <div class="modal-content">
-                <button class="close-modal" onclick="closeAddTypeModal()">×</button>
-                <h3 style="margin-bottom: 1.5rem; color: #374151;">Add New Type</h3>
-                <div id="type-alert"></div>
-                <form id="add-type-form">
-                    <div class="form-group">
-                        <label for="new-type">Type Name:</label>
-                        <input id="new-type" placeholder="e.g., Groceries, Fuel, Entertainment" required=""
-                            type="text" />
-                    </div>
-                    <button class="btn" style="background: linear-gradient(135deg, #10b981, #059669);" type="submit">Add
-                        Type</button>
-                </form>
-            </div>
-        </div>
-        <!-- Edit Type Modal -->
-        <div class="modal" id="edit-type-modal">
-            <div class="modal-content">
-                <button class="close-modal" onclick="closeEditTypeModal()">×</button>
-                <h3 style="margin-bottom: 1.5rem; color: #374151;">Edit Expense Type</h3>
-                <div id="edit-type-alert"></div>
-                <form id="edit-type-form">
-                    <div class="form-group">
-                        <label for="edit-type-select">Select Type to Edit:</label>
-                        <select id="edit-type-select" onchange="populateEditField()" required="">
-                            <option value="">Select Type</option>
+            </section>
+
+            <!-- ============ Expenses List ============ -->
+            <section class="expenses-list card">
+                <div class="expenses-header">
+                    <h3 class="card-title">Recent Expenses</h3>
+                    <div class="expenses-header-actions">
+                        <select id="recent-limit" class="mini-select" onchange="loadExpenses()"
+                            aria-label="Number of recent expenses">
+                            <option value="5">Last 5</option>
+                            <option value="10">Last 10</option>
+                            <option value="25">Last 25</option>
                         </select>
+                        <button class="btn btn-small btn-success" onclick="showVisualizationModal()">
+                            <svg class="icon"><use href="#i-chart" /></svg> Edit / Analytics
+                        </button>
                     </div>
-                    <div class="form-group">
-                        <label for="edit-type-name">New Type Name:</label>
-                        <input id="edit-type-name" placeholder="Enter new type name" required="" type="text" />
+                </div>
+                <div id="expenses-container"></div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Mobile quick-add -->
+    <button class="fab" id="fab-add" onclick="focusAddExpense()" aria-label="Add expense">
+        <svg class="icon"><use href="#i-plus" /></svg>
+    </button>
+
+    <!-- ============ Settings Modal ============ -->
+    <div class="modal" id="settings-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeSettingsModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Settings</h3>
+            <div id="settings-alert"></div>
+
+            <div class="setting-row">
+                <div class="setting-copy">
+                    <div class="setting-title">Track billed / unbilled separately</div>
+                    <p class="setting-desc">Turn this off for a simpler tracker: one total budget, no billing
+                        status anywhere. Existing expenses are kept, and new ones are saved as unbilled.</p>
+                </div>
+                <button type="button" class="switch" id="setting-track-billing"
+                    onclick="toggleTrackBilling()" role="switch" aria-checked="true"
+                    aria-label="Track billed and unbilled separately"></button>
+            </div>
+
+            <div class="setting-row">
+                <div class="setting-copy">
+                    <div class="setting-title">Default new expenses to billed</div>
+                    <p class="setting-desc">Pre-selects "Billed" on the add-expense form.</p>
+                </div>
+                <button type="button" class="switch" id="setting-default-billed"
+                    onclick="toggleDefaultBilled()" role="switch" aria-checked="false"
+                    aria-label="Default new expenses to billed"></button>
+            </div>
+
+            <div class="setting-row">
+                <div class="setting-copy">
+                    <div class="setting-title">Budget alerts</div>
+                    <p class="setting-desc">Configured per level under
+                        <button type="button" class="link-inline"
+                            onclick="closeSettingsModal(); setBudget(); switchBudgetTab('alerts');">Budget →
+                            Alerts</button>.
+                    </p>
+                </div>
+            </div>
+
+            <div class="setting-row">
+                <div class="setting-copy">
+                    <div class="setting-title">Full backup</div>
+                    <p class="setting-desc">Every expense, type, budget and recurring rule as one JSON
+                        file — unlike the CSV export, nothing is filtered out.</p>
+                </div>
+                <button type="button" class="btn btn-small btn-secondary" id="backup-btn"
+                    onclick="downloadFullBackup()">Download backup</button>
+            </div>
+
+            <p class="setting-footnote">Settings are saved to your account when available, and always kept on
+                this device.</p>
+        </div>
+    </div>
+
+    <!-- ============ Change Password Modal ============ -->
+    <div class="modal" id="change-password-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeChangePasswordModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Change Password</h3>
+            <div id="change-password-alert"></div>
+            <form id="change-password-form">
+                <div class="form-group">
+                    <label for="new-password">New password</label>
+                    <input autocomplete="new-password" id="new-password" minlength="6" required type="password" />
+                </div>
+                <div class="form-group">
+                    <label for="confirm-new-password">Confirm new password</label>
+                    <input autocomplete="new-password" id="confirm-new-password" minlength="6" required
+                        type="password" />
+                </div>
+                <button class="btn" type="submit">Change Password</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ============ Import Expenses Modal ============ -->
+    <div class="modal" id="import-expenses-modal">
+        <div class="modal-content" style="max-width: 850px;">
+            <button class="close-modal" onclick="closeImportExpensesModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Import Expenses</h3>
+
+            <div id="import-step-upload">
+                <div class="import-instructions">
+                    <p><strong>File format:</strong> the first row (header) must contain exactly these columns, in
+                        any order:</p>
+                    <div class="import-header-pills" id="import-header-pills">
+                        <span class="header-pill">Note</span>
+                        <span class="header-pill">Type</span>
+                        <span class="header-pill">Amount</span>
+                        <span class="header-pill">Date</span>
+                        <span class="header-pill" id="import-pill-billed">Billed/Unbilled</span>
                     </div>
-                    <button class="btn" style="background: linear-gradient(135deg, #667eea, #764ba2);"
-                        type="submit">Update Type</button>
-                </form>
+                    <p style="margin: 0.75rem 0 0;">Date in <code>DD/MM/YYYY</code> format, Amount as a whole number
+                        (no decimals)<span id="import-billed-hint">, and Billed/Unbilled as <code>Billed</code> or
+                            <code>Unbilled</code></span>.</p>
+                    <a href="#" id="download-sample-csv" class="sample-csv-link">⬇ Download sample CSV</a>
+                </div>
+
+                <div id="import-alert"></div>
+
+                <div class="import-dropzone" id="import-dropzone" tabindex="0" role="button">
+                    <input type="file" id="import-file-input" accept=".csv,.xlsx,.xls" hidden />
+                    <div class="import-dropzone-icon">📄</div>
+                    <p><strong>Click to choose a file</strong> or drag &amp; drop</p>
+                    <p class="muted-sm">CSV, XLSX or XLS</p>
+                </div>
+            </div>
+
+            <div id="import-step-progress" style="display: none;">
+                <p id="import-progress-label" class="import-progress-label">Reading row 0 of 0…</p>
+                <div class="budget-progress">
+                    <div class="budget-progress-bar" id="import-progress-bar" style="width: 0%"></div>
+                </div>
+                <div class="import-progress-stats">
+                    <span id="import-progress-success" class="import-stat success">✓ 0 valid</span>
+                    <span id="import-progress-failed" class="import-stat failed">✕ 0 failed</span>
+                </div>
+            </div>
+
+            <div id="import-step-review" style="display: none;">
+                <div class="import-summary-banner" id="import-summary-banner"></div>
+                <div class="import-preview-table-wrapper">
+                    <table class="import-preview-table">
+                        <thead>
+                            <tr>
+                                <th>Status</th>
+                                <th>Note</th>
+                                <th>Type</th>
+                                <th>Amount</th>
+                                <th>Date</th>
+                                <th class="col-billed">Billed</th>
+                                <th>Issue</th>
+                            </tr>
+                        </thead>
+                        <tbody id="import-preview-body"></tbody>
+                    </table>
+                </div>
+                <p class="muted-sm" style="margin: 0.75rem 0 1rem;">Only rows marked ✓ Valid will be uploaded. Fix
+                    and re-upload the file if you'd like to correct failed rows first.</p>
+                <div class="import-review-actions">
+                    <button class="btn btn-secondary" type="button" onclick="cancelImportReview()">Cancel</button>
+                    <button class="btn" type="button" id="confirm-import-btn" onclick="confirmImportUpload()">Confirm
+                        &amp; Upload Valid Rows</button>
+                </div>
+            </div>
+
+            <div id="import-step-done" style="display: none;">
+                <div class="import-done-icon">✅</div>
+                <h4 id="import-done-title" style="text-align:center;">Import complete</h4>
+                <p id="import-done-summary" class="muted-sm" style="text-align:center;"></p>
+                <button class="btn" type="button" onclick="closeImportExpensesModal()">Done</button>
             </div>
         </div>
-        <!-- Budget Setting Modal -->
-        <div class="modal" id="budget-modal">
-            <div class="modal-content">
-                <button class="close-modal" onclick="closeBudgetModal()">×</button>
-                <h3>Set Monthly Budget</h3>
+    </div>
+
+    <!-- ============ Edit Profile Modal ============ -->
+    <div class="modal" id="edit-profile-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeEditProfileModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Edit Profile</h3>
+            <div id="edit-profile-alert"></div>
+            <form id="edit-profile-form">
+                <div class="form-group">
+                    <label for="profile-name">Full name</label>
+                    <input autocomplete="name" id="profile-name" required type="text" />
+                </div>
+                <div class="form-group">
+                    <label for="profile-email">Email</label>
+                    <input autocomplete="email" id="profile-email" required type="email" inputmode="email" />
+                </div>
+                <button class="btn btn-success" id="save-profile-btn" style="display: none;" type="submit">Save
+                    Changes</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ============ Insights Modal ============ -->
+    <div id="insights-modal" class="modal">
+        <div class="modal-content" style="max-width: 860px;">
+            <button class="close-modal" onclick="closeInsightsModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Spending Insights</h3>
+            <div id="insights-content"></div>
+        </div>
+    </div>
+
+    <!-- ============ Add Type Modal ============ -->
+    <div class="modal" id="add-type-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeAddTypeModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Add New Type</h3>
+            <div id="type-alert"></div>
+            <form id="add-type-form">
+                <div class="form-group">
+                    <label for="new-type">Type name</label>
+                    <input id="new-type" placeholder="e.g. Groceries, Fuel, Entertainment" required type="text"
+                        maxlength="60" />
+                </div>
+                <button class="btn btn-success" type="submit">Add Type</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ============ Edit Type Modal ============ -->
+    <div class="modal" id="edit-type-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeEditTypeModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Edit Expense Type</h3>
+            <div id="edit-type-alert"></div>
+            <form id="edit-type-form">
+                <div class="form-group">
+                    <label for="edit-type-select">Select type to edit</label>
+                    <select id="edit-type-select" onchange="populateEditField()" required>
+                        <option value="">Select Type</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="edit-type-name">New type name</label>
+                    <input id="edit-type-name" placeholder="Enter new type name" required type="text" maxlength="60" />
+                </div>
+                <button class="btn" type="submit">Update Type</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ============ Budget Modal ============ -->
+    <div class="modal" id="budget-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeBudgetModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3 id="budget-modal-title">Set Monthly Budget</h3>
+
+            <div class="tabs" role="tablist">
+                <button type="button" class="tab active" id="budget-tab-btn-amounts" role="tab"
+                    aria-selected="true" onclick="switchBudgetTab('amounts')">Amounts</button>
+                <button type="button" class="tab" id="budget-tab-btn-alerts" role="tab"
+                    aria-selected="false" onclick="switchBudgetTab('alerts')">Alerts</button>
+            </div>
+
+            <div id="budget-tab-amounts">
                 <form id="budget-form">
-                    <div class="form-group">
-                        <label for="billed-budget-amount">Monthly Billed Budget Amount:</label>
-                        <input id="billed-budget-amount" placeholder="Enter your monthly billed budget" required=""
-                            step="0.01" type="number" />
+                    <div class="form-group" id="budget-total-group" style="display:none;">
+                        <label for="total-budget-amount">Monthly budget amount</label>
+                        <input id="total-budget-amount" placeholder="Enter your monthly budget" step="1" min="0"
+                            type="number" inputmode="decimal" />
                     </div>
-                    <div class="form-group">
-                        <label for="unbilled-budget-amount">Monthly Unbilled Budget Amount:</label>
-                        <input id="unbilled-budget-amount" placeholder="Enter your monthly unbilled budget" required=""
-                            step="0.01" type="number" />
+                    <div class="form-group" id="budget-billed-group">
+                        <label for="billed-budget-amount">Monthly billed budget</label>
+                        <input id="billed-budget-amount" placeholder="Enter your monthly billed budget" step="1"
+                            min="0" type="number" inputmode="decimal" />
                     </div>
-                    <button class="btn" type="submit">Set Budget</button>
+                    <div class="form-group" id="budget-unbilled-group">
+                        <label for="unbilled-budget-amount">Monthly unbilled budget</label>
+                        <input id="unbilled-budget-amount" placeholder="Enter your monthly unbilled budget" step="1"
+                            min="0" type="number" inputmode="decimal" />
+                    </div>
+                    <div class="budget-modal-total" id="budget-modal-total"></div>
+                    <button class="btn" type="submit">Save Budget</button>
                 </form>
             </div>
+
+            <div id="budget-tab-alerts" style="display:none;">
+                <div class="setting-row">
+                    <div class="setting-copy">
+                        <div class="setting-title">Budget alerts</div>
+                        <p class="setting-desc">Each level fires one toast per month, the first time you
+                            cross it.</p>
+                    </div>
+                    <button type="button" class="switch" id="setting-budget-alerts"
+                        onclick="toggleBudgetAlerts()" role="switch" aria-checked="true"
+                        aria-label="Budget alerts"></button>
+                </div>
+
+                <div id="alert-rules-list" class="alert-rules"></div>
+
+                <div class="alert-add-row">
+                    <select id="alert-new-scope" aria-label="Alert applies to">
+                        <option value="total">Total</option>
+                        <option value="billed">Billed</option>
+                        <option value="unbilled">Unbilled</option>
+                    </select>
+                    <input type="number" id="alert-new-percent" min="1" max="500" step="5" value="50"
+                        inputmode="numeric" aria-label="Alert threshold percent" />
+                    <span class="alert-percent-sign">%</span>
+                    <button type="button" class="btn btn-small" onclick="addAlertRule()">Add level</button>
+                </div>
+                <div id="alert-rules-alert"></div>
+                <p class="setting-footnote" id="alert-scope-note">Billed and unbilled levels only apply while
+                    billed / unbilled tracking is on.</p>
+            </div>
         </div>
-        <!-- Delete Type Modal -->
-        <div class="modal" id="delete-type-modal">
-            <div class="modal-content">
-                <button class="close-modal" onclick="closeDeleteTypeModal()">×</button>
-                <h3 style="margin-bottom: 1.5rem; color: #374151;">Delete Expense Type</h3>
-                <div id="delete-type-alert"></div>
-                <form id="delete-type-form">
+    </div>
+
+    <!-- ============ Recurring Expenses Modal ============ -->
+    <div class="modal" id="recurring-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeRecurringModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Recurring Expenses</h3>
+            <div id="recurring-alert"></div>
+
+            <div id="recurring-unavailable" style="display:none;">
+                <p class="setting-desc" style="margin-bottom:.75rem;">This feature needs one extra table.
+                    Run the following in your Supabase SQL editor, then reopen this window.</p>
+                <pre class="sql-block" id="recurring-sql"></pre>
+                <button class="btn btn-secondary" type="button" onclick="copyRecurringSql()">Copy SQL</button>
+            </div>
+
+            <div id="recurring-available">
+                <form id="recurring-form">
+                    <div class="form-row two-even">
+                        <div class="form-group">
+                            <label for="recurring-note">Note</label>
+                            <input id="recurring-note" type="text" placeholder="e.g. Rent" maxlength="500"
+                                required />
+                        </div>
+                        <div class="form-group">
+                            <label for="recurring-amount">Amount (₹)</label>
+                            <input id="recurring-amount" type="number" min="1" step="1" inputmode="decimal"
+                                placeholder="0" required />
+                        </div>
+                    </div>
+                    <div class="form-row two-even">
+                        <div class="form-group">
+                            <label for="recurring-type">Type</label>
+                            <select id="recurring-type" required>
+                                <option value="">Select Type</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="recurring-day">Day of month</label>
+                            <input id="recurring-day" type="number" min="1" max="31" step="1" value="1"
+                                inputmode="numeric" required />
+                        </div>
+                    </div>
+                    <div class="form-group" id="recurring-billed-group">
+                        <label>Billing status</label>
+                        <div class="billing-row">
+                            <span class="billing-side">Unbilled</span>
+                            <div class="billed-toggle" id="recurring-billed-toggle"
+                                onclick="toggleRecurringBilling()" role="switch" tabindex="0"
+                                aria-checked="false" aria-label="Billed"></div>
+                            <span class="billing-side">Billed</span>
+                        </div>
+                    </div>
+                    <button class="btn" type="submit" id="recurring-submit">Add Recurring Expense</button>
+                </form>
+
+                <div class="recurring-list-title panel-title" style="margin-top:1.25rem;">Your recurring
+                    expenses</div>
+                <div id="recurring-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Delete Type Modal ============ -->
+    <div class="modal" id="delete-type-modal">
+        <div class="modal-content modal-sm">
+            <button class="close-modal" onclick="closeDeleteTypeModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Delete Expense Type</h3>
+            <div id="delete-type-alert"></div>
+            <form id="delete-type-form">
+                <div class="form-group">
+                    <label for="delete-type-select">Select type to delete</label>
+                    <select id="delete-type-select" required>
+                        <option value="">Select Type</option>
+                    </select>
+                </div>
+                <button class="btn btn-danger" type="submit">Delete Type</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ============ Visualization Modal ============ -->
+    <div class="modal" id="visualization-modal">
+        <div class="modal-content">
+            <button class="close-modal" onclick="closeVisualizationModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Expense Analytics &amp; Export</h3>
+            <div class="date-filters">
+                <div class="filter-row">
                     <div class="form-group">
-                        <label for="delete-type-select">Select Type to Delete:</label>
-                        <select id="delete-type-select" required="">
-                            <option value="">Select Type</option>
+                        <label for="start-date">Start date</label>
+                        <input id="start-date" type="date" />
+                    </div>
+                    <div class="form-group">
+                        <label for="end-date">End date</label>
+                        <input id="end-date" type="date" />
+                    </div>
+                    <div class="form-group">
+                        <label for="type-filter">Expense type</label>
+                        <select id="type-filter">
+                            <option value="all">All Types</option>
                         </select>
                     </div>
-                    <button class="btn" style="background: linear-gradient(135deg, #ef4444, #dc2626);"
-                        type="submit">Delete Type</button>
-                </form>
-            </div>
-        </div>
-        <!-- Visualization Modal -->
-        <div class="modal" id="visualization-modal">
-            <div class="modal-content">
-                <button class="close-modal" onclick="closeVisualizationModal()">×</button>
-                <h3 style="margin-bottom: 1.5rem; color: #374151;">Expense Visualization / Export</h3>
-                <div class="date-filters">
-                    <div class="filter-row">
-                        <div class="form-group">
-                            <label for="start-date">Start Date:</label>
-                            <input id="start-date" type="date" />
-                        </div>
-                        <div class="form-group">
-                            <label for="end-date">End Date:</label>
-                            <input id="end-date" type="date" />
-                        </div>
-                        <div class="form-group">
-                            <label for="type-filter">Expense Type:</label>
-                            <select id="type-filter">
-                                <option value="all">All Types</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label for="billing-filter">Billing Status:</label>
-                            <select id="billing-filter">
-                                <option value="both">Both</option>
-                                <option value="billed">Billed Only</option>
-                                <option value="unbilled">Unbilled Only</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem;">
-                        <button class="btn btn-small" onclick="exportToCSV()" type="button">Export CSV</button>
-                        <button class="btn btn-small" onclick="showSearchModal()">Search Expenses</button>
-                        <button class="btn btn-small" onclick="applyDateFilter()" type="button">Apply Filter</button>
+                    <div class="form-group" id="billing-filter-group">
+                        <label for="billing-filter">Billing status</label>
+                        <select id="billing-filter">
+                            <option value="both">Both</option>
+                            <option value="billed">Billed Only</option>
+                            <option value="unbilled">Unbilled Only</option>
+                        </select>
                     </div>
                 </div>
-                <div class="chart-container">
-                    <canvas id="expenseChart"></canvas>
+                <div class="range-presets" id="range-presets">
+                    <button type="button" class="chip" onclick="applyRangePreset('this-month')">This month</button>
+                    <button type="button" class="chip" onclick="applyRangePreset('last-month')">Last month</button>
+                    <button type="button" class="chip" onclick="applyRangePreset('last-30')">Last 30 days</button>
+                    <button type="button" class="chip" onclick="applyRangePreset('this-year')">This year</button>
+                    <button type="button" class="chip" onclick="applyRangePreset('all')">All time</button>
                 </div>
-                <div style="margin-top: 2rem;">
-                    <h4 style="margin-bottom: 1rem; color: #374151;">Chart Type:</h4>
-                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
-                        <button class="btn btn-small" onclick="updateChartType('line')" type="button">Line
-                            Chart</button>
-                        <button class="btn btn-small" onclick="updateChartType('horizontalBar')"
-                            type="button">Horizontal Bar</button>
-                        <button class="btn btn-small" onclick="updateChartType('doughnut')"
-                            type="button">Doughnut</button>
-                        <button class="btn btn-small" onclick="updateChartType('bubble')" type="button">Bubble
-                            Chart</button>
-                    </div>
+                <div class="filter-actions">
+                    <button class="btn btn-small" onclick="applyDateFilter()" type="button">Apply Filter</button>
+                    <button class="btn btn-small btn-secondary" onclick="showSearchModal()" type="button">
+                        <svg class="icon"><use href="#i-search" /></svg> Search
+                    </button>
+                    <button class="btn btn-small btn-secondary" onclick="exportToCSV()" type="button">Export CSV</button>
+                    <button class="btn btn-small btn-secondary" onclick="exportToXLSX()" type="button">Export Excel</button>
                 </div>
             </div>
+            <div class="chart-toolbar" id="chart-toolbar">
+                <button type="button" class="seg active" data-chart="line"
+                    onclick="updateChartType('line')">Trend</button>
+                <button type="button" class="seg" data-chart="horizontalBar"
+                    onclick="updateChartType('horizontalBar')">By type</button>
+                <button type="button" class="seg" data-chart="doughnut"
+                    onclick="updateChartType('doughnut')">Split</button>
+                <button type="button" class="seg" data-chart="bubble"
+                    onclick="updateChartType('bubble')">Bubble</button>
+            </div>
+            <div class="chart-container">
+                <canvas id="expenseChart"></canvas>
+            </div>
+            <div id="filtered-list-mount"></div>
         </div>
+    </div>
 
-        <!-- Search Modal -->
-        <div id="search-modal" class="modal" style="display: none;">
-            <div class="modal-content" style="max-width: 600px;">
-                <span class="close-modal" onclick="closeSearchModal()">&times;</span>
-                <h3 style="margin-bottom: 1.5rem;">Search Expenses</h3>
-                <div style="margin-bottom: 1rem; margin-top: 1rem;">
-                    <div style="margin-bottom: 1rem;">
-                        <input type="text" id="search-input"
-                            placeholder="Search by description, type, amount, or date..."
-                            style="width: 100%; padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 8px; font-size: 1rem;"
-                            oninput="performSearch()">
-                    </div>
-                    <div id="search-results" style="max-height: 400px; overflow-y: auto;"></div>
-                </div>
+    <!-- ============ Search Modal ============ -->
+    <div id="search-modal" class="modal">
+        <div class="modal-content" style="max-width: 640px;">
+            <button class="close-modal" onclick="closeSearchModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Search Expenses</h3>
+            <div class="search-field">
+                <svg class="icon search-field-icon"><use href="#i-search" /></svg>
+                <input type="text" id="search-input" placeholder="Search by note, type, amount or date…"
+                    autocomplete="off" />
             </div>
+            <div id="search-results" class="search-results"></div>
         </div>
+    </div>
 
-        <script src="script.js"></script>
-    </body>
+    <script src="script.js?v=1.1.0"></script>
+</body>
 
 </html>

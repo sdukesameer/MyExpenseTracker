@@ -6,6 +6,56 @@ A comprehensive, feature-rich expense tracking web application built with vanill
 [![GitHub Stars](https://img.shields.io/github/stars/sdukesameer/myExpenseTracker?style=for-the-badge)](https://github.com/sdukesameer/myExpenseTracker)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
+## 🆕 What's new in 1.1
+
+**Fixed — timezone.** The dashboard used to roll over to the next day at
+18:30 IST, because it added a +05:30 offset to a `Date` and then read *local*
+getters off it (a double shift on an IST device). On the last evening of a
+month the whole dashboard jumped to the next month: the budget vanished and
+the monthly totals reset to zero. All date maths now runs on `YYYY-MM-DD`
+strings anchored to Asia/Kolkata — see [How dates are handled](#️-how-dates-are-handled).
+
+**New — total budget.** Billed + unbilled now roll up into a single headline
+budget with its own progress bar, remaining balance, and a daily pace figure
+("₹1,240/day for 9 days").
+
+**New — simple mode.** Settings → *Track billed / unbilled separately*. Turn
+it off and the billing concept disappears from the entire UI: one total budget,
+no billing toggle, no badges, no billing filter. New expenses save as unbilled.
+Existing data is untouched, and turning it back on restores the split view.
+
+**New — quick add.** Three things that remove typing, all derived from data
+you already have:
+
+- **One-tap presets.** Any (note, amount, type) you've repeated becomes a chip
+  — `Chai ₹20`, `Team lunch ₹250`. One tap files it, with an undo.
+- **Natural language.** Type `450 lunch swiggy` or `1.2k flight blr`. The
+  amount is parsed, and the category is inferred by a small Naive Bayes model
+  trained on **your own notes** — no server, no download, better the more you
+  log. If it can't recognise a word it leaves the type blank and asks rather
+  than guessing wrong on a money record.
+- **Maths in the amount box.** `120+80+45` → `245`.
+
+**New — recurring expenses.** Rent, EMIs, subscriptions. Due items are offered
+on the dashboard each month; you add or skip. Never inserted behind your back.
+
+**New — budget alert levels.** Budget → *Alerts*. Add as many thresholds as you
+like, each scoped to **total**, **billed** or **unbilled** — 50% of total, 100%
+of billed, whatever you want. Each fires one toast per month, and only the
+highest level crossed per scope fires, so one big expense doesn't set off four
+toasts at once.
+
+**New — month heatmap.** A calendar of the current month in Spending Insights,
+shaded by daily spend on a square-root scale so one rent payment doesn't flatten
+every other day. Blank squares are days you logged nothing.
+
+**New — full JSON backup.** Settings → *Download backup*. Everything, unfiltered.
+
+Also: Indian digit grouping (₹1,23,456), undo for deletes, one-tap repeat of a
+past expense, quick amount and date chips, Excel export, per-category colours,
+search highlighting, keyboard shortcuts (`/`, `n`, `Esc`), a rebuilt light/dark
+theme, and a set of iOS Safari fixes. See the full list at the end of this file.
+
 ## ✨ Key Highlights
 
 - **🔐 Complete User Authentication System** with secure password reset & email change
@@ -258,6 +308,72 @@ CREATE TRIGGER create_default_types_trigger
     EXECUTE FUNCTION create_default_expense_types();
 ```
 
+### Optional migration — recurring expenses
+
+Rent, EMIs and subscriptions. Until you run this, the feature hides itself and
+the *Recurring Expenses* window shows you the same SQL with a copy button.
+Nothing is ever inserted automatically — due items are *offered* on the
+dashboard and you add or skip each one.
+
+```sql
+CREATE TABLE IF NOT EXISTS recurring_expenses (
+    id               BIGSERIAL PRIMARY KEY,
+    user_id          UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    amount           DECIMAL(10,2) NOT NULL CHECK (amount > 0 AND amount <= 1000000),
+    type             TEXT NOT NULL,
+    note             TEXT NOT NULL,
+    billed           BOOLEAN NOT NULL DEFAULT FALSE,
+    day_of_month     SMALLINT NOT NULL CHECK (day_of_month BETWEEN 1 AND 31),
+    active           BOOLEAN NOT NULL DEFAULT TRUE,
+    last_added_year  INTEGER,
+    last_added_month SMALLINT,
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE recurring_expenses ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can manage own recurring expenses"
+    ON recurring_expenses FOR ALL USING (auth.uid() = user_id);
+
+CREATE INDEX IF NOT EXISTS idx_recurring_user
+    ON recurring_expenses(user_id, active);
+```
+
+A day-31 rule lands on the 28th/30th in shorter months, and each rule is
+stamped with the year/month it was last handled so it never double-books.
+
+### Optional migration — cross-device settings
+
+The app works without this. Per-user preferences (billed tracking on/off,
+default billing status, budget alerts) are stored in `localStorage` and will
+also sync to your account if this column exists:
+
+```sql
+ALTER TABLE user_profiles
+    ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb;
+```
+
+Without the column the app silently falls back to device-local storage, so
+settings simply won't follow you to a second device.
+
+## ⏱️ How dates are handled
+
+Expense dates are plain `DATE` values (`YYYY-MM-DD`) representing **calendar
+days in India (Asia/Kolkata)**, independent of the device's clock.
+
+All date maths in `script.js` operates on those date *strings* via the helpers
+at the top of the file (`todayISO`, `monthBounds`, `addDaysISO`, `splitISO`,
+`withinRange`). Do not build a `Date` from a stored date and read local getters
+off it — that shifts the day for anyone outside IST, and the "add an offset then
+read local getters" trick double-shifts for anyone inside it.
+
+```js
+todayISO();                  // '2026-08-31' in Asia/Kolkata, on any device
+monthBounds(2026, 8);        // { first: '2026-08-01', last: '2026-08-31' }
+withinRange(e.date, f, l);   // plain string comparison — no timezone involved
+```
+
 ## 🎯 Usage Guide
 
 ### Getting Started
@@ -434,6 +550,63 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Chart.js](https://www.chartjs.org) - Beautiful charts
 - [Inter Font](https://rsms.me/inter) - Modern typography
 - JavaScript community for inspiration and best practices
+
+## 📋 Full 1.1 change list
+
+### Bug fixes
+
+| Area | Problem | Fix |
+| --- | --- | --- |
+| Dates | `getISTDate()` added +05:30 then read local getters — one day early after 18:30 IST, one **month** early on the last evening of a month | Rewritten around `YYYY-MM-DD` strings anchored to Asia/Kolkata |
+| Dates | `formatDate()` parsed `'2026-08-05'` as UTC midnight, so devices west of UTC showed the previous day | Parses the string into a local-midnight date |
+| Dates | Insights grouped months via `new Date(expense.date).getMonth()` — wrong month at boundaries outside IST | Groups on the stored date string |
+| Change password | `showChangePassword()` focused `#current-password`, an element that does not exist — threw and left the user menu stuck open | Focuses `#new-password` |
+| Delete type | `closeDeleteTypeModal()` called `hideLandingIcons()` instead of `showLandingIcons()`, leaving the theme and docs buttons invisible | Modals now sit above those buttons by z-index; the hide/show hack is gone |
+| Security | Notes were interpolated into `data-original="…"` and `value="…"` unescaped, and rendered raw in search results | Separate `esc()` / `attr()` escaping on every path; covered by a test that feeds a hostile note through the list and edit mode |
+| Insights | `Math.max(...[])` returned `-Infinity` for a new account, producing `NaN` chart bounds | `safeMax()` |
+| Insights | Stray `</div>` in the generated markup | Rebuilt |
+| CSV export | Fields wrapped in quotes but inner quotes never doubled — a note containing `"` broke the file | RFC 4180 escaping + UTF-8 BOM so ₹ survives in Excel |
+| Import | 40 ms sleep per row (a 500-row file idled for 20 s) | Yields ~60 times total, and inserts in chunks of 200 |
+| Import | `readAsBinaryString` is deprecated and unreliable in Safari | `readAsArrayBuffer` |
+| Stats | Card labelled "Total Transactions" showed the current month's count | Relabelled "Transactions" |
+| Charts | Chart handle stored at `window.velocityChart` collided with `<canvas id="velocityChart">`, so the first `.destroy()` hit a DOM node and threw | Handles moved to module scope |
+| Tooling | `npm run dev` ran `python`, absent on current macOS | `python3` |
+| Amount field | Was `<input type="number">`, which silently rejects `120+80+45` — the calculator could never have worked | `type="text"` + `inputmode="decimal"`, so the numeric keypad still appears on iOS |
+
+### iPhone / Safari
+
+- `viewport-fit=cover` plus `env(safe-area-inset-*)` padding for the notch and home indicator
+- Every focusable input is ≥16px, so iOS no longer zooms the viewport on focus
+- `-webkit-backdrop-filter` alongside `backdrop-filter` (blur previously did nothing in Safari)
+- Hover styles behind `@media (hover: hover)` — tapped buttons no longer stay stuck in their hover state
+- Background scroll locked while a modal is open, with scroll position restored on close
+- `100dvh` with a `100vh` fallback; momentum scrolling and `overscroll-behavior: contain` on scroll areas
+- Tap targets ≥38px on coarse pointers; `:has()` used only with a class-based fallback
+- Verified at 428×926 @3x: no horizontal overflow, modals fit the viewport, charts render
+
+### New features
+
+- **Quick add** — mined one-tap presets, natural-language parsing with type inference from your own history, and arithmetic in the amount box
+- **Recurring expenses** — offered monthly, never auto-inserted; day-of-month clamps for short months
+- **Budget alert levels** — any number of thresholds, each scoped to total / billed / unbilled; one toast per scope per month
+- **Month heatmap** — daily spend calendar with blank-day tracking, square-root shading
+- **Full JSON backup** — every table plus settings in one restorable file
+- **Total budget** — billed + unbilled as one headline number with progress, remaining, and daily pace
+- **Simple mode** — hides billed/unbilled everywhere; one total budget; new expenses save unbilled
+- **Settings modal** — billing mode, default billing status, budget alerts; synced to the account when the `settings` column exists, otherwise device-local
+- **Undo delete** — deletions surface an Undo action for 6.5 s
+- **Repeat expense** — one tap to re-add a past expense dated today
+- **Delete from the dashboard** — no longer requires opening the analytics modal
+- **Quick chips** — +50/+100/+200/+500 amounts, Today/Yesterday dates
+- **Excel export** alongside CSV; both include the budget summary for single-month ranges
+- **Date range presets** — this month, last month, last 30 days, this year, all time
+- **Indian digit grouping** — ₹1,23,456.00 via `Intl.NumberFormat('en-IN')`
+- **Per-category colours** — a type keeps its colour in badges and in every chart
+- **Search** — debounced, with match highlighting
+- **Keyboard shortcuts** — `/` search, `n` new expense, `Esc` close
+- **Recent list size** — 5 / 10 / 25
+- **Month-over-month delta** on the "This Month" card
+- Theme follows the OS until you pick one; empty states and skeleton loaders; reduced-motion and print styles
 
 ## 📞 Support & Contact
 

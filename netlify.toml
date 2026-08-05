@@ -1,5 +1,8 @@
 [build]
   publish = "."
+  # NOTE: script.js no longer contains %VITE_*% placeholders (the Supabase URL
+  # and publishable key are inline), so these substitutions are currently a
+  # no-op. Kept so the env-var workflow still works if you reintroduce them.
   command = """
     # Create a temporary copy of script.js
     cp script.js script_temp.js && \
@@ -13,6 +16,10 @@
 [build.environment]
   NODE_VERSION = "18"
   SECRETS_SCAN_ENABLED = "false"
+  # The publish directory is the repo root, so anything npm installs would be
+  # deployed with the site. puppeteer-core is a test-only dependency — never
+  # install it here.
+  NPM_FLAGS = "--omit=dev --no-audit --no-fund"
 
 [[headers]]
   for = "/*"
@@ -22,6 +29,20 @@
     X-XSS-Protection = "1; mode=block"
     Referrer-Policy = "strict-origin-when-cross-origin"
     Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://*.supabase.co https://*.workers.dev; font-src 'self' data:;"
+
+# index.html must never be served stale: it is what points at the versioned
+# script.js / style.css.
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+# Test files are not part of the app.
+[[redirects]]
+  from = "/tests/*"
+  to = "/index.html"
+  status = 404
+
 [[redirects]]
   from = "/*"
   to = "/index.html"

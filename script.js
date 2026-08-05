@@ -1,171 +1,726 @@
-// Global variables
-let currentUser = null;
-let currentChart = null;
-let filteredExpenses = [];
-let allExpensesCache = [];
-let budgetWarningShown = { billed: false, unbilled: false };
-let isPasswordResetFlow = false;
-let monthlyBilledBudget = 0;
-let monthlyUnbilledBudget = 0;
-let supabase;
+/* =====================================================================
+   Expense Tracker
+   ---------------------------------------------------------------------
+   Vanilla JS + Supabase. No build step: this file is served as-is.
+   ===================================================================== */
 
-// Use Cloudflare Worker proxy for Indian ISP compatibility
+'use strict';
+
+/* ---------------------------------------------------------------------
+   Config
+   --------------------------------------------------------------------- */
+
+// Cloudflare Worker proxy in front of Supabase (Indian ISP compatibility)
 const DIRECT_SUPABASE_URL = 'https://hjjpjcqzslqikopsbxwh.supabase.co';
 const PROXY_URL = 'https://supabase-proxy.sdukesameer.workers.dev';
 
-// Detect if Supabase is reachable, fallback to proxy
 const supabaseUrl = PROXY_URL;
 const supabaseKey = 'sb_publishable_7dJnWY2k5asHPS1qpABHjw_MeQXUpIa';
 
-if (!supabaseUrl || !supabaseKey) {
-    console.error('Supabase credentials not found. Please check environment variables.');
-}
+// All dates in this app are "calendar dates in India", independent of the
+// device clock's timezone. See the date helpers below.
+const APP_TIMEZONE = 'Asia/Kolkata';
 
-supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+const MAX_AMOUNT = 1000000;
+const MAX_NOTE_LENGTH = 500;
 
-// FIXED: Initialize theme toggle variables at the top
+/* ---------------------------------------------------------------------
+   Global state
+   --------------------------------------------------------------------- */
+
+let supabase = null;
+let currentUser = null;
+let currentChart = null;
+let currentChartType = 'line';
+let filteredExpenses = [];
+let allExpensesCache = [];
+let isPasswordResetFlow = false;
+let monthlyBilledBudget = 0;
+let monthlyUnbilledBudget = 0;
+let editedExpenses = new Set();
+let expenseEdits = {};
+let lastDeletedExpense = null;
 let isDarkMode = localStorage.getItem('darkMode') === 'true';
 
-// FIXED: Theme toggle function moved up and properly scoped
-function toggleTheme() {
-    isDarkMode = !isDarkMode;
-    document.body.classList.toggle('dark-mode', isDarkMode);
-    document.getElementById('theme-icon').textContent = isDarkMode ? '☀️' : '🌙';
-    localStorage.setItem('darkMode', isDarkMode);
-}
+/* Budget alert levels. Each fires at most one toast per calendar month,
+   the first time spending crosses it. Scope is total / billed / unbilled;
+   the last two are ignored while billing tracking is off. */
+const DEFAULT_ALERT_RULES = [
+    { scope: 'total', percent: 90 },
+    { scope: 'total', percent: 100 },
+    { scope: 'billed', percent: 100 },
+    { scope: 'unbilled', percent: 100 }
+];
+const MAX_ALERT_RULES = 12;
 
-// Add this function after toggleTheme() function
-function handleSecureEmailLink() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const actualLink = urlParams.get('link');
+const DEFAULT_SETTINGS = {
+    trackBilling: true,     // show/hide the whole billed-vs-unbilled concept
+    defaultBilled: false,   // pre-select "Billed" on the add form
+    budgetAlerts: true,
+    alertRules: DEFAULT_ALERT_RULES
+};
+let settings = { ...DEFAULT_SETTINGS };
 
-    if (actualLink && window.location.pathname === '/secure-email-link') {
-        // Redirect to the actual Supabase link
-        window.location.href = actualLink;
+/* Alert levels already fired this month, persisted so a page reload
+   doesn't replay every toast. */
+let firedAlerts = new Set();
+
+/* ---------------------------------------------------------------------
+   Bootstrap the Supabase client
+   --------------------------------------------------------------------- */
+
+function fatalError(message) {
+    document.body.classList.add('loaded');
+    const spinner = document.getElementById('loading-spinner');
+    if (spinner) spinner.style.display = 'none';
+    const container = document.querySelector('.container');
+    if (container) {
+        container.innerHTML =
+            '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
+            '<h3 class="card-title" style="margin-bottom:.5rem">Something went wrong</h3>' +
+            '<p>' + esc(message) + '</p></div>';
     }
 }
 
-function sanitizeHTML(str) {
-    if (!str) return '';
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+try {
+    if (!window.supabase || typeof window.supabase.createClient !== 'function') {
+        throw new Error('The Supabase library failed to load.');
+    }
+    supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+} catch (error) {
+    console.error('Supabase init failed:', error);
+    document.addEventListener('DOMContentLoaded', function () {
+        fatalError('Could not reach the server. Check your connection and reload the page.');
+    });
 }
 
-function validateExpenseInput(amount, type, note) {
-    const errors = [];
+/* =====================================================================
+   Escaping & formatting helpers
+   ===================================================================== */
 
-    if (!amount || isNaN(amount) || amount <= 0) {
-        errors.push('Valid amount is required');
-    }
-    if (amount > 1000000) {
-        errors.push('Amount cannot exceed ₹10,00,000');
-    }
-    if (!type || type.trim() === '') {
-        errors.push('Expense type is required');
-    }
-    if (!note || note.trim() === '') {
-        errors.push('Description is required');
-    }
-    if (note && note.length > 500) {
-        errors.push('Description cannot exceed 500 characters');
-    }
-
-    return errors;
+/** Escape for use as HTML text content. */
+function esc(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 
-function getISTDate(date = new Date()) {
-    // Create IST date properly
-    const utc = date.getTime();
-    const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
-    return new Date(utc + istOffset);
+/** Escape for use inside a double-quoted HTML attribute. */
+function attr(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
-function getISTMonthBounds(year, month) {
-    // Get first day (always 01) and last day of the month
-    const firstDay = 1;
-    const lastDay = new Date(year, month, 0).getDate(); // 0th day of next month = last day of current month
+// Kept as aliases: older call sites (and any external snippets) use these names.
+const sanitizeHTML = esc;
+const escapeHtml = esc;
 
-    // Format as YYYY-MM-DD strings
-    const firstDayStr = `${year}-${String(month).padStart(2, '0')}-01`;
-    const lastDayStr = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+let _inrFormatter = null;
+function inrFormatter() {
+    if (!_inrFormatter) {
+        try {
+            _inrFormatter = new Intl.NumberFormat('en-IN', {
+                style: 'currency', currency: 'INR',
+                minimumFractionDigits: 2, maximumFractionDigits: 2
+            });
+        } catch (error) {
+            _inrFormatter = { format: n => '₹' + Number(n).toFixed(2) };
+        }
+    }
+    return _inrFormatter;
+}
 
+/** ₹1,23,456.00 — Indian digit grouping. */
+function money(value) {
+    const n = Number(value);
+    if (!isFinite(n)) return '₹0.00';
+    return inrFormatter().format(n);
+}
+
+/** ₹1,23,456 — same grouping, no paise. Used for big display numbers. */
+function moneyShort(value) {
+    const n = Number(value);
+    if (!isFinite(n)) return '₹0';
+    try {
+        return new Intl.NumberFormat('en-IN', {
+            style: 'currency', currency: 'INR', maximumFractionDigits: 0
+        }).format(n);
+    } catch (error) {
+        return '₹' + Math.round(n);
+    }
+}
+
+function pad2(n) {
+    return String(n).padStart(2, '0');
+}
+
+/* =====================================================================
+   Dates
+   ---------------------------------------------------------------------
+   Expense dates are stored as plain DATE ('YYYY-MM-DD') in Postgres, so
+   every calculation here works on date *strings* anchored to
+   APP_TIMEZONE. Never build a Date from a stored date and read local
+   getters off it — that silently shifts the day for anyone whose device
+   is not on IST, and double-shifts for anyone who is.
+   ===================================================================== */
+
+let _tzParts = null;
+function tzPartsFormatter() {
+    if (_tzParts === null) {
+        try {
+            _tzParts = new Intl.DateTimeFormat('en-GB', {
+                timeZone: APP_TIMEZONE,
+                year: 'numeric', month: '2-digit', day: '2-digit'
+            });
+            // Confirm the engine actually honours the timeZone option.
+            _tzParts.formatToParts(new Date());
+        } catch (error) {
+            _tzParts = false;
+        }
+    }
+    return _tzParts;
+}
+
+/** The calendar date in APP_TIMEZONE for an instant, as 'YYYY-MM-DD'. */
+function toAppDateISO(date) {
+    const when = date instanceof Date ? date : new Date();
+    const formatter = tzPartsFormatter();
+    if (formatter) {
+        const parts = formatter.formatToParts(when);
+        const pick = type => (parts.find(p => p.type === type) || {}).value;
+        const year = pick('year'), month = pick('month'), day = pick('day');
+        if (year && month && day) return `${year}-${month}-${day}`;
+    }
+    // Fallback for engines without full Intl: fixed +05:30 offset.
+    return new Date(when.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+/** Today in APP_TIMEZONE, as 'YYYY-MM-DD'. */
+function todayISO() {
+    return toAppDateISO(new Date());
+}
+
+/** Split 'YYYY-MM-DD' into numbers. Returns null for anything malformed. */
+function splitISO(iso) {
+    if (typeof iso !== 'string') return null;
+    const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+    if (!match) return null;
+    return { year: +match[1], month: +match[2], day: +match[3] };
+}
+
+/** { year, month, day } for today in APP_TIMEZONE. month is 1-12. */
+function todayParts() {
+    return splitISO(todayISO());
+}
+
+function daysInMonth(year, month) {
+    return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/** Inclusive first/last date strings of a month. */
+function monthBounds(year, month) {
     return {
-        first: firstDayStr,
-        last: lastDayStr
+        first: `${year}-${pad2(month)}-01`,
+        last: `${year}-${pad2(month)}-${pad2(daysInMonth(year, month))}`
     };
 }
 
-function getCurrentMonthName() {
-    const months = ['January', 'February', 'March', 'April', 'May', 'June',
-        'July', 'August', 'September', 'October', 'November', 'December'];
-    return months[new Date().getMonth()];
+function previousMonth(year, month) {
+    return month === 1 ? { year: year - 1, month: 12 } : { year, month: month - 1 };
 }
 
-// FIXED: Notification system properly scoped
-function showNotification(message, type = 'info', duration = 3000) {
-    const container = document.getElementById('notification-container');
+/** Shift a 'YYYY-MM-DD' string by whole days, staying on the calendar. */
+function addDaysISO(iso, days) {
+    const parts = splitISO(iso);
+    if (!parts) return iso;
+    const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days));
+    return shifted.toISOString().slice(0, 10);
+}
 
-    // Position existing notifications higher
-    const existingNotifications = container.querySelectorAll('.notification');
-    existingNotifications.forEach((notification, index) => {
-        const currentTop = parseInt(notification.style.top || '20') + 80;
-        notification.style.top = currentTop + 'px';
-    });
+/** 'YYYY-MM-DD' -> Date at *local* midnight. Display only, never storage. */
+function isoToDisplayDate(iso) {
+    const parts = splitISO(iso);
+    if (!parts) return new Date(NaN);
+    return new Date(parts.year, parts.month - 1, parts.day);
+}
+
+/** '2026-08-05' -> '5 Aug 2026' */
+function formatDate(iso) {
+    const parts = splitISO(iso);
+    if (!parts) return String(iso || '');
+    const date = isoToDisplayDate(iso);
+    try {
+        return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+    } catch (error) {
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        return `${parts.day} ${months[parts.month - 1]} ${parts.year}`;
+    }
+}
+
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+
+function monthLabel(year, month, short) {
+    const name = MONTH_NAMES[month - 1] || '';
+    return (short ? name.slice(0, 3) : name) + ' ' + year;
+}
+
+function getCurrentMonthName() {
+    return MONTH_NAMES[todayParts().month - 1];
+}
+
+/** True when an ISO date string falls inside [first, last] inclusive. */
+function withinRange(iso, first, last) {
+    return typeof iso === 'string' && iso >= first && iso <= last;
+}
+
+/* =====================================================================
+   Settings (per user; DB-backed when the column exists, else local)
+   ===================================================================== */
+
+function settingsStorageKey() {
+    return 'et:settings:' + (currentUser ? currentUser.id : 'anon');
+}
+
+function readLocalSettings() {
+    try {
+        const raw = localStorage.getItem(settingsStorageKey());
+        return raw ? JSON.parse(raw) : {};
+    } catch (error) {
+        return {};
+    }
+}
+
+function writeLocalSettings(next) {
+    try {
+        localStorage.setItem(settingsStorageKey(), JSON.stringify(next));
+    } catch (error) {
+        /* Private browsing on iOS can reject writes — not fatal. */
+    }
+}
+
+async function loadSettings() {
+    settings = { ...DEFAULT_SETTINGS, ...readLocalSettings() };
+    if (!currentUser) return;
+    try {
+        const { data, error } = await supabase
+            .from('user_profiles')
+            .select('settings')
+            .eq('user_id', currentUser.id)
+            .maybeSingle();
+        if (!error && data && data.settings && typeof data.settings === 'object') {
+            settings = { ...settings, ...data.settings };
+            writeLocalSettings(settings);
+        }
+    } catch (error) {
+        // The `settings` column is optional; local storage is the fallback.
+    }
+}
+
+async function saveSettings(patch) {
+    settings = { ...settings, ...patch };
+    writeLocalSettings(settings);
+    if (!currentUser) return;
+    try {
+        await supabase
+            .from('user_profiles')
+            .upsert([{ user_id: currentUser.id, settings }], { onConflict: 'user_id' });
+    } catch (error) {
+        // Optional column missing — the local copy still applies.
+    }
+}
+
+const trackingBilling = () => settings.trackBilling !== false;
+
+/* ---------------------------------------------------------------------
+   Budget alert levels
+   --------------------------------------------------------------------- */
+
+function alertRules() {
+    const rules = Array.isArray(settings.alertRules) ? settings.alertRules : DEFAULT_ALERT_RULES;
+    return rules
+        .filter(rule => rule && ['total', 'billed', 'unbilled'].indexOf(rule.scope) !== -1
+            && Number(rule.percent) > 0)
+        .map(rule => ({ scope: rule.scope, percent: Math.round(Number(rule.percent)) }))
+        .sort((a, b) => a.scope.localeCompare(b.scope) || a.percent - b.percent);
+}
+
+function alertRuleKey(rule) {
+    return rule.scope + ':' + rule.percent;
+}
+
+function firedAlertsStorageKey() {
+    const parts = todayParts();
+    return 'et:alerts:' + (currentUser ? currentUser.id : 'anon') +
+        ':' + parts.year + '-' + pad2(parts.month);
+}
+
+function loadFiredAlerts() {
+    try {
+        const raw = localStorage.getItem(firedAlertsStorageKey());
+        firedAlerts = new Set(raw ? JSON.parse(raw) : []);
+    } catch (error) {
+        firedAlerts = new Set();
+    }
+}
+
+function saveFiredAlerts() {
+    try {
+        localStorage.setItem(firedAlertsStorageKey(), JSON.stringify(Array.from(firedAlerts)));
+    } catch (error) {
+        /* Private browsing — alerts just replay after a reload. */
+    }
+}
+
+/** Called when the budget or the levels change: everything is re-armed. */
+function resetFiredAlerts() {
+    firedAlerts = new Set();
+    saveFiredAlerts();
+}
+
+/* =====================================================================
+   Small DOM helpers
+   ===================================================================== */
+
+function $(id) {
+    return document.getElementById(id);
+}
+
+function setText(id, text) {
+    const el = $(id);
+    if (el) el.textContent = text;
+}
+
+function show(el, visible, displayValue) {
+    const node = typeof el === 'string' ? $(el) : el;
+    if (node) node.style.display = visible ? (displayValue || '') : 'none';
+}
+
+function debounce(fn, delay) {
+    let timer;
+    return function (...args) {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn.apply(this, args), delay);
+    };
+}
+
+/* =====================================================================
+   Theme
+   ===================================================================== */
+
+function applyTheme() {
+    document.body.classList.toggle('dark-mode', isDarkMode);
+    const icon = $('theme-icon');
+    if (icon) {
+        const use = icon.querySelector('use');
+        if (use) use.setAttribute('href', isDarkMode ? '#i-sun' : '#i-moon');
+    }
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', isDarkMode ? '#0d0f16' : '#eef0f8');
+    refreshChartTheme();
+}
+
+function toggleTheme() {
+    isDarkMode = !isDarkMode;
+    localStorage.setItem('darkMode', String(isDarkMode));
+    applyTheme();
+}
+
+/* =====================================================================
+   Notifications
+   ===================================================================== */
+
+function showNotification(message, type = 'info', duration = 3200, action = null) {
+    const container = $('notification-container');
+    if (!container) return;
 
     const notification = document.createElement('div');
-    notification.className = `notification ${type}`;
-    notification.textContent = message;
-    notification.style.top = '20px';
+    notification.className = 'notification ' + type;
 
-    container.appendChild(notification);
-    setTimeout(() => notification.classList.add('show'), 100);
+    const text = document.createElement('span');
+    text.className = 'notification-text';
+    text.textContent = message;
+    notification.appendChild(text);
 
-    setTimeout(() => {
+    let dismissTimer = null;
+    const dismiss = () => {
+        clearTimeout(dismissTimer);
         notification.classList.remove('show');
-        setTimeout(() => {
-            if (container.contains(notification)) {
-                container.removeChild(notification);
-            }
-        }, 300);
-    }, duration);
-}
+        setTimeout(() => notification.remove(), 320);
+    };
 
-// Initialize the app
-document.addEventListener('DOMContentLoaded', async function () {
-    // Show loading spinner
-    document.getElementById('loading-spinner').style.display = 'block';
-
-    if (isDarkMode) {
-        document.body.classList.add('dark-mode');
-        document.getElementById('theme-icon').textContent = '☀️';
+    if (action && action.label && typeof action.onClick === 'function') {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'notification-action';
+        button.textContent = action.label;
+        button.addEventListener('click', () => {
+            dismiss();
+            action.onClick();
+        });
+        notification.appendChild(button);
     }
 
-    // Set today's date in IST
-    const now = new Date();
-    const istNow = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
-    const todayIST = istNow.toISOString().split('T')[0];
-    const currentMonth = istNow.getMonth() + 1;
-    const currentYear = istNow.getFullYear();
-    const firstDayIST = getISTMonthBounds(currentYear, currentMonth).first;
+    container.appendChild(notification);
+    requestAnimationFrame(() => notification.classList.add('show'));
+    dismissTimer = setTimeout(dismiss, duration);
+}
 
-    document.getElementById('date').value = todayIST;
-    document.getElementById('end-date').value = todayIST;
-    document.getElementById('start-date').value = firstDayIST;
+function showAlert(containerId, message, type) {
+    const container = $(containerId);
+    if (!container) return;
+    container.innerHTML = '<div class="alert alert-' + attr(type) + '">' + esc(message) + '</div>';
+    clearTimeout(container._alertTimer);
+    container._alertTimer = setTimeout(() => { container.innerHTML = ''; }, 6000);
+}
 
+/* =====================================================================
+   Modals
+   ===================================================================== */
+
+const openModals = [];
+let savedScrollY = 0;
+
+function lockBodyScroll() {
+    if (document.body.classList.contains('modal-open')) return;
+    savedScrollY = window.scrollY || window.pageYOffset || 0;
+    document.body.style.top = -savedScrollY + 'px';
+    document.body.classList.add('modal-open');
+}
+
+function unlockBodyScroll() {
+    if (!document.body.classList.contains('modal-open')) return;
+    document.body.classList.remove('modal-open');
+    document.body.style.top = '';
+    window.scrollTo(0, savedScrollY);
+}
+
+function openModal(id) {
+    const modal = $(id);
+    if (!modal) return;
+    modal.classList.add('open');
+    modal.style.display = 'flex';
+    if (openModals.indexOf(id) === -1) openModals.push(id);
+    lockBodyScroll();
+}
+
+function closeModal(id) {
+    const modal = $(id);
+    if (!modal) return;
+    modal.classList.remove('open');
+    modal.style.display = 'none';
+    const index = openModals.indexOf(id);
+    if (index !== -1) openModals.splice(index, 1);
+    if (openModals.length === 0) unlockBodyScroll();
+}
+
+const MODAL_CLOSERS = {
+    'add-type-modal': closeAddTypeModal,
+    'edit-type-modal': closeEditTypeModal,
+    'delete-type-modal': closeDeleteTypeModal,
+    'budget-modal': closeBudgetModal,
+    'edit-profile-modal': closeEditProfileModal,
+    'visualization-modal': closeVisualizationModal,
+    'search-modal': closeSearchModal,
+    'insights-modal': closeInsightsModal,
+    'import-expenses-modal': closeImportExpensesModal,
+    'settings-modal': closeSettingsModal,
+    'recurring-modal': closeRecurringModal,
+    'change-password-modal': closeChangePasswordModal
+};
+
+function closeTopModal() {
+    const id = openModals[openModals.length - 1];
+    if (!id) return;
+    if (id === 'change-password-modal' && isPasswordResetFlow) return;
+    const closer = MODAL_CLOSERS[id];
+    if (closer) closer(); else closeModal(id);
+}
+
+// Backdrop click closes the modal it belongs to. pointerdown so it also
+// fires reliably for taps on iOS Safari.
+document.addEventListener(window.PointerEvent ? 'pointerdown' : 'mousedown', function (event) {
+    if (!event.target.classList || !event.target.classList.contains('modal')) return;
+    const id = event.target.id;
+    if (id === 'change-password-modal' && isPasswordResetFlow) return;
+    const closer = MODAL_CLOSERS[id];
+    if (closer) closer(); else closeModal(id);
+});
+
+// These used to hide the floating buttons behind modals. Modals now sit
+// above them via z-index, so the calls are harmless no-ops.
+function hideLandingIcons() { }
+function showLandingIcons() { }
+
+/* =====================================================================
+   Category colours — a type keeps the same colour everywhere
+   ===================================================================== */
+
+const CATEGORY_PALETTE = [
+    { bg: 'rgba(99,102,241,.14)', fg: '#4f46e5', bd: 'rgba(99,102,241,.30)', chart: '#6366f1' },
+    { bg: 'rgba(16,185,129,.14)', fg: '#047857', bd: 'rgba(16,185,129,.30)', chart: '#10b981' },
+    { bg: 'rgba(245,158,11,.16)', fg: '#b45309', bd: 'rgba(245,158,11,.32)', chart: '#f59e0b' },
+    { bg: 'rgba(236,72,153,.14)', fg: '#be185d', bd: 'rgba(236,72,153,.30)', chart: '#ec4899' },
+    { bg: 'rgba(14,165,233,.14)', fg: '#0369a1', bd: 'rgba(14,165,233,.30)', chart: '#0ea5e9' },
+    { bg: 'rgba(139,92,246,.14)', fg: '#6d28d9', bd: 'rgba(139,92,246,.30)', chart: '#8b5cf6' },
+    { bg: 'rgba(244,63,94,.14)', fg: '#be123c', bd: 'rgba(244,63,94,.30)', chart: '#f43f5e' },
+    { bg: 'rgba(20,184,166,.14)', fg: '#0f766e', bd: 'rgba(20,184,166,.30)', chart: '#14b8a6' },
+    { bg: 'rgba(132,204,22,.16)', fg: '#4d7c0f', bd: 'rgba(132,204,22,.32)', chart: '#84cc16' },
+    { bg: 'rgba(249,115,22,.16)', fg: '#c2410c', bd: 'rgba(249,115,22,.32)', chart: '#f97316' },
+    { bg: 'rgba(6,182,212,.14)', fg: '#0e7490', bd: 'rgba(6,182,212,.30)', chart: '#06b6d4' },
+    { bg: 'rgba(168,85,247,.14)', fg: '#7e22ce', bd: 'rgba(168,85,247,.30)', chart: '#a855f7' }
+];
+
+function categoryColor(name) {
+    const key = String(name || '');
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+        hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+    }
+    return CATEGORY_PALETTE[hash % CATEGORY_PALETTE.length];
+}
+
+function typeStyleAttr(name) {
+    const color = categoryColor(name);
+    return `--type-bg:${color.bg};--type-fg:${color.fg};--type-bd:${color.bd}`;
+}
+
+function typeBadge(name) {
+    return `<span class="expense-type" style="${typeStyleAttr(name)}">${esc(name)}</span>`;
+}
+
+function billingBadge(billed) {
+    if (!trackingBilling()) return '';
+    return billed
+        ? '<span class="billed-badge">BILLED</span>'
+        : '<span class="unbilled-badge">UNBILLED</span>';
+}
+
+/* =====================================================================
+   Charts — theme awareness
+   ===================================================================== */
+
+const chartsAvailable = () => typeof window.Chart !== 'undefined';
+
+function chartInk() {
+    return isDarkMode ? '#b8c0d2' : '#4b5162';
+}
+
+function chartGrid() {
+    return isDarkMode ? 'rgba(255,255,255,.08)' : 'rgba(16,20,40,.08)';
+}
+
+function applyChartDefaults() {
+    if (!chartsAvailable()) return;
+    Chart.defaults.font.family =
+        '-apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif';
+    Chart.defaults.font.size = 12;
+    Chart.defaults.color = chartInk();
+    Chart.defaults.plugins.legend.labels.usePointStyle = true;
+    Chart.defaults.plugins.legend.labels.boxWidth = 8;
+    Chart.defaults.plugins.tooltip.backgroundColor = isDarkMode ? '#242938' : '#171a24';
+    Chart.defaults.plugins.tooltip.padding = 10;
+    Chart.defaults.plugins.tooltip.cornerRadius = 8;
+    Chart.defaults.plugins.tooltip.displayColors = false;
+}
+
+function axisConfig(extra) {
+    return Object.assign({
+        grid: { color: chartGrid(), drawBorder: false },
+        ticks: { color: chartInk() }
+    }, extra || {});
+}
+
+function refreshChartTheme() {
+    if (!chartsAvailable()) return;
+    applyChartDefaults();
+    if (currentChart) updateChart(currentChartType);
+    if (insightsChart || velocityChart) {
+        if (document.getElementById('insights-modal').classList.contains('open')) {
+            loadSpendingInsights();
+        }
+    }
+}
+
+function calculateStepSize(maxValue) {
+    if (!isFinite(maxValue) || maxValue <= 0) return 100;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(maxValue)));
+    const normalized = maxValue / magnitude;
+    if (normalized <= 1) return magnitude / 10;
+    if (normalized <= 2) return magnitude / 5;
+    if (normalized <= 5) return magnitude / 2;
+    return magnitude;
+}
+
+function calculateMaxValue(maxValue) {
+    if (!isFinite(maxValue) || maxValue <= 0) return 1000;
+    const step = calculateStepSize(maxValue);
+    return Math.ceil(maxValue / step) * step;
+}
+
+/** Math.max over a possibly-empty array without returning -Infinity. */
+function safeMax(values) {
+    let max = 0;
+    for (const value of values) {
+        const n = Number(value);
+        if (isFinite(n) && n > max) max = n;
+    }
+    return max;
+}
+
+/* =====================================================================
+   Validation
+   ===================================================================== */
+
+function validateExpenseInput(amount, type, note) {
+    const errors = [];
+    if (!amount || isNaN(amount) || amount <= 0) errors.push('Valid amount is required');
+    if (amount > MAX_AMOUNT) errors.push('Amount cannot exceed ₹10,00,000');
+    if (!type || String(type).trim() === '') errors.push('Expense type is required');
+    if (!note || String(note).trim() === '') errors.push('Description is required');
+    if (note && String(note).length > MAX_NOTE_LENGTH) {
+        errors.push('Description cannot exceed ' + MAX_NOTE_LENGTH + ' characters');
+    }
+    return errors;
+}
+
+/* =====================================================================
+   App start
+   ===================================================================== */
+
+document.addEventListener('DOMContentLoaded', async function () {
+    if (!supabase) return;
+
+    show('loading-spinner', true, 'block');
+    applyTheme();
+    applyChartDefaults();
+
+    const today = todayISO();
+    const { year, month } = todayParts();
+    $('date').value = today;
+    $('end-date').value = today;
+    $('start-date').value = monthBounds(year, month).first;
+
+    renderAmountChips();
+    initImportExpensesUI();
+    wireForms();
     handleSecureEmailLink();
     handleEmailChangeConfirmation();
 
     supabase.auth.onAuthStateChange((event, session) => {
         if (event === 'PASSWORD_RECOVERY') {
-            // Ensure clean state for password recovery
-            currentUser = null;
+            currentUser = session && session.user ? session.user : null;
             isPasswordResetFlow = true;
-            if (session?.user) {
-                currentUser = session.user;
-            }
-            showForcedPasswordChange();
-        } else if (event === 'SIGNED_IN' && session?.user) {
+            if (currentUser) showForcedPasswordChange();
+            else showSignIn();
+        } else if (event === 'SIGNED_IN' && session && session.user) {
             if (!isPasswordResetFlow) {
                 currentUser = session.user;
                 showDashboard();
@@ -174,24 +729,31 @@ document.addEventListener('DOMContentLoaded', async function () {
             currentUser = null;
             isPasswordResetFlow = false;
             showSignIn();
-        } else if (event === 'USER_UPDATED' && session?.user) {
+        } else if (event === 'USER_UPDATED' && session && session.user) {
             if (!window.location.search.includes('type=email_change')) {
                 currentUser = session.user;
-                if (!isPasswordResetFlow && document.getElementById('dashboard').style.display !== 'none') {
+                if (!isPasswordResetFlow && $('dashboard').style.display !== 'none') {
                     showDashboard();
                 }
             }
         }
-
-        document.getElementById('loading-spinner').style.display = 'none';
+        show('loading-spinner', false);
         document.body.classList.add('loaded');
     });
 
     try {
-        const { data: { user } } = await supabase.auth.getUser();
-        if (user) {
-            currentUser = user;
-            showDashboard();
+        // getSession() reads the stored token locally. Calling getUser()
+        // straight away costs a request that 401s for every signed-out
+        // visitor, so only reach for it once a session actually exists.
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (sessionData && sessionData.session) {
+            const { data } = await supabase.auth.getUser();
+            if (data && data.user) {
+                currentUser = data.user;
+                await showDashboard();
+            } else {
+                showSignIn();
+            }
         } else {
             showSignIn();
         }
@@ -199,119 +761,146 @@ document.addEventListener('DOMContentLoaded', async function () {
         console.error('Auth check failed:', error);
         showSignIn();
     } finally {
-        // Hide loading spinner and show content
-        document.getElementById('loading-spinner').style.display = 'none';
+        show('loading-spinner', false);
         document.body.classList.add('loaded');
     }
 
-    document.getElementById('signin').addEventListener('submit', handleSignIn);
-    document.getElementById('signup').addEventListener('submit', handleSignUp);
-    document.getElementById('forgot-password').addEventListener('submit', handleForgotPassword);
-    document.getElementById('expense-form').addEventListener('submit', handleAddExpense);
-    document.getElementById('add-type-form').addEventListener('submit', handleAddType);
-    document.getElementById('change-password-form').addEventListener('submit', handleChangePassword);
-    document.getElementById('edit-profile-form').addEventListener('submit', handleEditProfile);
     updateDateDisplay();
 });
 
-function hideLandingIcons() {
-    // Docs icon
-    const docs = document.getElementById('docs-toggle');
-    if (docs) docs.style.display = 'none';
+function wireForms() {
+    $('signin').addEventListener('submit', handleSignIn);
+    $('signup').addEventListener('submit', handleSignUp);
+    $('forgot-password').addEventListener('submit', handleForgotPassword);
+    $('expense-form').addEventListener('submit', handleAddExpense);
+    $('add-type-form').addEventListener('submit', handleAddType);
+    $('edit-type-form').addEventListener('submit', handleEditType);
+    $('delete-type-form').addEventListener('submit', handleDeleteType);
+    $('change-password-form').addEventListener('submit', handleChangePassword);
+    $('edit-profile-form').addEventListener('submit', handleEditProfile);
+    $('budget-form').addEventListener('submit', handleBudgetSubmit);
+    $('search-input').addEventListener('input', debounce(performSearch, 180));
+    $('recurring-form').addEventListener('submit', handleRecurringSubmit);
 
-    // Theme button (adjust selector if needed)
-    const themeBtn = document.querySelector('.theme-toggle');
-    if (themeBtn) themeBtn.style.display = 'none';
+    const quickInput = $('quick-add-input');
+    quickInput.addEventListener('input', updateQuickAddPreview);
+    quickInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') { event.preventDefault(); submitQuickAdd(); }
+    });
+
+    // "120+80+45" in the amount box resolves to 245 on blur or Enter.
+    const amountInput = $('amount');
+    amountInput.addEventListener('blur', resolveAmountExpression);
+    amountInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') resolveAmountExpression();
+    });
+
+    ['total-budget-amount', 'billed-budget-amount', 'unbilled-budget-amount'].forEach(id => {
+        $(id).addEventListener('input', updateBudgetModalTotal);
+    });
+
+    // The billed switch on the add form should be keyboard operable.
+    $('form-billed-toggle').addEventListener('keydown', function (event) {
+        if (event.key === ' ' || event.key === 'Enter') {
+            event.preventDefault();
+            toggleFormBilling();
+        }
+    });
 }
 
-function showLandingIcons() {
-    const docs = document.getElementById('docs-toggle');
-    if (docs) docs.style.display = 'flex'; // or 'block' based on your CSS
+/* Keyboard shortcuts */
+document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') {
+        if (openModals.length) {
+            closeTopModal();
+        } else {
+            closeUserMenu();
+        }
+        return;
+    }
+    const target = event.target;
+    const typing = target && (target.tagName === 'INPUT' || target.tagName === 'SELECT' ||
+        target.tagName === 'TEXTAREA' || target.isContentEditable);
+    if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (!currentUser || $('dashboard').style.display === 'none') return;
 
-    const themeBtn = document.querySelector('.theme-toggle');
-    if (themeBtn) themeBtn.style.display = 'flex';
+    if (event.key === '/') {
+        event.preventDefault();
+        showSearchModal();
+    } else if (event.key === 'n' || event.key === 'N') {
+        event.preventDefault();
+        focusAddExpense();
+    }
+});
+
+function handleSecureEmailLink() {
+    const params = new URLSearchParams(window.location.search);
+    const actualLink = params.get('link');
+    if (actualLink && window.location.pathname === '/secure-email-link') {
+        window.location.href = actualLink;
+    }
 }
 
-// Authentication functions
+/* =====================================================================
+   Auth screens
+   ===================================================================== */
+
+function hideAllForms() {
+    ['signin-form', 'signup-form', 'forgot-password-form', 'password-reset-form']
+        .forEach(id => $(id).classList.add('hidden'));
+    $('dashboard').style.display = 'none';
+    document.body.classList.remove('signed-in');
+}
+
 function showSignIn() {
     hideAllForms();
-    document.getElementById('signin-form').classList.remove('hidden');
-    showLandingIcons();
+    $('signin-form').classList.remove('hidden');
 }
 
 function showSignUp() {
     hideAllForms();
-    document.getElementById('signup-form').classList.remove('hidden');
-    showLandingIcons();
+    $('signup-form').classList.remove('hidden');
 }
 
 async function showForgotPassword() {
-    // Logout current session before showing forgot password form
     try {
         await supabase.auth.signOut();
         currentUser = null;
     } catch (error) {
         console.error('Error during logout:', error);
     }
-
     hideAllForms();
-    document.getElementById('forgot-password-form').classList.remove('hidden');
-    showLandingIcons();
+    $('forgot-password-form').classList.remove('hidden');
 }
 
-function hideAllForms() {
-    document.getElementById('signin-form').classList.add('hidden');
-    document.getElementById('signup-form').classList.add('hidden');
-    document.getElementById('forgot-password-form').classList.add('hidden');
-    document.getElementById('password-reset-form').classList.add('hidden');
-    document.getElementById('dashboard').style.display = 'none';
-}
-
-// Demo login function
 async function demoLogin() {
-    const emailInput = document.getElementById('signin-email');
-    const passInput = document.getElementById('signin-password');
-
-    emailInput.value = "test.expenses@yopmail.com";
-    passInput.value = "123456";
-
-    await handleSignIn(new Event("submit"));
+    $('signin-email').value = 'test.expenses@yopmail.com';
+    $('signin-password').value = '123456';
+    await handleSignIn(new Event('submit'));
 }
 
-async function handleSignIn(e) {
-    e.preventDefault();
-    const emailField = document.getElementById('signin-email');
-    const passwordField = document.getElementById('signin-password');
-
-    if (!emailField || !passwordField) {
-        showAlert('signin-alert', 'Form fields not found.', 'error');
-        return;
-    }
-
-    const email = emailField.value;
-    const password = passwordField.value;
+async function handleSignIn(event) {
+    event.preventDefault();
+    const email = $('signin-email').value;
+    const password = $('signin-password').value;
 
     try {
-        const { data, error } = await supabase.auth.signInWithPassword({
-            email, password
-        });
-
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
-
         currentUser = data.user;
         showAlert('signin-alert', 'Sign in successful!', 'success');
-        setTimeout(() => showDashboard(), 1000);
+        setTimeout(() => showDashboard(), 600);
     } catch (error) {
         showAlert('signin-alert', error.message, 'error');
     }
 }
 
-async function handleSignUp(e) {
-    e.preventDefault();
-    const name = document.getElementById('signup-name').value;
-    const email = document.getElementById('signup-email').value;
-    const password = document.getElementById('signup-password').value;
-    const confirmPassword = document.getElementById('signup-confirm-password').value;
+async function handleSignUp(event) {
+    event.preventDefault();
+    const name = $('signup-name').value.trim();
+    const email = $('signup-email').value.trim();
+    const password = $('signup-password').value;
+    const confirmPassword = $('signup-confirm-password').value;
 
     if (password !== confirmPassword) {
         showAlert('signup-alert', 'Passwords do not match.', 'error');
@@ -322,56 +911,45 @@ async function handleSignUp(e) {
         const { data, error } = await supabase.auth.signUp({
             email, password,
             options: {
-                data: {
-                    display_name: name,
-                    name: name,
-                    full_name: name
-                },
+                data: { display_name: name, name: name, full_name: name },
                 emailRedirectTo: window.location.origin
             }
         });
-
         if (error) throw error;
 
-        // Add default expense types for new user
         if (data.user) {
-            const defaultTypes = ['Food', 'Transportation', 'Entertainment', 'Utilities', 'Shopping', 'Healthcare', 'Education', 'Other'];
-            for (const type of defaultTypes) {
-                await supabase.from('expense_types').insert([{ user_id: data.user.id, name: type }]);
-            }
+            const defaults = ['Food', 'Transportation', 'Entertainment', 'Utilities',
+                'Shopping', 'Healthcare', 'Education', 'Other'];
+            await supabase.from('expense_types')
+                .insert(defaults.map(name => ({ user_id: data.user.id, name })));
         }
 
-        showAlert('signup-alert', 'Check your email for verification link!', 'success');
+        showAlert('signup-alert', 'Check your email for the verification link!', 'success');
         setTimeout(() => showSignIn(), 2000);
     } catch (error) {
         showAlert('signup-alert', error.message, 'error');
     }
 }
 
-async function handleForgotPassword(e) {
-    e.preventDefault();
-    const email = document.getElementById('forgot-email').value;
-
+async function handleForgotPassword(event) {
+    event.preventDefault();
+    const email = $('forgot-email').value.trim();
     try {
         const { error } = await supabase.auth.resetPasswordForEmail(email, {
             redirectTo: window.location.origin
         });
-
-        if (error) {
-            showAlert('forgot-alert', 'Invalid email or user doesn\'t exist. Please sign up.', 'error');
-        } else {
-            showAlert('forgot-alert', 'Password reset link sent to your email!', 'success');
-            setTimeout(() => showSignIn(), 2000);
-        }
+        if (error) throw error;
+        showAlert('forgot-alert', 'Password reset link sent to your email!', 'success');
+        setTimeout(() => showSignIn(), 2000);
     } catch (error) {
-        showAlert('forgot-alert', 'Invalid email or user doesn\'t exist. Please sign up.', 'error');
+        showAlert('forgot-alert', "Invalid email or user doesn't exist. Please sign up.", 'error');
     }
 }
 
-async function handlePasswordReset(e) {
-    e.preventDefault();
-    const newPassword = document.getElementById('reset-password').value;
-    const confirmPassword = document.getElementById('reset-confirm-password').value;
+async function handlePasswordReset(event) {
+    event.preventDefault();
+    const newPassword = $('reset-password').value;
+    const confirmPassword = $('reset-confirm-password').value;
 
     if (newPassword !== confirmPassword) {
         showAlert('reset-alert', 'Passwords do not match.', 'error');
@@ -381,11 +959,8 @@ async function handlePasswordReset(e) {
     try {
         const { error } = await supabase.auth.updateUser({ password: newPassword });
         if (error) throw error;
-
         showAlert('reset-alert', 'Password updated successfully!', 'success');
-        setTimeout(() => {
-            window.location.hash = '';
-        }, 2000);
+        setTimeout(() => { window.location.hash = ''; }, 1800);
     } catch (error) {
         showAlert('reset-alert', error.message, 'error');
     }
@@ -393,55 +968,48 @@ async function handlePasswordReset(e) {
 
 async function showForcedPasswordChange() {
     hideAllForms();
-
-    // Ensure we have a valid user for password recovery
     if (!currentUser) {
         showSignIn();
         return;
     }
 
     try {
-        await supabase
-            .from('user_profiles')
-            .upsert([{
-                user_id: currentUser.id,
-                requires_password_reset: true
-            }], { onConflict: 'user_id' });
+        await supabase.from('user_profiles')
+            .upsert([{ user_id: currentUser.id, requires_password_reset: true }],
+                { onConflict: 'user_id' });
     } catch (error) {
         console.error('Failed to update password reset flag:', error);
     }
 
-    document.getElementById('change-password-modal').style.display = 'block';
+    openModal('change-password-modal');
 
     const closeBtn = document.querySelector('#change-password-modal .close-modal');
-    closeBtn.style.display = 'none';
-    document.getElementById('change-password-modal').onclick = null;
+    if (closeBtn) closeBtn.style.display = 'none';
 
-    const modalTitle = document.querySelector('#change-password-modal h3');
-    modalTitle.textContent = 'Set New Password';
+    const title = document.querySelector('#change-password-modal h3');
+    if (title) title.textContent = 'Set New Password';
 
-    let instructionText = document.getElementById('password-reset-instruction');
-    if (!instructionText) {
-        instructionText = document.createElement('p');
-        instructionText.id = 'password-reset-instruction';
-        instructionText.style.cssText = 'color: #6b7280; margin-bottom: 1rem; font-size: 0.9rem; text-align: center;';
-        instructionText.textContent = 'Please set a new password to continue using your account.';
-        modalTitle.insertAdjacentElement('afterend', instructionText);
+    if (!$('password-reset-instruction') && title) {
+        const note = document.createElement('p');
+        note.id = 'password-reset-instruction';
+        note.className = 'setting-desc';
+        note.style.marginBottom = '1rem';
+        note.textContent = 'Please set a new password to continue using your account.';
+        title.insertAdjacentElement('afterend', note);
     }
 
-    document.getElementById('new-password').focus();
+    $('new-password').focus();
 }
 
-async function handleChangePassword(e) {
-    e.preventDefault();
-    const newPassword = document.getElementById('new-password').value;
-    const confirmNewPassword = document.getElementById('confirm-new-password').value;
+async function handleChangePassword(event) {
+    event.preventDefault();
+    const newPassword = $('new-password').value;
+    const confirmNewPassword = $('confirm-new-password').value;
 
     if (newPassword !== confirmNewPassword) {
         showAlert('change-password-alert', 'New passwords do not match.', 'error');
         return;
     }
-
     if (newPassword.length < 6) {
         showAlert('change-password-alert', 'Password must be at least 6 characters long.', 'error');
         return;
@@ -452,12 +1020,9 @@ async function handleChangePassword(e) {
         if (error) throw error;
 
         if (isPasswordResetFlow) {
-            await supabase
-                .from('user_profiles')
-                .upsert([{
-                    user_id: currentUser.id,
-                    requires_password_reset: false
-                }], { onConflict: 'user_id' });
+            await supabase.from('user_profiles')
+                .upsert([{ user_id: currentUser.id, requires_password_reset: false }],
+                    { onConflict: 'user_id' });
         }
 
         showAlert('change-password-alert', 'Password changed successfully!', 'success');
@@ -467,10 +1032,10 @@ async function handleChangePassword(e) {
                 isPasswordResetFlow = false;
                 closeChangePasswordModal();
                 showDashboard();
-                showNotification('Password updated successfully! You can now use your account.', 'success');
-            }, 1500);
+                showNotification('Password updated. You can now use your account.', 'success');
+            }, 1400);
         } else {
-            setTimeout(() => closeChangePasswordModal(), 2000);
+            setTimeout(() => closeChangePasswordModal(), 1600);
         }
     } catch (error) {
         showAlert('change-password-alert', error.message, 'error');
@@ -478,54 +1043,41 @@ async function handleChangePassword(e) {
 }
 
 function showChangePassword() {
-    document.getElementById('change-password-modal').style.display = 'block';
-    hideLandingIcons();
-    document.getElementById('current-password').focus();
+    openModal('change-password-modal');
+    // NOTE: focus the field that actually exists on this form.
+    $('new-password').focus();
 }
 
 function closeChangePasswordModal() {
     if (isPasswordResetFlow) return;
 
-    document.getElementById('change-password-modal').style.display = 'none';
-    document.getElementById('change-password-form').reset();
-    document.getElementById('change-password-alert').innerHTML = '';
+    closeModal('change-password-modal');
+    $('change-password-form').reset();
+    $('change-password-alert').innerHTML = '';
 
     const closeBtn = document.querySelector('#change-password-modal .close-modal');
-    closeBtn.style.display = 'block';
+    if (closeBtn) closeBtn.style.display = '';
 
-    const modalTitle = document.querySelector('#change-password-modal h3');
-    modalTitle.textContent = 'Change Password';
+    const title = document.querySelector('#change-password-modal h3');
+    if (title) title.textContent = 'Change Password';
 
-    const instructionText = document.getElementById('password-reset-instruction');
-    if (instructionText) {
-        instructionText.remove();
-    }
-    showLandingIcons();
+    const note = $('password-reset-instruction');
+    if (note) note.remove();
 }
 
-// Replace the existing logout function
 async function logout() {
     try {
-        // Sign out with global scope to terminate all sessions
         const { error } = await supabase.auth.signOut();
+        if (error) console.error('Logout error:', error);
 
-        if (error) {
-            console.error('Logout error:', error);
-        }
-
-        // Clear any local storage related to auth
         localStorage.removeItem('supabase.auth.token');
-
-        // Clear the project-specific auth token
-        const projectId = supabaseUrl.split('//')[1]?.split('.')[0];
-        if (projectId) {
-            localStorage.removeItem(`sb-${projectId}-auth-token`);
-        }
+        const projectId = supabaseUrl.split('//')[1] ? supabaseUrl.split('//')[1].split('.')[0] : null;
+        if (projectId) localStorage.removeItem('sb-' + projectId + '-auth-token');
 
         currentUser = null;
         isPasswordResetFlow = false;
         showSignIn();
-        showNotification('Signed out from all devices', 'success');
+        showNotification('Signed out', 'success');
     } catch (error) {
         console.error('Error during logout:', error);
         currentUser = null;
@@ -533,17 +1085,20 @@ async function logout() {
     }
 }
 
-// Dashboard functions
+/* =====================================================================
+   Dashboard
+   ===================================================================== */
+
 async function showDashboard() {
-    // Check if user requires password reset
+    if (!currentUser) return;
+
     try {
         const { data } = await supabase
             .from('user_profiles')
             .select('requires_password_reset')
             .eq('user_id', currentUser.id)
-            .single();
-
-        if (data?.requires_password_reset) {
+            .maybeSingle();
+        if (data && data.requires_password_reset) {
             isPasswordResetFlow = true;
             showForcedPasswordChange();
             return;
@@ -553,190 +1108,201 @@ async function showDashboard() {
     }
 
     hideAllForms();
-    document.getElementById('dashboard').style.display = 'block';
-    showLandingIcons();
+    $('dashboard').style.display = 'block';
+    document.body.classList.add('signed-in');
 
-    const displayName = currentUser.user_metadata?.display_name ||
-        currentUser.user_metadata?.name ||
-        currentUser.user_metadata?.full_name ||
+    const meta = currentUser.user_metadata || {};
+    const displayName = meta.display_name || meta.name || meta.full_name ||
         currentUser.email.split('@')[0];
 
-    document.getElementById('user-name').textContent = `Welcome, ${displayName}!`;
-    document.getElementById('user-email').textContent = currentUser.email;
-    document.getElementById('user-avatar').textContent = displayName.charAt(0).toUpperCase();
+    setText('user-name', 'Welcome, ' + displayName + '!');
+    setText('user-email', currentUser.email);
+    setText('user-avatar', displayName.charAt(0).toUpperCase());
 
-    // Check for URL parameters (amount from SMS automation)
-    const urlParams = new URLSearchParams(window.location.search);
-    const prefilledAmount = urlParams.get('amount');
+    await loadSettings();
+    loadFiredAlerts();
+    applyBillingMode();
+
+    // Amount prefilled by the SMS automation shortcut.
+    const params = new URLSearchParams(window.location.search);
+    const prefilledAmount = params.get('amount');
     if (prefilledAmount && !isNaN(prefilledAmount)) {
-        const ceiledAmount = Math.ceil(parseFloat(prefilledAmount));
-        document.getElementById('amount').value = ceiledAmount;
-        document.getElementById('amount').focus(); // Optional: focus the field
-        // Clear URL parameter
+        $('amount').value = Math.ceil(parseFloat(prefilledAmount));
         window.history.replaceState({}, document.title, window.location.pathname);
+        focusAddExpense();
     }
 
-    // Load budget first, then other data
+    $('date').value = todayISO();
+    updateDateDisplay();
+    resetBillingToggle();
+    renderExpenseSkeleton();
+
     await loadUserBudget();
     updateBudgetHeader();
-    loadUserTypes();
-    await loadExpenses();
-    await updateStatistics();
-    await updateBudgetDisplay();
-
-    // Check if current month budget exists and update button
-    setTimeout(async () => {
-        const istNow = getISTDate();
-        const currentMonth = istNow.getMonth() + 1;
-        const currentYear = istNow.getFullYear();
-
-        const { data } = await supabase
-            .from('user_budgets')
-            .select('monthly_billed_budget, monthly_unbilled_budget')
-            .eq('user_id', currentUser.id)
-            .eq('budget_month', currentMonth)
-            .eq('budget_year', currentYear)
-            .single();
-
-        const budgetExists = data && (data.monthly_billed_budget > 0 || data.monthly_unbilled_budget > 0);
-        const budgetBtn = document.querySelector('.budget-tracker h3 + .btn');
-        if (budgetBtn) budgetBtn.textContent = budgetExists ? 'Update Budget' : 'Set Budget';
-    }, 100);
+    await Promise.all([
+        loadUserTypes(),
+        loadExpenses(),
+        updateStatistics(),
+        updateBudgetDisplay(),
+        loadRecurring()
+    ]);
 }
 
-function toggleUserMenu() {
-    const menu = document.getElementById('user-menu');
-    menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+function toggleUserMenu(event) {
+    if (event) event.stopPropagation();
+    const menu = $('user-menu');
+    const open = menu.classList.toggle('open');
+    $('user-avatar').setAttribute('aria-expanded', String(open));
 }
 
-// Close menu when clicking outside
+function closeUserMenu() {
+    const menu = $('user-menu');
+    if (!menu) return;
+    menu.classList.remove('open');
+    const avatar = $('user-avatar');
+    if (avatar) avatar.setAttribute('aria-expanded', 'false');
+}
+
 document.addEventListener('click', function (event) {
-    const avatar = document.getElementById('user-avatar');
-    const menu = document.getElementById('user-menu');
-    if (menu && !avatar.contains(event.target) && !menu.contains(event.target)) {
-        menu.style.display = 'none';
-    }
+    const avatar = $('user-avatar');
+    const menu = $('user-menu');
+    if (!menu || !avatar) return;
+    if (!avatar.contains(event.target) && !menu.contains(event.target)) closeUserMenu();
 });
+
+function focusAddExpense() {
+    const card = $('add-expense-card');
+    if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => {
+        const note = $('note');
+        if (note) note.focus({ preventScroll: true });
+    }, 320);
+}
+
+/* ---------------------------------------------------------------------
+   Simple mode: billed/unbilled hidden across the whole UI
+   --------------------------------------------------------------------- */
+
+function applyBillingMode() {
+    const tracking = trackingBilling();
+    document.body.classList.toggle('simple-mode', !tracking);
+
+    show('budget-split', tracking, 'grid');
+    show('stat-billed-card', tracking);
+    show('stat-unbilled-card', tracking);
+    show('billing-status-group', tracking);
+    show('billing-filter-group', tracking);
+    show('import-pill-billed', tracking, 'inline-block');
+    show('import-billed-hint', tracking, 'inline');
+
+    document.querySelectorAll('.import-preview-table .col-billed')
+        .forEach(cell => { cell.style.display = tracking ? '' : 'none'; });
+
+    // Analytics must not stay filtered by a control the user can no longer see.
+    if (!tracking) $('billing-filter').value = 'both';
+
+    // Budget modal switches between one total field and the billed/unbilled pair.
+    show('budget-total-group', !tracking);
+    show('budget-billed-group', tracking);
+    show('budget-unbilled-group', tracking);
+    $('total-budget-amount').required = !tracking;
+    $('billed-budget-amount').required = tracking;
+    $('unbilled-budget-amount').required = tracking;
+
+    show('recurring-billed-group', tracking);
+    if (!tracking) $('recurring-billed-toggle').classList.remove('active');
+
+    syncSettingSwitches();
+    if ($('budget-modal').classList.contains('open')) renderAlertRules();
+    renderRecurringDue();
+}
+
+function syncSettingSwitches() {
+    const pairs = [
+        ['setting-track-billing', trackingBilling()],
+        ['setting-default-billed', settings.defaultBilled === true],
+        ['setting-budget-alerts', settings.budgetAlerts !== false]
+    ];
+    pairs.forEach(([id, on]) => {
+        const el = $(id);
+        if (!el) return;
+        el.classList.toggle('on', on);
+        el.setAttribute('aria-checked', String(on));
+    });
+    // "Default to billed" is meaningless when billing isn't tracked.
+    const defaultRow = $('setting-default-billed');
+    if (defaultRow && defaultRow.parentElement) {
+        defaultRow.parentElement.style.display = trackingBilling() ? '' : 'none';
+    }
+}
+
+function showSettingsModal() {
+    syncSettingSwitches();
+    openModal('settings-modal');
+}
+
+function closeSettingsModal() {
+    closeModal('settings-modal');
+    $('settings-alert').innerHTML = '';
+}
+
+async function toggleTrackBilling() {
+    const next = !trackingBilling();
+    await saveSettings({ trackBilling: next });
+    applyBillingMode();
+    resetBillingToggle();
+
+    await Promise.all([loadExpenses(), updateStatistics(), updateBudgetDisplay()]);
+    renderRecurringDue();
+    renderPresetChips();
+
+    showAlert('settings-alert',
+        next
+            ? 'Billed / unbilled tracking is on. Budgets are split again.'
+            : 'Simplified. One total budget, and new expenses save as unbilled.',
+        next ? 'info' : 'success');
+}
+
+async function toggleDefaultBilled() {
+    await saveSettings({ defaultBilled: !settings.defaultBilled });
+    syncSettingSwitches();
+    resetBillingToggle();
+}
+
+async function toggleBudgetAlerts() {
+    await saveSettings({ budgetAlerts: settings.budgetAlerts === false });
+    syncSettingSwitches();
+}
+
+/* =====================================================================
+   Expense types
+   ===================================================================== */
 
 async function loadUserTypes() {
     try {
-        const { data, error } = await supabase
-            .from('expense_types')
-            .select('name')
-            .order('name');
-
+        const { data, error } = await supabase.from('expense_types').select('name').order('name');
         if (error) throw error;
 
-        const typeSelect = document.getElementById('type');
-        typeSelect.innerHTML = '<option value="">Select Type</option>';
-
+        const select = $('type');
+        const previous = select.value;
+        select.innerHTML = '<option value="">Select Type</option>';
         data.forEach(type => {
             const option = document.createElement('option');
             option.value = type.name;
             option.textContent = type.name;
-            typeSelect.appendChild(option);
+            select.appendChild(option);
         });
+        if (previous) select.value = previous;
 
-        loadRecentTypeBubbles();
+        await loadRecentActivity();
     } catch (error) {
         console.error('Failed to load types:', error);
     }
 }
 
-async function loadRecentTypeBubbles() {
-    const row = document.getElementById('recent-types-row');
-    const container = document.getElementById('recent-types-bubbles');
-    try {
-        const { data, error } = await supabase
-            .from('expenses')
-            .select('type, updated_at')
-            .eq('user_id', currentUser.id)
-            .order('updated_at', { ascending: false })
-            .limit(50);
-
-        if (error) throw error;
-
-        const seen = new Set();
-        const recentTypes = [];
-        for (const row of data) {
-            if (!seen.has(row.type)) {
-                seen.add(row.type);
-                recentTypes.push(row.type);
-            }
-            if (recentTypes.length === 12) break; // gather a generous pool, trim by width below
-        }
-
-        if (recentTypes.length === 0) {
-            row.style.display = 'none';
-            return;
-        }
-
-        row.style.display = 'block';
-        renderTypeBubblesResponsive(recentTypes);
-    } catch (error) {
-        console.error('Failed to load recent types:', error);
-        row.style.display = 'none';
-    }
-}
-
-function renderTypeBubblesResponsive(recentTypes) {
-    const container = document.getElementById('recent-types-bubbles');
-    const MIN_BUBBLES = 3;
-
-    // Render all candidates first (off-screen-safe, just normal flow) so we can measure real widths
-    container.innerHTML = '';
-    recentTypes.forEach(typeName => {
-        const bubble = document.createElement('button');
-        bubble.type = 'button';
-        bubble.className = 'type-bubble';
-        bubble.textContent = typeName;
-        bubble.onclick = () => selectTypeFromBubble(typeName);
-        container.appendChild(bubble);
-    });
-
-    requestAnimationFrame(() => {
-        const containerWidth = container.clientWidth;
-        const gap = 8; // matches CSS gap: 0.5rem
-        const bubbles = Array.from(container.children);
-
-        let usedWidth = 0;
-        let fitCount = 0;
-
-        for (let i = 0; i < bubbles.length; i++) {
-            const w = bubbles[i].offsetWidth;
-            const next = usedWidth + (fitCount > 0 ? gap : 0) + w;
-            if (next <= containerWidth || fitCount < MIN_BUBBLES) {
-                usedWidth = next;
-                fitCount++;
-            } else {
-                break;
-            }
-        }
-
-        fitCount = Math.max(MIN_BUBBLES, Math.min(fitCount, bubbles.length));
-
-        bubbles.forEach((b, idx) => {
-            if (idx >= fitCount) b.remove();
-        });
-    });
-}
-
-function selectTypeFromBubble(typeName) {
-    const typeSelect = document.getElementById('type');
-    typeSelect.value = typeName;
-
-    document.querySelectorAll('.type-bubble').forEach(b => {
-        b.classList.toggle('active', b.textContent === typeName);
-    });
-}
-
 async function loadTypesForEdit() {
     try {
-        const { data, error } = await supabase
-            .from('expense_types')
-            .select('name')
-            .order('name');
-
+        const { data, error } = await supabase.from('expense_types').select('name').order('name');
         if (error) throw error;
         return data.map(type => type.name);
     } catch (error) {
@@ -745,580 +1311,1770 @@ async function loadTypesForEdit() {
     }
 }
 
-async function createEditableElements(expenseId, expense) {
-    const expenseItem = document.querySelector(`[data-id="${expenseId}"]`);
+/**
+ * One query powers both the "quick select" type bubbles and the quick-add
+ * model (presets + the token->type index), so this replaced a separate
+ * fetch rather than adding one.
+ */
+async function loadRecentActivity() {
+    const row = $('recent-types-row');
+    if (!currentUser) return;
 
-    // Amount input with ₹ prefix
-    const amountEl = expenseItem.querySelector('.expense-amount');
-    const originalAmount = parseFloat(amountEl.dataset.original);
-    amountEl.innerHTML = `<input type="number" step="0.01" min="0" max="1000000" value="${originalAmount}" placeholder="0.00" onchange="trackExpenseChange(${expenseId})">`;
-
-    // Note input
-    const noteEl = expenseItem.querySelector('.expense-note');
-    const originalNote = noteEl.dataset.original;
-    noteEl.innerHTML = `<input type="text" value="${originalNote}" placeholder="Add description..." maxlength="500" onchange="trackExpenseChange(${expenseId})">`;
-
-    // Type select with styled dropdown
-    const typeEl = expenseItem.querySelector('.expense-type');
-    const originalType = typeEl.dataset.original;
-    const types = await loadTypesForEdit();
-    typeEl.innerHTML = `<select onchange="trackExpenseChange(${expenseId})">
-                ${types.map(type => `<option value="${type}" ${type === originalType ? 'selected' : ''}>${type}</option>`).join('')}
-            </select>`;
-
-    // Date input
-    const dateEl = expenseItem.querySelector('.expense-date');
-    const originalDate = dateEl.dataset.original;
-    dateEl.innerHTML = `<input type="date" value="${originalDate}" onchange="trackExpenseChange(${expenseId})">`;
-}
-
-function restoreStaticElements(expenseId) {
-    const expenseItem = document.querySelector(`[data-id="${expenseId}"]`);
-    const edits = expenseEdits[expenseId] || {};
-
-    // Restore amount with ₹ prefix
-    const amountEl = expenseItem.querySelector('.expense-amount');
-    const finalAmount = edits.amount !== undefined ? edits.amount : parseFloat(amountEl.dataset.original);
-    amountEl.innerHTML = `₹${finalAmount.toFixed(2)}`;
-
-    // Restore note
-    const noteEl = expenseItem.querySelector('.expense-note');
-    const finalNote = edits.note !== undefined ? edits.note : noteEl.dataset.original;
-    noteEl.innerHTML = finalNote || 'No description';
-
-    // Restore type with original styling
-    const typeEl = expenseItem.querySelector('.expense-type');
-    const finalType = edits.type !== undefined ? edits.type : typeEl.dataset.original;
-    typeEl.innerHTML = finalType;
-    typeEl.className = 'expense-type'; // Restore original class
-
-    // Restore date
-    const dateEl = expenseItem.querySelector('.expense-date');
-    const finalDate = edits.date !== undefined ? edits.date : dateEl.dataset.original;
-    dateEl.innerHTML = formatDate(finalDate);
-}
-
-function trackExpenseChange(expenseId) {
-    const expenseItem = document.querySelector(`[data-id="${expenseId}"]`);
-
-    // Get current values
-    const amountInput = expenseItem.querySelector('.expense-amount input');
-    const noteInput = expenseItem.querySelector('.expense-note input');
-    const typeSelect = expenseItem.querySelector('.expense-type select');
-    const dateInput = expenseItem.querySelector('.expense-date input');
-
-    const currentAmount = parseFloat(amountInput?.value || 0);
-    const currentNote = noteInput?.value?.trim() || '';
-    const currentType = typeSelect?.value || '';
-    const currentDate = dateInput?.value || '';
-
-    // Get original values
-    const originalAmount = parseFloat(expenseItem.querySelector('.expense-amount').dataset.original);
-    const originalNote = expenseItem.querySelector('.expense-note').dataset.original;
-    const originalType = expenseItem.querySelector('.expense-type').dataset.original;
-    const originalDate = expenseItem.querySelector('.expense-date').dataset.original;
-    const originalBilled = expenseItem.querySelector('.billed-status').dataset.billed === 'true';
-
-    // Initialize edits object
-    if (!expenseEdits[expenseId]) {
-        expenseEdits[expenseId] = {
-            originalAmount, originalNote, originalType, originalDate, originalBilled,
-            billed: originalBilled
-        };
-    }
-
-    // Update current values
-    expenseEdits[expenseId].amount = currentAmount;
-    expenseEdits[expenseId].note = currentNote;
-    expenseEdits[expenseId].type = currentType;
-    expenseEdits[expenseId].date = currentDate;
-
-    // Check if anything changed from original
-    const hasChanges = currentAmount !== originalAmount ||
-        currentNote !== originalNote ||
-        currentType !== originalType ||
-        currentDate !== originalDate ||
-        expenseEdits[expenseId].billed !== originalBilled;
-
-    if (hasChanges) {
-        editedExpenses.add(expenseId);
-    } else {
-        editedExpenses.delete(expenseId);
-        // Don't delete the object completely, keep it for toggle state
-    }
-
-    updateSaveButton();
-}
-
-async function handleAddExpense(e) {
-    e.preventDefault();
-
-    try {
-        const amount = parseFloat(document.getElementById('amount').value);
-        const type = document.getElementById('type').value;
-        const note = document.getElementById('note').value.trim();
-        const isBilled = document.getElementById('form-billed-toggle').classList.contains('active');
-
-        // Enhanced validation
-        if (!amount || amount <= 0) {
-            showNotification('Please enter a valid amount greater than 0', 'error');
-            return;
-        }
-
-        if (amount > 1000000) {
-            showNotification('Amount cannot exceed ₹10,00,000', 'error');
-            return;
-        }
-
-        if (!type) {
-            showNotification('Please select an expense type', 'error');
-            return;
-        }
-
-        if (!note) {
-            showNotification('Please enter a description', 'error');
-            return;
-        }
-
-        if (note.length > 500) {
-            showNotification('Description cannot exceed 500 characters', 'error');
-            return;
-        }
-
-        const expense = {
-            user_id: currentUser.id,
-            amount: amount,
-            date: document.getElementById('date').value,
-            type: type,
-            note: note,
-            billed: isBilled
-        };
-
-        const { error } = await supabase
-            .from('expenses')
-            .insert([expense]);
-
-        if (error) throw error;
-
-        document.getElementById('expense-form').reset();
-        document.getElementById('date').value = new Date().toLocaleDateString('en-CA');
-        document.getElementById('form-billed-toggle').classList.remove('active');
-        document.querySelectorAll('.type-bubble').forEach(b => b.classList.remove('active'));
-        updateDateDisplay();
-
-        const selectedType = document.getElementById('type').value; // Save current selection
-        await Promise.all([
-            loadExpenses(),
-            updateStatistics(),
-            updateBudgetDisplay()
-        ]);
-        document.getElementById('type').value = selectedType; // Restore selection
-
-        await checkBudgetWarnings();
-        loadRecentTypeBubbles();
-        showNotification('Expense added successfully!', 'success');
-    } catch (error) {
-        console.error('Add expense error:', error);
-        showNotification('Failed to add expense: ' + error.message, 'error');
-    }
-}
-
-async function checkBudgetWarnings() {
-    const { billedUsedPercentage, unbilledUsedPercentage } = await updateBudgetDisplay();
-
-    if (!budgetWarningShown.billed && billedUsedPercentage >= 90 && monthlyBilledBudget > 0) {
-        if (billedUsedPercentage >= 100) {
-            showNotification('Alert: You\'ve exceeded your monthly billed budget!', 'error');
-        } else {
-            showNotification(`Warning: You\'ve used ${Math.round(billedUsedPercentage)}% of your billed budget!`, 'warning');
-        }
-        budgetWarningShown.billed = true;
-    }
-
-    if (!budgetWarningShown.unbilled && unbilledUsedPercentage >= 90 && monthlyUnbilledBudget > 0) {
-        if (unbilledUsedPercentage >= 100) {
-            showNotification('Alert: You\'ve exceeded your monthly unbilled budget!', 'error');
-        } else {
-            showNotification(`Warning: You\'ve used ${Math.round(unbilledUsedPercentage)}% of your unbilled budget!`, 'warning');
-        }
-        budgetWarningShown.unbilled = true;
-    }
-}
-
-async function loadExpenses() {
     try {
         const { data, error } = await supabase
             .from('expenses')
-            .select('*')
+            .select('note, amount, type, billed, updated_at')
+            .eq('user_id', currentUser.id)
             .order('updated_at', { ascending: false })
-            .limit(5); // Show only last 5 inserted/updated
-
+            .limit(400);
         if (error) throw error;
 
-        const container = document.getElementById('expenses-container');
-
-        if (data.length === 0) {
-            container.innerHTML = '<p style="text-align: center; color: #9ca3af; padding: 3rem;">No expenses added yet. Add your first expense above!</p>';
-            return;
-        }
-
-        container.innerHTML = data.map(expense => `
-                    <div class="expense-item">
-                        <div class="expense-details">
-                            <div class="expense-amount">₹${expense.amount.toFixed(2)}</div>
-                            <div class="expense-note">${sanitizeHTML(expense.note) || 'No description'}</div>
-                            <div class="expense-meta">
-                                <span class="expense-type">${expense.type}</span>
-                                ${expense.billed ? '<span class="billed-badge">BILLED</span>' : ''}
-                                <span>${formatDate(expense.date)}</span>
-                            </div>
-                        </div>
-                    </div>
-                `).join('');
+        const rows = data || [];
+        renderRecentTypeBubbles(rows);
+        buildQuickAddModel(rows);
     } catch (error) {
-        console.error('Failed to load expenses:', error);
+        console.error('Failed to load recent activity:', error);
+        if (row) row.style.display = 'none';
     }
 }
 
+// Kept as the historical name used by the resize handler.
+const loadRecentTypeBubbles = loadRecentActivity;
 
-async function deleteFilteredExpense(id) {
-    if (confirm('Are you sure you want to delete this expense?')) {
-        try {
-            const { error } = await supabase
-                .from('expenses')
-                .delete()
-                .eq('id', id);
+function renderRecentTypeBubbles(rows) {
+    const row = $('recent-types-row');
+    const seen = new Set();
+    const recentTypes = [];
 
-            if (error) throw error;
+    for (const entry of rows) {
+        if (!entry.type || seen.has(entry.type)) continue;
+        seen.add(entry.type);
+        recentTypes.push(entry.type);
+        if (recentTypes.length === 12) break;
+    }
 
-            // Remove from filtered expenses
-            filteredExpenses = filteredExpenses.filter(expense => expense.id !== id);
+    if (!recentTypes.length) {
+        row.style.display = 'none';
+        return;
+    }
+    row.style.display = 'block';
+    renderTypeBubblesResponsive(recentTypes);
+}
 
-            // Refresh displays
-            await showExpenseList();
-            updateChart(currentChart ? currentChart.config.type : 'pie');
-            await loadExpenses();
-            await updateStatistics();
-            await updateBudgetDisplay();
-            await checkBudgetWarnings();
-            showNotification('Expense deleted successfully!', 'success');
-        } catch (error) {
-            showNotification('Failed to delete expense: ' + error.message, 'error');
+function renderTypeBubblesResponsive(recentTypes) {
+    const container = $('recent-types-bubbles');
+    const MIN_BUBBLES = 3;
+    const selected = $('type').value;
+
+    container.innerHTML = '';
+    recentTypes.forEach(name => {
+        const bubble = document.createElement('button');
+        bubble.type = 'button';
+        bubble.className = 'type-bubble' + (name === selected ? ' active' : '');
+        bubble.textContent = name;
+        bubble.onclick = () => selectTypeFromBubble(name);
+        container.appendChild(bubble);
+    });
+
+    requestAnimationFrame(() => {
+        const containerWidth = container.clientWidth;
+        if (!containerWidth) return;
+        const gap = 6;
+        const bubbles = Array.from(container.children);
+
+        let usedWidth = 0;
+        let fitCount = 0;
+        for (let i = 0; i < bubbles.length; i++) {
+            const next = usedWidth + (fitCount > 0 ? gap : 0) + bubbles[i].offsetWidth;
+            if (next <= containerWidth || fitCount < MIN_BUBBLES) {
+                usedWidth = next;
+                fitCount++;
+            } else {
+                break;
+            }
         }
-    }
+        fitCount = Math.max(MIN_BUBBLES, Math.min(fitCount, bubbles.length));
+        bubbles.forEach((bubble, index) => {
+            if (index >= fitCount) bubble.remove();
+        });
+    });
 }
 
-async function updateStatistics() {
-    try {
-        const { data, error } = await supabase
-            .from('expenses')
-            .select('amount, date, billed');
-
-        if (error) throw error;
-
-        const istNow = getISTDate();
-        const currentMonth = istNow.getMonth() + 1;
-        const currentYear = istNow.getFullYear();
-        const bounds = getISTMonthBounds(currentYear, currentMonth);
-        const firstDayOfMonth = bounds.first;
-        const lastDayOfMonth = bounds.last;
-
-        // For last month:
-        const lastMonthBounds = currentMonth === 1 ?
-            getISTMonthBounds(currentYear - 1, 12) :
-            getISTMonthBounds(currentYear, currentMonth - 1);
-        const lastMonthFirstDay = lastMonthBounds.first;
-        const lastMonthLastDay = lastMonthBounds.last;
-
-        // Current month calculations
-        const monthlyExpenses = data
-            .filter(expense => expense.date >= firstDayOfMonth && expense.date <= lastDayOfMonth)
-            .reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-        const monthlyCount = data.filter(expense =>
-            expense.date >= firstDayOfMonth && expense.date <= lastDayOfMonth
-        ).length;
-
-        const monthlyBilledExpenses = data
-            .filter(expense => expense.billed && expense.date >= firstDayOfMonth && expense.date <= lastDayOfMonth)
-            .reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-        const monthlyUnbilledExpenses = data
-            .filter(expense => !expense.billed && expense.date >= firstDayOfMonth && expense.date <= lastDayOfMonth)
-            .reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-        const lastMonthExpenses = data
-            .filter(expense => expense.date >= lastMonthFirstDay && expense.date <= lastMonthLastDay)
-            .reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-        // All-time total for reference
-        const totalExpenses = data.reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-        // Update DOM - Note: Changed labels to reflect actual data
-        document.getElementById('total-expenses').textContent = `₹${lastMonthExpenses.toFixed(2)}`;
-        document.getElementById('monthly-expenses').textContent = `₹${monthlyExpenses.toFixed(2)}`;
-        document.getElementById('billed-expenses').textContent = `₹${monthlyBilledExpenses.toFixed(2)}`;
-        document.getElementById('unbilled-expenses').textContent = `₹${monthlyUnbilledExpenses.toFixed(2)}`;
-        document.getElementById('expense-count').textContent = monthlyCount;
-    } catch (error) {
-        console.error('Failed to update statistics:', error);
-    }
+function selectTypeFromBubble(name) {
+    $('type').value = name;
+    document.querySelectorAll('.type-bubble').forEach(bubble => {
+        bubble.classList.toggle('active', bubble.textContent === name);
+    });
 }
 
-// Type management functions
 function showAddTypeModal() {
-    document.getElementById('add-type-modal').style.display = 'block';
-    document.getElementById('new-type').focus();
-    hideLandingIcons();
+    openModal('add-type-modal');
+    $('new-type').focus();
 }
 
 function closeAddTypeModal() {
-    document.getElementById('add-type-modal').style.display = 'none';
-    document.getElementById('add-type-form').reset();
-    document.getElementById('type-alert').innerHTML = '';
-    showLandingIcons();
+    closeModal('add-type-modal');
+    $('add-type-form').reset();
+    $('type-alert').innerHTML = '';
 }
 
-async function handleAddType(e) {
-    e.preventDefault();
-    const newType = document.getElementById('new-type').value.trim();
-
+async function handleAddType(event) {
+    event.preventDefault();
+    const newType = $('new-type').value.trim();
     if (!newType) {
         showAlert('type-alert', 'Please enter a type name.', 'error');
         return;
     }
 
     try {
-        // Check if type already exists
         const { data: existing } = await supabase
-            .from('expense_types')
-            .select('name')
-            .ilike('name', newType);
-
+            .from('expense_types').select('name').ilike('name', newType);
         if (existing && existing.length > 0) {
             showAlert('type-alert', 'This type already exists.', 'error');
             return;
         }
 
         const { error } = await supabase
-            .from('expense_types')
-            .insert([{ user_id: currentUser.id, name: newType }]);
-
+            .from('expense_types').insert([{ user_id: currentUser.id, name: newType }]);
         if (error) throw error;
 
-        loadUserTypes();
-        document.getElementById('type').value = newType;
+        await loadUserTypes();
+        $('type').value = newType;
         showAlert('type-alert', 'Type added successfully!', 'success');
-        setTimeout(() => closeAddTypeModal(), 1500);
+        setTimeout(() => closeAddTypeModal(), 1200);
     } catch (error) {
         showAlert('type-alert', error.message || 'Failed to add type.', 'error');
     }
 }
 
-function updateBudgetHeader() {
-    const monthName = getCurrentMonthName();
-    document.getElementById('budget-header').textContent = `${monthName} Budget`;
-}
-
-// Budget management
-function setBudget() {
-    document.getElementById('budget-modal').style.display = 'block';
-    // Load current month's budget specifically
-    loadCurrentMonthBudget();
-    hideLandingIcons();
-}
-
-async function loadCurrentMonthBudget() {
-    const istNow = getISTDate();
-    const currentMonth = istNow.getMonth() + 1;
-    const currentYear = istNow.getFullYear();
-
-    const { data } = await supabase
-        .from('user_budgets')
-        .select('monthly_billed_budget, monthly_unbilled_budget')
-        .eq('user_id', currentUser.id)
-        .eq('budget_month', currentMonth)
-        .eq('budget_year', currentYear);
-
-    const budget = data && data.length > 0 ? data[0] : null;
-    document.getElementById('billed-budget-amount').value = budget?.monthly_billed_budget || '';
-    document.getElementById('unbilled-budget-amount').value = budget?.monthly_unbilled_budget || '';
-}
-
-function closeBudgetModal() {
-    document.getElementById('budget-modal').style.display = 'none';
-    showLandingIcons();
-}
-
-async function updateBudgetDisplay() {
-    if (!currentUser) return;
-
-    try {
-        const istNow = getISTDate();
-        const currentMonth = istNow.getMonth() + 1;
-        const currentYear = istNow.getFullYear();
-        const bounds = getISTMonthBounds(currentYear, currentMonth);
-        const firstDayOfMonth = bounds.first;
-        const lastDayOfMonth = bounds.last;
-
-        // Get current month expenses only
-        const { data: monthlyExpenses, error } = await supabase
-            .from('expenses')
-            .select('amount, billed')
-            .eq('user_id', currentUser.id)
-            .gte('date', firstDayOfMonth)
-            .lte('date', lastDayOfMonth);
-
-        if (error) throw error;
-
-        const monthlyBilledSpent = monthlyExpenses
-            .filter(expense => expense.billed)
-            .reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-        const monthlyUnbilledSpent = monthlyExpenses
-            .filter(expense => !expense.billed)
-            .reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-    // Billed Budget Display
-        const billedRemaining = monthlyBilledBudget - monthlyBilledSpent;
-        const billedRemainingElement = document.getElementById('billed-budget-remaining');
-        const billedPercentage = monthlyBilledBudget > 0 ? ((billedRemaining / monthlyBilledBudget) * 100) : 0;
-        const billedPercentageText = monthlyBilledBudget > 0 ? ` (${billedPercentage.toFixed(0)}%)` : '';
-
-        billedRemainingElement.textContent = `Billed Remaining: ₹${billedRemaining.toFixed(2)}${billedPercentageText}`;
-        document.getElementById('billed-budget-total').textContent = `Billed Budget: ₹${monthlyBilledBudget.toFixed(2)}`;
-
-        const billedUsedPercentage = monthlyBilledBudget > 0 ? (monthlyBilledSpent / monthlyBilledBudget) * 100 : 0;
-        const billedProgressBar = document.getElementById('billed-budget-progress-bar');
-        billedProgressBar.style.width = `${Math.min(billedUsedPercentage, 100)}%`;
-        billedProgressBar.classList.toggle('over-budget', billedUsedPercentage > 100);
-
-    // Unbilled Budget Display
-        const unbilledRemaining = monthlyUnbilledBudget - monthlyUnbilledSpent;
-        const unbilledRemainingElement = document.getElementById('unbilled-budget-remaining');
-        const unbilledPercentage = monthlyUnbilledBudget > 0 ? ((unbilledRemaining / monthlyUnbilledBudget) * 100) : 0;
-        const unbilledPercentageText = monthlyUnbilledBudget > 0 ? ` (${unbilledPercentage.toFixed(0)}%)` : '';
-
-        unbilledRemainingElement.textContent = `Unbilled Remaining: ₹${unbilledRemaining.toFixed(2)}${unbilledPercentageText}`;
-        document.getElementById('unbilled-budget-total').textContent = `Unbilled Budget: ₹${monthlyUnbilledBudget.toFixed(2)}`;
-
-        const unbilledUsedPercentage = monthlyUnbilledBudget > 0 ? (monthlyUnbilledSpent / monthlyUnbilledBudget) * 100 : 0;
-        const unbilledProgressBar = document.getElementById('unbilled-budget-progress-bar');
-        unbilledProgressBar.style.width = `${Math.min(unbilledUsedPercentage, 100)}%`;
-        unbilledProgressBar.classList.toggle('over-budget', unbilledUsedPercentage > 100);
-
-    // Color coding for remaining amounts
-        [
-            { element: billedRemainingElement, percentage: billedUsedPercentage },
-            { element: unbilledRemainingElement, percentage: unbilledUsedPercentage }
-        ].forEach(({ element, percentage }) => {
-            if (percentage >= 100) {
-                element.style.color = '#ef4444';
-                element.style.fontWeight = '600';
-            } else if (percentage >= 90) {
-                element.style.color = '#f56a20';
-                element.style.fontWeight = '600';
-            } else {
-                element.style.color = '';
-                element.style.fontWeight = '';
-            }
+function showEditTypeModal() {
+    openModal('edit-type-modal');
+    loadTypesForEdit().then(types => {
+        const select = $('edit-type-select');
+        select.innerHTML = '<option value="">Select Type</option>';
+        types.forEach(name => {
+            const option = document.createElement('option');
+            option.value = name;
+            option.textContent = name;
+            select.appendChild(option);
         });
-
-        return { billedUsedPercentage, unbilledUsedPercentage };
-
-    } catch (error) {
-        console.error('Failed to update budget display:', error);
-        return { billedUsedPercentage: 0, unbilledUsedPercentage: 0 };
-    }
-}
-
-function updateDateDisplay() {
-    const dateInput = document.getElementById('date');
-    const dateDisplay = document.getElementById('date-display');
-
-    if (dateInput && dateInput.value) {
-        // Parse date string directly without timezone conversion
-        const [year, month, day] = dateInput.value.split('-').map(Number);
-        const date = new Date(year, month - 1, day);
-
-        const options = {
-            weekday: 'long',
-            day: 'numeric',
-            month: 'long',
-            year: 'numeric'
-        };
-
-        const formattedDate = date.toLocaleDateString('en-IN', options);
-        const dayNum = date.getDate();
-        const suffix = dayNum % 10 === 1 && dayNum !== 11 ? 'st' :
-            dayNum % 10 === 2 && dayNum !== 12 ? 'nd' :
-                dayNum % 10 === 3 && dayNum !== 13 ? 'rd' : 'th';
-
-        if (dateDisplay) {
-            dateDisplay.textContent = formattedDate.replace(dayNum.toString(), `${dayNum}${suffix}`);
+        const currentType = $('type').value;
+        if (currentType) {
+            select.value = currentType;
+            $('edit-type-name').value = currentType;
         }
+    });
+}
+
+function closeEditTypeModal() {
+    closeModal('edit-type-modal');
+    $('edit-type-form').reset();
+    $('edit-type-alert').innerHTML = '';
+}
+
+function populateEditField() {
+    $('edit-type-name').value = $('edit-type-select').value;
+}
+
+async function handleEditType(event) {
+    event.preventDefault();
+    const oldName = $('edit-type-select').value;
+    const newName = $('edit-type-name').value.trim();
+
+    if (!oldName) {
+        showAlert('edit-type-alert', 'Please select a type to edit.', 'error');
+        return;
+    }
+    if (!newName) {
+        showAlert('edit-type-alert', 'Please enter a new type name.', 'error');
+        return;
+    }
+    if (oldName === newName) {
+        showAlert('edit-type-alert', 'No changes found. Please modify the type name.', 'error');
+        return;
+    }
+
+    try {
+        const { data: existing } = await supabase
+            .from('expense_types').select('name').ilike('name', newName).neq('name', oldName);
+        if (existing && existing.length > 0) {
+            showAlert('edit-type-alert', 'A type with this name already exists.', 'error');
+            return;
+        }
+
+        const { error: typeError } = await supabase
+            .from('expense_types').update({ name: newName })
+            .eq('name', oldName).eq('user_id', currentUser.id);
+        if (typeError) throw typeError;
+
+        const { error: expenseError } = await supabase
+            .from('expenses').update({ type: newName })
+            .eq('type', oldName).eq('user_id', currentUser.id);
+        if (expenseError) throw expenseError;
+
+        await loadUserTypes();
+        $('type').value = newName;
+
+        if ($('visualization-modal').classList.contains('open')) {
+            await loadTypesForFilter();
+            await applyDateFilter();
+        }
+        await loadExpenses();
+
+        showAlert('edit-type-alert', 'Type updated successfully!', 'success');
+        setTimeout(() => closeEditTypeModal(), 1200);
+    } catch (error) {
+        showAlert('edit-type-alert', error.message || 'Failed to update type.', 'error');
     }
 }
 
-// Visualization functions
-function showVisualizationModal() {
-    // Update modal title
-    document.querySelector('#visualization-modal h3').textContent = 'Expense Analytics & Export';
-    document.getElementById('visualization-modal').style.display = 'block';
-
-    // Load types for filter
-    loadTypesForFilter();
-
-    applyDateFilter();
-
-    hideLandingIcons();
+function showDeleteTypeModal() {
+    openModal('delete-type-modal');
+    const currentType = $('type').value;
+    loadTypesForDeletion().then(() => {
+        if (currentType) $('delete-type-select').value = currentType;
+    });
 }
 
-// Add new function
-async function loadTypesForFilter() {
+function closeDeleteTypeModal() {
+    closeModal('delete-type-modal');
+    $('delete-type-form').reset();
+    $('delete-type-alert').innerHTML = '';
+}
+
+async function loadTypesForDeletion() {
     try {
-        const { data, error } = await supabase
-            .from('expense_types')
-            .select('name')
-            .order('name');
-
+        const { data, error } = await supabase.from('expense_types').select('name').order('name');
         if (error) throw error;
-
-        const typeFilter = document.getElementById('type-filter');
-        typeFilter.innerHTML = '<option value="all">All Types</option>';
-
+        const select = $('delete-type-select');
+        select.innerHTML = '<option value="">Select Type</option>';
         data.forEach(type => {
             const option = document.createElement('option');
             option.value = type.name;
             option.textContent = type.name;
-            typeFilter.appendChild(option);
+            select.appendChild(option);
         });
+    } catch (error) {
+        console.error('Failed to load types:', error);
+    }
+}
+
+async function handleDeleteType(event) {
+    event.preventDefault();
+    const typeName = $('delete-type-select').value;
+    if (!typeName) {
+        showAlert('delete-type-alert', 'Please select a type to delete.', 'error');
+        return;
+    }
+
+    try {
+        const { data: used, error: checkError } = await supabase
+            .from('expenses').select('id').eq('type', typeName).limit(1);
+        if (checkError) throw checkError;
+
+        if (used && used.length > 0) {
+            showAlert('delete-type-alert',
+                'Cannot delete a type that is still used by an expense.', 'error');
+            return;
+        }
+        if (!confirm('Delete the type "' + typeName + '"?')) return;
+
+        const { error } = await supabase
+            .from('expense_types').delete()
+            .eq('name', typeName).eq('user_id', currentUser.id);
+        if (error) throw error;
+
+        await loadUserTypes();
+        showAlert('delete-type-alert', 'Type deleted successfully!', 'success');
+        setTimeout(() => closeDeleteTypeModal(), 1200);
+    } catch (error) {
+        showAlert('delete-type-alert', error.message || 'Failed to delete type.', 'error');
+    }
+}
+
+/* =====================================================================
+   Add expense
+   ===================================================================== */
+
+function renderAmountChips() {
+    const container = $('amount-chips');
+    if (!container) return;
+    const presets = [50, 100, 200, 500];
+    container.innerHTML =
+        presets.map(value => `<button type="button" class="chip" data-add="${value}">+${value}</button>`).join('') +
+        '<button type="button" class="chip" data-clear="1">Clear</button>';
+
+    container.addEventListener('click', function (event) {
+        const button = event.target.closest('button');
+        if (!button) return;
+        const input = $('amount');
+        if (button.dataset.clear) {
+            input.value = '';
+        } else {
+            const current = parseFloat(input.value) || 0;
+            input.value = Math.min(current + Number(button.dataset.add), MAX_AMOUNT);
+        }
+    });
+}
+
+/* =====================================================================
+   Quick add
+   ---------------------------------------------------------------------
+   Three small things that remove typing:
+     · presets  — (note, amount, type) combinations you've repeated
+     · parsing  — "450 lunch swiggy" split into fields, type inferred from
+                  your own history (no server, no model download)
+     · maths    — "120+80+45" in the amount box
+   All derived from data already in the expenses table; no schema change.
+   ===================================================================== */
+
+let quickAddModel = { presets: [], tokenTypes: {}, typeCounts: {}, totalNotes: 0 };
+
+const QUICK_ADD_STOPWORDS = new Set([
+    'for', 'the', 'a', 'an', 'of', 'at', 'on', 'in', 'to', 'and', 'with',
+    'my', 'from', 'via', 'per', 'by'
+]);
+
+function tokenizeNote(note) {
+    return String(note || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(token => token.length > 1 && !QUICK_ADD_STOPWORDS.has(token) && !/^\d+$/.test(token));
+}
+
+/** '450' | '₹450' | '1.2k' | '1,200' | '450/-' | 'rs450' -> number, else null */
+function parseAmountToken(token) {
+    const cleaned = String(token)
+        .replace(/[₹,]/g, '')
+        .replace(/\/-$/, '')
+        .replace(/^rs\.?/i, '');
+    const match = /^(\d+(?:\.\d+)?)(k)?$/i.exec(cleaned);
+    if (!match) return null;
+    const value = parseFloat(match[1]) * (match[2] ? 1000 : 1);
+    return isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Evaluate a small arithmetic expression. Recursive descent over a
+ * whitelisted character set — never eval().
+ */
+function evalArithmetic(expression) {
+    const text = String(expression).replace(/\s+/g, '');
+    if (!text || !/^[0-9+\-*/().]+$/.test(text) || !/[+\-*/]/.test(text)) return null;
+
+    let pos = 0;
+    const peek = () => text.charAt(pos);
+
+    function unit() {
+        if (peek() === '(') {
+            pos++;
+            const value = sum();
+            if (peek() !== ')') throw new Error('unbalanced');
+            pos++;
+            return value;
+        }
+        if (peek() === '-') { pos++; return -unit(); }
+        if (peek() === '+') { pos++; return unit(); }
+        const match = /^\d+(?:\.\d+)?/.exec(text.slice(pos));
+        if (!match) throw new Error('expected number');
+        pos += match[0].length;
+        return parseFloat(match[0]);
+    }
+
+    function product() {
+        let value = unit();
+        while (peek() === '*' || peek() === '/') {
+            const op = text.charAt(pos++);
+            const right = unit();
+            if (op === '/' && right === 0) throw new Error('divide by zero');
+            value = op === '*' ? value * right : value / right;
+        }
+        return value;
+    }
+
+    function sum() {
+        let value = product();
+        while (peek() === '+' || peek() === '-') {
+            const op = text.charAt(pos++);
+            const right = product();
+            value = op === '+' ? value + right : value - right;
+        }
+        return value;
+    }
+
+    try {
+        const value = sum();
+        if (pos !== text.length || !isFinite(value) || value < 0) return null;
+        return Math.round(value * 100) / 100;
+    } catch (error) {
+        return null;
+    }
+}
+
+function resolveAmountExpression() {
+    const input = $('amount');
+    if (!input) return;
+    const result = evalArithmetic(input.value);
+    if (result !== null) input.value = result;
+}
+
+/** Read the amount box, tolerating "₹1,200", " 450 " and leftover maths. */
+function readAmountField() {
+    const raw = String($('amount').value || '').trim();
+    if (!raw) return NaN;
+    const computed = evalArithmetic(raw);
+    if (computed !== null) return computed;
+    return parseFloat(raw.replace(/[₹,\s]/g, ''));
+}
+
+/** Build presets + the token→type index from recent history. */
+function buildQuickAddModel(rows) {
+    const combos = new Map();
+    const tokenTypes = {};
+    const typeCounts = {};
+    let totalNotes = 0;
+
+    rows.forEach(row => {
+        const note = String(row.note || '').trim();
+        const type = row.type;
+        const amount = Number(row.amount);
+        if (!type) return;
+
+        typeCounts[type] = (typeCounts[type] || 0) + 1;
+        totalNotes++;
+
+        tokenizeNote(note).forEach(token => {
+            if (!tokenTypes[token]) tokenTypes[token] = {};
+            tokenTypes[token][type] = (tokenTypes[token][type] || 0) + 1;
+        });
+
+        if (!note || !isFinite(amount) || amount <= 0) return;
+        const key = note.toLowerCase() + '|' + amount + '|' + type;
+        const entry = combos.get(key) ||
+            { note, amount, type, billed: !!row.billed, count: 0 };
+        entry.count++;
+        combos.set(key, entry);
+    });
+
+    const presets = Array.from(combos.values())
+        .filter(entry => entry.count >= 2)
+        .sort((a, b) => b.count - a.count || b.amount - a.amount)
+        .slice(0, 6);
+
+    quickAddModel = { presets, tokenTypes, typeCounts, totalNotes };
+    renderPresetChips();
+    updateQuickAddPreview();
+}
+
+/**
+ * Naive Bayes over the user's own note vocabulary. Returns '' when no
+ * token is recognised — guessing a category on a money record is worse
+ * than asking.
+ */
+function inferType(note) {
+    const types = Object.keys(quickAddModel.typeCounts);
+    if (!types.length) return '';
+
+    const tokens = tokenizeNote(note);
+    const scores = {};
+    const total = quickAddModel.totalNotes || 1;
+    types.forEach(type => {
+        scores[type] = Math.log((quickAddModel.typeCounts[type] || 0.5) / total) * 0.4;
+    });
+
+    let matched = false;
+    tokens.forEach(token => {
+        const row = quickAddModel.tokenTypes[token];
+        if (!row) return;
+        matched = true;
+        const seen = Object.keys(row).reduce((sum, type) => sum + row[type], 0);
+        types.forEach(type => {
+            scores[type] += Math.log(((row[type] || 0) + 0.15) / (seen + 0.15 * types.length));
+        });
+    });
+
+    if (!matched) return '';
+    return types.reduce((best, type) => (scores[type] > scores[best] ? type : best), types[0]);
+}
+
+function parseQuickAdd(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return null;
+
+    const tokens = raw.split(/\s+/);
+    let amount = null;
+    let amountIndex = -1;
+
+    for (let i = 0; i < tokens.length; i++) {
+        const value = parseAmountToken(tokens[i]);
+        if (value !== null) { amount = value; amountIndex = i; break; }
+    }
+    // Fall back to an arithmetic expression, e.g. "120+80 dinner".
+    if (amount === null) {
+        for (let i = 0; i < tokens.length; i++) {
+            const value = evalArithmetic(tokens[i]);
+            if (value !== null && value > 0) { amount = value; amountIndex = i; break; }
+        }
+    }
+
+    const note = tokens.filter((_, i) => i !== amountIndex).join(' ').trim();
+    return { amount, note, type: note ? inferType(note) : '' };
+}
+
+function updateQuickAddPreview() {
+    const preview = $('quick-add-preview');
+    const input = $('quick-add-input');
+    if (!preview || !input) return;
+
+    const parsed = parseQuickAdd(input.value);
+    if (!parsed) { preview.innerHTML = ''; return; }
+
+    const bits = [];
+    bits.push(parsed.amount !== null
+        ? `<span class="qa-amount">${esc(money(parsed.amount))}</span>`
+        : '<span class="qa-guess">add an amount</span>');
+    if (parsed.type) bits.push(typeBadge(parsed.type));
+    else if (parsed.note) bits.push('<span class="qa-guess">pick a type</span>');
+    if (parsed.note) bits.push(esc(parsed.note));
+
+    preview.innerHTML = bits.join('<span aria-hidden="true">·</span> ');
+}
+
+async function submitQuickAdd() {
+    const input = $('quick-add-input');
+    const parsed = parseQuickAdd(input.value);
+    if (!parsed) { input.focus(); return; }
+
+    // Confident enough to file it; otherwise pre-fill and let the user finish.
+    if (parsed.amount !== null && parsed.type && parsed.note) {
+        const saved = await createExpense({
+            amount: parsed.amount, note: parsed.note,
+            type: parsed.type, date: todayISO(),
+            billed: trackingBilling() && settings.defaultBilled === true
+        }, 'Added ' + money(parsed.amount) + ' · ' + parsed.type);
+        if (saved) {
+            input.value = '';
+            updateQuickAddPreview();
+            input.focus();
+        }
+        return;
+    }
+
+    if (parsed.note) $('note').value = parsed.note;
+    if (parsed.amount !== null) $('amount').value = parsed.amount;
+    if (parsed.type) $('type').value = parsed.type;
+
+    input.value = '';
+    updateQuickAddPreview();
+
+    if (parsed.amount === null) {
+        $('amount').focus();
+        showNotification('Add an amount to finish', 'warning', 2600);
+    } else {
+        $('type').focus();
+        showNotification('Pick a type to finish', 'warning', 2600);
+    }
+}
+
+function renderPresetChips() {
+    const row = $('preset-row');
+    const container = $('preset-chips');
+    if (!row || !container) return;
+
+    if (!quickAddModel.presets.length) {
+        row.style.display = 'none';
+        container.innerHTML = '';
+        return;
+    }
+
+    row.style.display = 'block';
+    container.innerHTML = quickAddModel.presets.map((preset, index) => {
+        const label = preset.note.length > 22 ? preset.note.slice(0, 21) + '…' : preset.note;
+        return `<button type="button" class="preset-chip" data-preset="${index}"
+            title="${attr(preset.note + ' · ' + preset.type)}">
+            ${esc(label)} <span class="preset-amount">${esc(moneyShort(preset.amount))}</span>
+        </button>`;
+    }).join('');
+
+    container.querySelectorAll('[data-preset]').forEach(button => {
+        button.addEventListener('click', () => applyPreset(Number(button.dataset.preset)));
+    });
+}
+
+async function applyPreset(index) {
+    const preset = quickAddModel.presets[index];
+    if (!preset) return;
+    await createExpense({
+        amount: preset.amount, note: preset.note, type: preset.type,
+        date: todayISO(), billed: trackingBilling() ? preset.billed : false
+    }, 'Added ' + money(preset.amount) + ' · ' + preset.type);
+}
+
+function setDateOffset(days) {
+    $('date').value = days === 0 ? todayISO() : addDaysISO(todayISO(), days);
+    updateDateDisplay();
+}
+
+function updateDateDisplay() {
+    const input = $('date');
+    const display = $('date-display');
+    if (!input || !display || !input.value) return;
+
+    const parts = splitISO(input.value);
+    if (!parts) {
+        display.textContent = '';
+        return;
+    }
+
+    const date = isoToDisplayDate(input.value);
+    let formatted;
+    try {
+        formatted = date.toLocaleDateString('en-IN', {
+            weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
+        });
+    } catch (error) {
+        formatted = formatDate(input.value);
+    }
+
+    const day = parts.day;
+    const suffix = (day % 10 === 1 && day !== 11) ? 'st'
+        : (day % 10 === 2 && day !== 12) ? 'nd'
+            : (day % 10 === 3 && day !== 13) ? 'rd' : 'th';
+
+    // Only replace the standalone day number, never a digit inside the year.
+    display.textContent = formatted.replace(new RegExp('\\b' + day + '\\b'), day + suffix);
+
+    const today = todayISO();
+    if (input.value === today) display.textContent += ' · Today';
+    else if (input.value === addDaysISO(today, -1)) display.textContent += ' · Yesterday';
+    else if (input.value > today) display.textContent += ' · Future date';
+}
+
+function toggleFormBilling() {
+    const toggle = $('form-billed-toggle');
+    toggle.classList.toggle('active');
+    const active = toggle.classList.contains('active');
+    toggle.setAttribute('aria-checked', String(active));
+    $('billed').checked = active;
+}
+
+function resetBillingToggle() {
+    const toggle = $('form-billed-toggle');
+    const on = trackingBilling() && settings.defaultBilled === true;
+    toggle.classList.toggle('active', on);
+    toggle.setAttribute('aria-checked', String(on));
+    $('billed').checked = on;
+}
+
+/**
+ * The single write path for new expenses: validates, inserts, refreshes
+ * every dependent view, and offers an undo. Used by the form, the quick-add
+ * box, presets and recurring.
+ */
+async function createExpense(fields, successMessage) {
+    const errors = validateExpenseInput(fields.amount, fields.type, fields.note);
+    if (!fields.date || !splitISO(fields.date)) errors.push('A valid date is required');
+    if (errors.length) {
+        showNotification(errors[0], 'error');
+        return null;
+    }
+
+    try {
+        const { data, error } = await supabase.from('expenses').insert([{
+            user_id: currentUser.id,
+            amount: fields.amount,
+            date: fields.date,
+            type: fields.type,
+            note: fields.note,
+            billed: !!fields.billed
+        }]).select();
+        if (error) throw error;
+
+        const row = data && data[0] ? data[0] : null;
+
+        await refreshAfterMutation();
+        await loadRecentActivity();
+        await checkBudgetWarnings();
+
+        showNotification(successMessage || 'Expense added', 'success', 5000,
+            row ? { label: 'Undo', onClick: () => deleteExpense(row.id, false, true) } : null);
+        return row || true;
+    } catch (error) {
+        console.error('Add expense error:', error);
+        showNotification('Failed to add expense: ' + error.message, 'error');
+        return null;
+    }
+}
+
+async function handleAddExpense(event) {
+    event.preventDefault();
+    const button = $('add-expense-btn');
+    resolveAmountExpression();
+
+    const type = $('type').value;
+    const fields = {
+        amount: readAmountField(),
+        type,
+        note: $('note').value.trim(),
+        date: $('date').value,
+        // Simple mode hides the billing concept, so everything is unbilled.
+        billed: trackingBilling() && $('form-billed-toggle').classList.contains('active')
+    };
+
+    button.disabled = true;
+    try {
+        const saved = await createExpense(fields);
+        if (!saved) return;
+
+        $('expense-form').reset();
+        $('date').value = todayISO();
+        $('type').value = type;
+        resetBillingToggle();
+        updateDateDisplay();
+        $('note').focus();
+    } finally {
+        button.disabled = false;
+    }
+}
+
+/* =====================================================================
+   Recent expenses (dashboard)
+   ===================================================================== */
+
+function renderExpenseSkeleton() {
+    const container = $('expenses-container');
+    if (container) container.innerHTML = '<div class="skeleton-row"></div>'.repeat(3);
+}
+
+async function loadExpenses() {
+    const container = $('expenses-container');
+    if (!container || !currentUser) return;
+
+    const limit = parseInt(($('recent-limit') || {}).value, 10) || 5;
+
+    try {
+        const { data, error } = await supabase
+            .from('expenses').select('*')
+            .order('updated_at', { ascending: false })
+            .limit(limit);
+        if (error) throw error;
+
+        if (!data.length) {
+            container.innerHTML =
+                '<div class="empty-state"><div class="empty-state-icon">🧾</div>' +
+                '<p>No expenses yet. Add your first one above!</p></div>';
+            return;
+        }
+
+        container.innerHTML = data.map(expense => `
+            <div class="expense-item" data-id="${attr(expense.id)}">
+                <div class="expense-details">
+                    <div class="expense-amount">${esc(money(expense.amount))}</div>
+                    <div class="expense-note">${esc(expense.note) || 'No description'}</div>
+                    <div class="expense-meta">
+                        ${typeBadge(expense.type)}
+                        ${billingBadge(expense.billed)}
+                        <span>${esc(formatDate(expense.date))}</span>
+                    </div>
+                </div>
+                <div class="expense-actions">
+                    <button class="icon-btn tone-indigo" type="button" title="Repeat this expense today"
+                        aria-label="Repeat this expense today"
+                        onclick="duplicateExpense('${attr(expense.id)}')">
+                        <svg class="icon"><use href="#i-copy" /></svg>
+                    </button>
+                    <button class="icon-btn tone-red" type="button" title="Delete expense"
+                        aria-label="Delete expense"
+                        onclick="deleteExpense('${attr(expense.id)}', true)">
+                        <svg class="icon"><use href="#i-trash" /></svg>
+                    </button>
+                </div>
+            </div>`).join('');
+
+        container._rows = data;
+    } catch (error) {
+        console.error('Failed to load expenses:', error);
+        container.innerHTML =
+            '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
+            '<p>Could not load your expenses. Check your connection and try again.</p></div>';
+    }
+}
+
+async function duplicateExpense(id) {
+    const container = $('expenses-container');
+    const source = (container && container._rows || []).find(row => String(row.id) === String(id))
+        || filteredExpenses.find(row => String(row.id) === String(id));
+    if (!source) return;
+
+    try {
+        const { error } = await supabase.from('expenses').insert([{
+            user_id: currentUser.id,
+            amount: source.amount,
+            date: todayISO(),
+            type: source.type,
+            note: source.note,
+            billed: trackingBilling() ? source.billed : false
+        }]);
+        if (error) throw error;
+
+        await Promise.all([loadExpenses(), updateStatistics(), updateBudgetDisplay()]);
+        await checkBudgetWarnings();
+        showNotification('Repeated ' + money(source.amount) + ' on today', 'success');
+    } catch (error) {
+        showNotification('Could not repeat expense: ' + error.message, 'error');
+    }
+}
+
+/**
+ * Delete an expense. `offerUndo` re-inserts the same values on request
+ * (the restored row gets a new id, which is fine for this data model).
+ */
+async function deleteExpense(id, offerUndo, skipConfirm) {
+    const container = $('expenses-container');
+    const snapshot =
+        (container && container._rows || []).find(row => String(row.id) === String(id)) ||
+        filteredExpenses.find(row => String(row.id) === String(id)) ||
+        null;
+
+    if (!offerUndo && !skipConfirm && !confirm('Delete this expense?')) return;
+
+    try {
+        const { error } = await supabase.from('expenses').delete().eq('id', id);
+        if (error) throw error;
+
+        filteredExpenses = filteredExpenses.filter(expense => String(expense.id) !== String(id));
+        allExpensesCache = allExpensesCache.filter(expense => String(expense.id) !== String(id));
+
+        await refreshAfterMutation();
+
+        if (offerUndo && snapshot) {
+            lastDeletedExpense = snapshot;
+            showNotification('Expense deleted', 'success', 6500, {
+                label: 'Undo',
+                onClick: () => restoreLastDeleted(snapshot)
+            });
+        } else if (!skipConfirm) {
+            showNotification('Expense deleted', 'success');
+        } else {
+            showNotification('Removed', 'success', 2200);
+        }
+    } catch (error) {
+        showNotification('Failed to delete expense: ' + error.message, 'error');
+    }
+}
+
+async function restoreLastDeleted(snapshot) {
+    const row = snapshot || lastDeletedExpense;
+    if (!row) return;
+    try {
+        const { error } = await supabase.from('expenses').insert([{
+            user_id: currentUser.id,
+            amount: row.amount,
+            date: row.date,
+            type: row.type,
+            note: row.note,
+            billed: row.billed
+        }]);
+        if (error) throw error;
+        lastDeletedExpense = null;
+        await refreshAfterMutation();
+        showNotification('Expense restored', 'success');
+    } catch (error) {
+        showNotification('Could not restore expense: ' + error.message, 'error');
+    }
+}
+
+/** Delete from the analytics list (keeps that list in sync too). */
+async function deleteFilteredExpense(id) {
+    await deleteExpense(id, true);
+}
+
+async function refreshAfterMutation() {
+    await Promise.all([loadExpenses(), updateStatistics(), updateBudgetDisplay()]);
+    renderRecurringDue();
+    if ($('visualization-modal').classList.contains('open')) {
+        await applyDateFilter();
+    }
+}
+
+/* =====================================================================
+   Statistics
+   ===================================================================== */
+
+async function updateStatistics() {
+    if (!currentUser) return;
+
+    try {
+        const { data, error } = await supabase.from('expenses').select('amount, date, billed');
+        if (error) throw error;
+
+        const { year, month } = todayParts();
+        const thisMonth = monthBounds(year, month);
+        const prev = previousMonth(year, month);
+        const lastMonth = monthBounds(prev.year, prev.month);
+
+        let monthlyTotal = 0, monthlyCount = 0, billedTotal = 0, unbilledTotal = 0, lastMonthTotal = 0;
+
+        for (const expense of data) {
+            const amount = parseFloat(expense.amount) || 0;
+            if (withinRange(expense.date, thisMonth.first, thisMonth.last)) {
+                monthlyTotal += amount;
+                monthlyCount++;
+                if (expense.billed) billedTotal += amount; else unbilledTotal += amount;
+            } else if (withinRange(expense.date, lastMonth.first, lastMonth.last)) {
+                lastMonthTotal += amount;
+            }
+        }
+
+        setText('monthly-expenses', money(monthlyTotal));
+        setText('total-expenses', money(lastMonthTotal));
+        setText('billed-expenses', money(billedTotal));
+        setText('unbilled-expenses', money(unbilledTotal));
+        setText('expense-count', String(monthlyCount));
+
+        const delta = $('month-delta');
+        if (delta) {
+            if (lastMonthTotal > 0) {
+                const change = ((monthlyTotal - lastMonthTotal) / lastMonthTotal) * 100;
+                delta.textContent = (change >= 0 ? '▲ ' : '▼ ') + Math.abs(change).toFixed(0) + '%';
+                delta.className = 'stat-delta ' + (change >= 0 ? 'up' : 'down');
+            } else {
+                delta.textContent = '';
+                delta.className = 'stat-delta';
+            }
+        }
+    } catch (error) {
+        console.error('Failed to update statistics:', error);
+    }
+}
+
+/* =====================================================================
+   Budget
+   ===================================================================== */
+
+function updateBudgetHeader() {
+    setText('budget-header', getCurrentMonthName() + ' Budget');
+}
+
+async function loadUserBudget() {
+    monthlyBilledBudget = 0;
+    monthlyUnbilledBudget = 0;
+    if (!currentUser) return;
+
+    try {
+        const { year, month } = todayParts();
+        const { data, error } = await supabase
+            .from('user_budgets')
+            .select('monthly_billed_budget, monthly_unbilled_budget')
+            .eq('user_id', currentUser.id)
+            .eq('budget_month', month)
+            .eq('budget_year', year);
+
+        if (error) {
+            console.error('Budget query error:', error);
+        } else if (data && data.length > 0) {
+            monthlyBilledBudget = parseFloat(data[0].monthly_billed_budget) || 0;
+            monthlyUnbilledBudget = parseFloat(data[0].monthly_unbilled_budget) || 0;
+        }
+    } catch (error) {
+        console.error('Failed to load budget:', error);
+    }
+    updateBudgetHeader();
+    updateBudgetButtonLabel();
+}
+
+function updateBudgetButtonLabel() {
+    const button = $('budget-set-btn');
+    if (!button) return;
+    const exists = monthlyBilledBudget > 0 || monthlyUnbilledBudget > 0;
+    button.textContent = exists ? 'Update Budget' : 'Set Budget';
+}
+
+function setBudget() {
+    applyBillingMode();
+    openModal('budget-modal');
+    setText('budget-modal-title', getCurrentMonthName() + ' Budget');
+    switchBudgetTab('amounts');
+    loadCurrentMonthBudget();
+    renderAlertRules();
+}
+
+function switchBudgetTab(tab) {
+    const isAmounts = tab !== 'alerts';
+    show('budget-tab-amounts', isAmounts, 'block');
+    show('budget-tab-alerts', !isAmounts, 'block');
+
+    [['budget-tab-btn-amounts', isAmounts], ['budget-tab-btn-alerts', !isAmounts]]
+        .forEach(([id, active]) => {
+            const button = $(id);
+            if (!button) return;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-selected', String(active));
+        });
+
+    if (!isAmounts) renderAlertRules();
+}
+
+/* ---------------------------------------------------------------------
+   Alert level editor
+   --------------------------------------------------------------------- */
+
+function renderAlertRules() {
+    const list = $('alert-rules-list');
+    if (!list) return;
+
+    syncSettingSwitches();
+    show('alert-scope-note', trackingBilling(), 'block');
+
+    const rules = alertRules();
+    if (!rules.length) {
+        list.innerHTML = '<p class="setting-desc">No alert levels yet. Add one below.</p>';
+        return;
+    }
+
+    const budgets = {
+        total: monthlyBilledBudget + monthlyUnbilledBudget,
+        billed: monthlyBilledBudget,
+        unbilled: monthlyUnbilledBudget
+    };
+
+    list.innerHTML = rules.map((rule, index) => {
+        const applies = alertScopeApplies(rule.scope);
+        const budget = budgets[rule.scope];
+        const detail = !applies
+            ? 'Inactive while billing tracking is off'
+            : budget > 0
+                ? 'Fires at ' + money(budget * rule.percent / 100)
+                : 'No ' + rule.scope + ' budget set yet';
+
+        return `<div class="alert-rule">
+            <span class="alert-rule-scope ${applies ? attr(rule.scope) : 'inactive'}">${esc(rule.scope)}</span>
+            <div class="alert-rule-body">
+                <span class="alert-rule-pct">${rule.percent}%</span> of ${esc(rule.scope)} budget
+                <div class="alert-rule-sub">${esc(detail)}</div>
+            </div>
+            <button class="icon-btn tone-red" type="button" title="Remove level"
+                aria-label="Remove level" onclick="removeAlertRule(${index})">
+                <svg class="icon"><use href="#i-trash" /></svg>
+            </button>
+        </div>`;
+    }).join('');
+}
+
+async function addAlertRule() {
+    const scope = $('alert-new-scope').value;
+    const percent = Math.round(parseFloat($('alert-new-percent').value));
+
+    if (!(percent > 0 && percent <= 500)) {
+        showAlert('alert-rules-alert', 'Enter a percentage between 1 and 500.', 'error');
+        return;
+    }
+    const rules = alertRules();
+    if (rules.length >= MAX_ALERT_RULES) {
+        showAlert('alert-rules-alert', 'That is as many levels as one budget needs.', 'error');
+        return;
+    }
+    if (rules.some(rule => rule.scope === scope && rule.percent === percent)) {
+        showAlert('alert-rules-alert', 'That level already exists.', 'error');
+        return;
+    }
+
+    await saveSettings({ alertRules: rules.concat([{ scope, percent }]) });
+    resetFiredAlerts();
+    renderAlertRules();
+    showAlert('alert-rules-alert',
+        `Alert added at ${percent}% of the ${scope} budget.`, 'success');
+}
+
+async function removeAlertRule(index) {
+    const rules = alertRules();
+    if (index < 0 || index >= rules.length) return;
+    rules.splice(index, 1);
+    await saveSettings({ alertRules: rules });
+    resetFiredAlerts();
+    renderAlertRules();
+}
+
+async function loadCurrentMonthBudget() {
+    const { year, month } = todayParts();
+    const { data } = await supabase
+        .from('user_budgets')
+        .select('monthly_billed_budget, monthly_unbilled_budget')
+        .eq('user_id', currentUser.id)
+        .eq('budget_month', month)
+        .eq('budget_year', year);
+
+    const budget = data && data.length > 0 ? data[0] : null;
+    const billed = budget ? parseFloat(budget.monthly_billed_budget) || 0 : 0;
+    const unbilled = budget ? parseFloat(budget.monthly_unbilled_budget) || 0 : 0;
+
+    $('billed-budget-amount').value = billed || '';
+    $('unbilled-budget-amount').value = unbilled || '';
+    $('total-budget-amount').value = (billed + unbilled) || '';
+    updateBudgetModalTotal();
+}
+
+function updateBudgetModalTotal() {
+    const box = $('budget-modal-total');
+    if (!box) return;
+    if (trackingBilling()) {
+        const billed = parseFloat($('billed-budget-amount').value) || 0;
+        const unbilled = parseFloat($('unbilled-budget-amount').value) || 0;
+        box.innerHTML = '<span>Total budget</span><span>' + esc(money(billed + unbilled)) + '</span>';
+    } else {
+        const total = parseFloat($('total-budget-amount').value) || 0;
+        box.innerHTML = '<span>Total budget</span><span>' + esc(money(total)) + '</span>';
+    }
+}
+
+function closeBudgetModal() {
+    closeModal('budget-modal');
+}
+
+async function handleBudgetSubmit(event) {
+    event.preventDefault();
+
+    try {
+        let newBilled, newUnbilled;
+
+        if (trackingBilling()) {
+            newBilled = parseFloat($('billed-budget-amount').value) || 0;
+            newUnbilled = parseFloat($('unbilled-budget-amount').value) || 0;
+        } else {
+            // Simple mode: one number, and every expense counts as unbilled.
+            newBilled = 0;
+            newUnbilled = parseFloat($('total-budget-amount').value) || 0;
+        }
+
+        if (newBilled < 0 || newUnbilled < 0) {
+            showNotification('Budget amounts cannot be negative.', 'error');
+            return;
+        }
+        if (newBilled > MAX_AMOUNT || newUnbilled > MAX_AMOUNT) {
+            showNotification('Budget amount is too large.', 'error');
+            return;
+        }
+        if (newBilled === monthlyBilledBudget && newUnbilled === monthlyUnbilledBudget) {
+            showNotification('Please change a value to update the budget.', 'error');
+            return;
+        }
+
+        const { year, month } = todayParts();
+        const { error } = await supabase.from('user_budgets').upsert([{
+            user_id: currentUser.id,
+            monthly_billed_budget: newBilled,
+            monthly_unbilled_budget: newUnbilled,
+            budget_month: month,
+            budget_year: year
+        }], { onConflict: 'user_id,budget_month,budget_year' });
+        if (error) throw error;
+
+        monthlyBilledBudget = newBilled;
+        monthlyUnbilledBudget = newUnbilled;
+        resetFiredAlerts();
+
+        await updateBudgetDisplay();
+        updateBudgetHeader();
+        updateBudgetButtonLabel();
+        closeBudgetModal();
+        showNotification(getCurrentMonthName() + ' budget updated', 'success');
+    } catch (error) {
+        console.error('Budget update error:', error);
+        showNotification('Failed to update budget: ' + error.message, 'error');
+    }
+}
+
+function paintProgress(barId, usedPercentage) {
+    const bar = $(barId);
+    if (!bar) return;
+    bar.style.width = Math.min(Math.max(usedPercentage, 0), 100) + '%';
+    bar.classList.toggle('over-budget', usedPercentage > 100);
+    bar.classList.toggle('near-budget', usedPercentage >= 85 && usedPercentage <= 100);
+}
+
+function remainingText(label, remaining) {
+    if (remaining < 0) {
+        return `${label}: <span class="budget-over-text">${esc(money(Math.abs(remaining)))} over</span>`;
+    }
+    return `${label}: ${esc(money(remaining))}`;
+}
+
+async function updateBudgetDisplay() {
+    const zero = {
+        billedUsedPercentage: 0, unbilledUsedPercentage: 0, totalUsedPercentage: 0,
+        billedSpent: 0, unbilledSpent: 0, totalSpent: 0
+    };
+    if (!currentUser) return zero;
+
+    try {
+        const { year, month } = todayParts();
+        const bounds = monthBounds(year, month);
+
+        const { data, error } = await supabase
+            .from('expenses')
+            .select('amount, billed')
+            .eq('user_id', currentUser.id)
+            .gte('date', bounds.first)
+            .lte('date', bounds.last);
+        if (error) throw error;
+
+        let billedSpent = 0, unbilledSpent = 0;
+        for (const expense of data) {
+            const amount = parseFloat(expense.amount) || 0;
+            if (expense.billed) billedSpent += amount; else unbilledSpent += amount;
+        }
+
+        const totalBudget = monthlyBilledBudget + monthlyUnbilledBudget;
+        const totalSpent = billedSpent + unbilledSpent;
+
+        // ---- Total (always shown) ----
+        const totalRemaining = totalBudget - totalSpent;
+        const totalUsedPercentage = totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0;
+
+        setText('total-budget-spent', moneyShort(totalSpent));
+        setText('total-budget-total', totalBudget > 0 ? moneyShort(totalBudget) : 'Not set');
+        $('total-budget-remaining').innerHTML = totalBudget > 0
+            ? remainingText('Remaining', totalRemaining)
+            : 'Set a budget to track your pace';
+        paintProgress('total-budget-progress-bar', totalUsedPercentage);
+
+        const pace = $('total-budget-pace');
+        if (totalBudget > 0) {
+            const today = todayParts();
+            const daysLeft = Math.max(daysInMonth(today.year, today.month) - today.day + 1, 1);
+            if (totalRemaining < 0) {
+                pace.textContent = 'Over budget';
+                pace.classList.add('over');
+            } else {
+                pace.textContent = moneyShort(totalRemaining / daysLeft) + '/day for ' +
+                    daysLeft + (daysLeft === 1 ? ' day' : ' days');
+                pace.classList.remove('over');
+            }
+            pace.style.display = '';
+        } else {
+            pace.textContent = '';
+            pace.style.display = 'none';
+        }
+
+        // ---- Billed / unbilled split ----
+        const billedRemaining = monthlyBilledBudget - billedSpent;
+        const unbilledRemaining = monthlyUnbilledBudget - unbilledSpent;
+        const billedUsedPercentage = monthlyBilledBudget > 0
+            ? (billedSpent / monthlyBilledBudget) * 100 : 0;
+        const unbilledUsedPercentage = monthlyUnbilledBudget > 0
+            ? (unbilledSpent / monthlyUnbilledBudget) * 100 : 0;
+
+        setText('billed-budget-total', 'Budget: ' + moneyShort(monthlyBilledBudget));
+        setText('unbilled-budget-total', 'Budget: ' + moneyShort(monthlyUnbilledBudget));
+        $('billed-budget-remaining').innerHTML = remainingText('Remaining', billedRemaining);
+        $('unbilled-budget-remaining').innerHTML = remainingText('Remaining', unbilledRemaining);
+        paintProgress('billed-budget-progress-bar', billedUsedPercentage);
+        paintProgress('unbilled-budget-progress-bar', unbilledUsedPercentage);
+
+        return {
+            billedUsedPercentage, unbilledUsedPercentage, totalUsedPercentage,
+            billedSpent, unbilledSpent, totalSpent
+        };
+    } catch (error) {
+        console.error('Failed to update budget display:', error);
+        return zero;
+    }
+}
+
+/** Which scopes are meaningful right now, and their spend/budget/percent. */
+function budgetScopes(usage) {
+    return {
+        total: {
+            label: 'total', spent: usage.totalSpent,
+            budget: monthlyBilledBudget + monthlyUnbilledBudget,
+            percent: usage.totalUsedPercentage
+        },
+        billed: {
+            label: 'billed', spent: usage.billedSpent,
+            budget: monthlyBilledBudget, percent: usage.billedUsedPercentage
+        },
+        unbilled: {
+            label: 'unbilled', spent: usage.unbilledSpent,
+            budget: monthlyUnbilledBudget, percent: usage.unbilledUsedPercentage
+        }
+    };
+}
+
+function alertScopeApplies(scope) {
+    return scope === 'total' || trackingBilling();
+}
+
+async function checkBudgetWarnings() {
+    const usage = await updateBudgetDisplay();
+    if (settings.budgetAlerts === false) return;
+
+    const scopes = budgetScopes(usage);
+
+    // Collect every level newly crossed, but toast only the highest one per
+    // scope — a single large expense shouldn't fire 50/75/90 all at once.
+    const highest = {};
+    const crossed = [];
+
+    alertRules().forEach(rule => {
+        if (!alertScopeApplies(rule.scope)) return;
+        const scope = scopes[rule.scope];
+        if (!scope || scope.budget <= 0) return;
+        if (scope.percent < rule.percent) return;
+
+        const key = alertRuleKey(rule);
+        if (firedAlerts.has(key)) return;
+
+        crossed.push(key);
+        if (!highest[rule.scope] || rule.percent > highest[rule.scope].percent) {
+            highest[rule.scope] = rule;
+        }
+    });
+
+    if (!crossed.length) return;
+
+    crossed.forEach(key => firedAlerts.add(key));
+    saveFiredAlerts();
+
+    ['total', 'billed', 'unbilled'].forEach(name => {
+        const rule = highest[name];
+        if (!rule) return;
+        const scope = scopes[name];
+        const prefix = name === 'total' ? 'your total budget' : 'your ' + name + ' budget';
+        const message = rule.percent >= 100
+            ? `You've used all of ${prefix} — ${money(scope.spent)} of ${money(scope.budget)}.`
+            : `${Math.round(scope.percent)}% of ${prefix} used — ${money(scope.spent)} of ${money(scope.budget)}.`;
+        showNotification(message, rule.percent >= 100 ? 'error' : 'warning', 6000);
+    });
+}
+
+/* =====================================================================
+   Recurring expenses
+   ---------------------------------------------------------------------
+   Rules live in their own table. Nothing is ever inserted behind your
+   back: due items are offered on the dashboard and you add or skip them.
+   The table is optional — until it exists the feature hides itself and
+   the manage window shows the SQL to create it.
+   ===================================================================== */
+
+let recurringRules = [];
+let recurringAvailable = true;
+
+const RECURRING_SQL = `CREATE TABLE IF NOT EXISTS recurring_expenses (
+    id               BIGSERIAL PRIMARY KEY,
+    user_id          UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    amount           DECIMAL(10,2) NOT NULL CHECK (amount > 0 AND amount <= 1000000),
+    type             TEXT NOT NULL,
+    note             TEXT NOT NULL,
+    billed           BOOLEAN NOT NULL DEFAULT FALSE,
+    day_of_month     SMALLINT NOT NULL CHECK (day_of_month BETWEEN 1 AND 31),
+    active           BOOLEAN NOT NULL DEFAULT TRUE,
+    last_added_year  INTEGER,
+    last_added_month SMALLINT,
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE recurring_expenses ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can manage own recurring expenses"
+    ON recurring_expenses FOR ALL USING (auth.uid() = user_id);
+
+CREATE INDEX IF NOT EXISTS idx_recurring_user
+    ON recurring_expenses(user_id, active);`;
+
+async function loadRecurring() {
+    if (!currentUser) return;
+    try {
+        const { data, error } = await supabase
+            .from('recurring_expenses')
+            .select('*')
+            .eq('user_id', currentUser.id)
+            .order('day_of_month', { ascending: true });
+
+        if (error) {
+            recurringAvailable = false;
+            recurringRules = [];
+        } else {
+            recurringAvailable = true;
+            recurringRules = data || [];
+        }
+    } catch (error) {
+        recurringAvailable = false;
+        recurringRules = [];
+    }
+    renderRecurringDue();
+}
+
+/** Day the rule lands on this month, clamped for short months. */
+function recurringDateFor(rule, year, month) {
+    const day = Math.min(Number(rule.day_of_month) || 1, daysInMonth(year, month));
+    return `${year}-${pad2(month)}-${pad2(day)}`;
+}
+
+function dueRecurring() {
+    if (!recurringAvailable) return [];
+    const { year, month, day } = todayParts();
+    return recurringRules.filter(rule => {
+        if (!rule.active) return false;
+        if (Number(rule.last_added_year) === year && Number(rule.last_added_month) === month) {
+            return false;
+        }
+        return day >= Math.min(Number(rule.day_of_month) || 1, daysInMonth(year, month));
+    });
+}
+
+function renderRecurringDue() {
+    const card = $('recurring-due');
+    const list = $('recurring-due-list');
+    if (!card || !list) return;
+
+    const due = dueRecurring();
+    if (!due.length) {
+        card.style.display = 'none';
+        return;
+    }
+
+    const { year, month } = todayParts();
+    card.style.display = 'block';
+    setText('recurring-due-title',
+        due.length === 1 ? '1 recurring expense due' : due.length + ' recurring expenses due');
+
+    list.innerHTML = due.map(rule => `
+        <div class="recurring-due-item">
+            <div class="recurring-due-main">
+                <div class="recurring-due-note">${esc(rule.note)}</div>
+                <div class="recurring-due-meta">
+                    ${typeBadge(rule.type)}
+                    ${billingBadge(rule.billed)}
+                    <span>${esc(formatDate(recurringDateFor(rule, year, month)))}</span>
+                </div>
+            </div>
+            <div class="recurring-due-amount">${esc(money(rule.amount))}</div>
+            <div class="recurring-due-actions">
+                <button class="icon-btn tone-green" type="button" title="Add this expense"
+                    aria-label="Add this expense" onclick="addRecurringNow('${attr(rule.id)}')">
+                    <svg class="icon"><use href="#i-check" /></svg>
+                </button>
+                <button class="icon-btn" type="button" title="Skip this month"
+                    aria-label="Skip this month" onclick="skipRecurring('${attr(rule.id)}')">
+                    <svg class="icon"><use href="#i-close" /></svg>
+                </button>
+            </div>
+        </div>`).join('');
+
+    show('recurring-add-all', due.length > 1);
+}
+
+async function markRecurringHandled(rule) {
+    const { year, month } = todayParts();
+    const { error } = await supabase
+        .from('recurring_expenses')
+        .update({ last_added_year: year, last_added_month: month })
+        .eq('id', rule.id)
+        .eq('user_id', currentUser.id);
+    if (error) throw error;
+    rule.last_added_year = year;
+    rule.last_added_month = month;
+}
+
+async function addRecurringNow(id, quiet) {
+    const rule = recurringRules.find(entry => String(entry.id) === String(id));
+    if (!rule) return false;
+
+    const { year, month } = todayParts();
+    try {
+        const { error } = await supabase.from('expenses').insert([{
+            user_id: currentUser.id,
+            amount: rule.amount,
+            date: recurringDateFor(rule, year, month),
+            type: rule.type,
+            note: rule.note,
+            billed: trackingBilling() ? !!rule.billed : false
+        }]);
+        if (error) throw error;
+
+        await markRecurringHandled(rule);
+        renderRecurringDue();
+
+        if (!quiet) {
+            await refreshAfterMutation();
+            await checkBudgetWarnings();
+            showNotification('Added ' + money(rule.amount) + ' · ' + rule.note, 'success');
+        }
+        return true;
+    } catch (error) {
+        showNotification('Could not add recurring expense: ' + error.message, 'error');
+        return false;
+    }
+}
+
+async function addAllRecurringDue() {
+    const due = dueRecurring();
+    if (!due.length) return;
+
+    const button = $('recurring-add-all');
+    if (button) button.disabled = true;
+
+    let added = 0;
+    for (const rule of due) {
+        if (await addRecurringNow(rule.id, true)) added++;
+    }
+
+    if (button) button.disabled = false;
+    renderRecurringDue();
+    await refreshAfterMutation();
+    await loadRecentActivity();
+    await checkBudgetWarnings();
+    if (added) showNotification(added + ' recurring expense(s) added', 'success');
+}
+
+async function skipRecurring(id) {
+    const rule = recurringRules.find(entry => String(entry.id) === String(id));
+    if (!rule) return;
+    try {
+        await markRecurringHandled(rule);
+        renderRecurringDue();
+        showNotification('Skipped for ' + getCurrentMonthName(), 'success', 2600);
+    } catch (error) {
+        showNotification('Could not skip: ' + error.message, 'error');
+    }
+}
+
+async function showRecurringModal() {
+    openModal('recurring-modal');
+    $('recurring-alert').innerHTML = '';
+    $('recurring-sql').textContent = RECURRING_SQL;
+
+    await loadRecurring();
+    show('recurring-unavailable', !recurringAvailable, 'block');
+    show('recurring-available', recurringAvailable, 'block');
+    if (!recurringAvailable) return;
+
+    const select = $('recurring-type');
+    const types = await loadTypesForEdit();
+    select.innerHTML = '<option value="">Select Type</option>' +
+        types.map(name => `<option value="${attr(name)}">${esc(name)}</option>`).join('');
+
+    show('recurring-billed-group', trackingBilling());
+    renderRecurringList();
+}
+
+function closeRecurringModal() {
+    closeModal('recurring-modal');
+    $('recurring-form').reset();
+    $('recurring-billed-toggle').classList.remove('active');
+    $('recurring-alert').innerHTML = '';
+}
+
+function copyRecurringSql() {
+    const text = RECURRING_SQL;
+    const done = () => showAlert('recurring-alert', 'SQL copied to your clipboard.', 'success');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, () => {
+            showAlert('recurring-alert', 'Copy failed — select the text manually.', 'error');
+        });
+    } else {
+        showAlert('recurring-alert', 'Select the text above and copy it manually.', 'error');
+    }
+}
+
+function renderRecurringList() {
+    const list = $('recurring-list');
+    if (!list) return;
+
+    if (!recurringRules.length) {
+        list.innerHTML = '<p class="setting-desc">Nothing recurring yet. Add rent, an EMI or a ' +
+            'subscription above and it will be offered to you each month.</p>';
+        return;
+    }
+
+    list.innerHTML = recurringRules.map(rule => `
+        <div class="recurring-row ${rule.active ? '' : 'paused'}">
+            <div class="recurring-row-main">
+                <div class="recurring-row-note">${esc(rule.note)}</div>
+                <div class="recurring-row-meta">
+                    ${esc(money(rule.amount))} · ${esc(rule.type)} · day ${esc(rule.day_of_month)}${rule.active ? '' : ' · paused'}
+                </div>
+            </div>
+            <div class="recurring-due-actions">
+                <button class="icon-btn" type="button"
+                    title="${rule.active ? 'Pause' : 'Resume'}"
+                    aria-label="${rule.active ? 'Pause' : 'Resume'}"
+                    onclick="toggleRecurringActive('${attr(rule.id)}')">
+                    <svg class="icon"><use href="#${rule.active ? 'i-minus' : 'i-check'}" /></svg>
+                </button>
+                <button class="icon-btn tone-red" type="button" title="Delete" aria-label="Delete"
+                    onclick="deleteRecurring('${attr(rule.id)}')">
+                    <svg class="icon"><use href="#i-trash" /></svg>
+                </button>
+            </div>
+        </div>`).join('');
+}
+
+function toggleRecurringBilling() {
+    const toggle = $('recurring-billed-toggle');
+    toggle.classList.toggle('active');
+    toggle.setAttribute('aria-checked', String(toggle.classList.contains('active')));
+}
+
+async function handleRecurringSubmit(event) {
+    event.preventDefault();
+
+    const note = $('recurring-note').value.trim();
+    const type = $('recurring-type').value;
+    const amount = parseFloat($('recurring-amount').value);
+    const day = parseInt($('recurring-day').value, 10);
+    const billed = trackingBilling() && $('recurring-billed-toggle').classList.contains('active');
+
+    const errors = validateExpenseInput(amount, type, note);
+    if (!(day >= 1 && day <= 31)) errors.push('Day of month must be between 1 and 31');
+    if (errors.length) {
+        showAlert('recurring-alert', errors[0], 'error');
+        return;
+    }
+
+    const button = $('recurring-submit');
+    button.disabled = true;
+    try {
+        const { error } = await supabase.from('recurring_expenses').insert([{
+            user_id: currentUser.id,
+            amount, type, note, billed,
+            day_of_month: day,
+            active: true
+        }]);
+        if (error) throw error;
+
+        $('recurring-form').reset();
+        $('recurring-day').value = 1;
+        $('recurring-billed-toggle').classList.remove('active');
+
+        await loadRecurring();
+        renderRecurringList();
+        showAlert('recurring-alert', 'Recurring expense saved.', 'success');
+    } catch (error) {
+        showAlert('recurring-alert', error.message || 'Could not save.', 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function toggleRecurringActive(id) {
+    const rule = recurringRules.find(entry => String(entry.id) === String(id));
+    if (!rule) return;
+    try {
+        const { error } = await supabase
+            .from('recurring_expenses')
+            .update({ active: !rule.active })
+            .eq('id', id).eq('user_id', currentUser.id);
+        if (error) throw error;
+        rule.active = !rule.active;
+        renderRecurringList();
+        renderRecurringDue();
+    } catch (error) {
+        showAlert('recurring-alert', error.message, 'error');
+    }
+}
+
+async function deleteRecurring(id) {
+    const rule = recurringRules.find(entry => String(entry.id) === String(id));
+    if (!rule) return;
+    if (!confirm('Delete the recurring rule "' + rule.note + '"? Expenses already added are kept.')) {
+        return;
+    }
+    try {
+        const { error } = await supabase
+            .from('recurring_expenses').delete()
+            .eq('id', id).eq('user_id', currentUser.id);
+        if (error) throw error;
+        recurringRules = recurringRules.filter(entry => String(entry.id) !== String(id));
+        renderRecurringList();
+        renderRecurringDue();
+        showAlert('recurring-alert', 'Recurring rule deleted.', 'success');
+    } catch (error) {
+        showAlert('recurring-alert', error.message, 'error');
+    }
+}
+
+/* =====================================================================
+   Analytics modal
+   ===================================================================== */
+
+function showVisualizationModal() {
+    openModal('visualization-modal');
+    applyBillingMode();
+    loadTypesForFilter();
+    applyDateFilter();
+}
+
+function closeVisualizationModal() {
+    closeModal('visualization-modal');
+    if (currentChart) {
+        currentChart.destroy();
+        currentChart = null;
+    }
+    editedExpenses.clear();
+    expenseEdits = {};
+}
+
+async function loadTypesForFilter() {
+    try {
+        const { data, error } = await supabase.from('expense_types').select('name').order('name');
+        if (error) throw error;
+        const select = $('type-filter');
+        const previous = select.value;
+        select.innerHTML = '<option value="all">All Types</option>';
+        data.forEach(type => {
+            const option = document.createElement('option');
+            option.value = type.name;
+            option.textContent = type.name;
+            select.appendChild(option);
+        });
+        if (previous) select.value = previous;
     } catch (error) {
         console.error('Failed to load types for filter:', error);
     }
 }
 
-function closeVisualizationModal() {
-    document.getElementById('visualization-modal').style.display = 'none';
-    if (currentChart) {
-        currentChart.destroy();
-        currentChart = null;
+function applyRangePreset(preset) {
+    const { year, month } = todayParts();
+    const today = todayISO();
+    let start = '', end = today;
+
+    if (preset === 'this-month') {
+        start = monthBounds(year, month).first;
+    } else if (preset === 'last-month') {
+        const prev = previousMonth(year, month);
+        const bounds = monthBounds(prev.year, prev.month);
+        start = bounds.first;
+        end = bounds.last;
+    } else if (preset === 'last-30') {
+        start = addDaysISO(today, -29);
+    } else if (preset === 'this-year') {
+        start = year + '-01-01';
+    } else if (preset === 'all') {
+        start = '';
+        end = '';
     }
-    // Reset billing toggle tracking
-    editedExpenses.clear();
-    expenseEdits = {};
-    showLandingIcons();
+
+    $('start-date').value = start;
+    $('end-date').value = end;
+
+    document.querySelectorAll('#range-presets .chip').forEach(chip => {
+        chip.classList.toggle('active', chip.getAttribute('onclick').indexOf("'" + preset + "'") !== -1);
+    });
+
+    applyDateFilter();
 }
 
 async function applyDateFilter() {
-    const startDate = document.getElementById('start-date').value;
-    const endDate = document.getElementById('end-date').value;
-    const billingFilter = document.getElementById('billing-filter').value;
-    const typeFilter = document.getElementById('type-filter').value;
+    const startDate = $('start-date').value;
+    const endDate = $('end-date').value;
+    const billingFilter = trackingBilling() ? $('billing-filter').value : 'both';
+    const typeFilter = $('type-filter').value;
 
     try {
         let query = supabase.from('expenses').select('*');
-
         if (startDate) query = query.gte('date', startDate);
         if (endDate) query = query.lte('date', endDate);
         if (billingFilter === 'billed') query = query.eq('billed', true);
@@ -1329,2036 +3085,1448 @@ async function applyDateFilter() {
         if (error) throw error;
 
         filteredExpenses = data || [];
-        updateChart('line');
-
-        // Add expense list below chart
-        showExpenseList();
     } catch (error) {
         console.error('Failed to filter expenses:', error);
         filteredExpenses = [];
-        updateChart('line');
+        showNotification('Could not load expenses for that filter.', 'error');
     }
+
+    editedExpenses.clear();
+    expenseEdits = {};
+    updateChart(currentChartType);
+    showExpenseList();
 }
 
 function updateChartType(type) {
+    currentChartType = type;
+    document.querySelectorAll('#chart-toolbar .seg').forEach(button => {
+        button.classList.toggle('active', button.dataset.chart === type);
+    });
     updateChart(type);
 }
 
+/**
+ * Show/hide a DOM overlay over a chart canvas. Painting the message onto
+ * the canvas is unreliable — after Chart#destroy the backing store size
+ * and DPR transform are no longer ours to reason about.
+ */
+function setChartEmptyState(canvas, message) {
+    if (!canvas || !canvas.parentNode) return;
+    const holder = canvas.parentNode;
+    if (getComputedStyle(holder).position === 'static') holder.style.position = 'relative';
+
+    let overlay = holder.querySelector('.chart-empty');
+    if (!message) {
+        if (overlay) overlay.remove();
+        canvas.style.visibility = '';
+        return;
+    }
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'chart-empty';
+        holder.appendChild(overlay);
+    }
+    overlay.textContent = message;
+    canvas.style.visibility = 'hidden';
+}
+
 function updateChart(chartType) {
-    const ctx = document.getElementById('expenseChart').getContext('2d');
+    const canvas = $('expenseChart');
+    if (!canvas || !chartsAvailable()) return;
+    const context = canvas.getContext('2d');
 
     if (currentChart) {
         currentChart.destroy();
+        currentChart = null;
     }
-
     if (filteredExpenses.length === 0) {
-        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-        ctx.fillStyle = document.body.classList.contains('dark-mode') ? '#f9fafb' : '#9ca3af';
-        ctx.font = '16px Inter';
-        ctx.textAlign = 'center';
-        ctx.fillText('No expenses found for the selected date range', ctx.canvas.width / 2, ctx.canvas.height / 2);
+        setChartEmptyState(canvas, 'No expenses in this range');
         return;
     }
+    setChartEmptyState(canvas, null);
 
-    let chartData, chartConfig;
+    applyChartDefaults();
+    const moneyTick = value => moneyShort(value);
+    let config;
 
     if (chartType === 'line') {
-        chartData = prepareLineChartData();
-        chartConfig = {
+        config = {
             type: 'line',
-            data: chartData,
+            data: prepareLineChartData(),
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
                 plugins: {
-                    title: { display: true, text: 'Expenses Over Time' },
-                    legend: { display: false }
+                    title: { display: true, text: 'Cumulative spend over time' },
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: { label: ctx => 'Total: ' + money(ctx.parsed.y) }
+                    }
                 },
                 scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: { callback: function (value) { return '₹' + value.toFixed(0); } }
-                    }
+                    x: axisConfig(),
+                    y: axisConfig({ beginAtZero: true, ticks: { color: chartInk(), callback: moneyTick } })
                 }
             }
         };
     } else if (chartType === 'bubble') {
-        chartData = prepareBubbleChartData();
-        chartConfig = {
+        config = {
             type: 'bubble',
-            data: chartData,
+            data: prepareBubbleChartData(),
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
                 plugins: {
-                    title: { display: true, text: 'Expense Types by Amount & Frequency' },
+                    title: { display: true, text: 'Types by amount and frequency' },
                     legend: { display: false },
                     tooltip: {
                         callbacks: {
-                            label: function(context) {
-                                return `${context.raw.label}: ₹${context.raw.y.toFixed(2)} (${context.raw.x} transactions)`;
-                            }
-                        }
-                    }
-                },
-                elements: {
-                    point: {
-                        backgroundColor: function(context) {
-                            const colors = [
-                                '#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe',
-                                '#43e97b', '#38f9d7', '#ffecd2', '#fcb69f', '#a8edea', '#fed6e3'
-                            ];
-                            return colors[context.dataIndex % colors.length];
+                            label: ctx => `${ctx.raw.label}: ${money(ctx.raw.y)} · ${ctx.raw.x} txn`
                         }
                     }
                 },
                 scales: {
-                    x: { title: { display: true, text: 'Number of Transactions' } },
-                    y: {
-                        title: { display: true, text: 'Total Amount (₹)' },
-                        ticks: { callback: function (value) { return '₹' + value.toFixed(0); } }
-                    }
+                    x: axisConfig({ title: { display: true, text: 'Transactions', color: chartInk() } }),
+                    y: axisConfig({
+                        beginAtZero: true,
+                        title: { display: true, text: 'Amount', color: chartInk() },
+                        ticks: { color: chartInk(), callback: moneyTick }
+                    })
                 }
             }
         };
     } else {
-        chartData = prepareTypeChartData();
+        const data = prepareTypeChartData();
         const isHorizontal = chartType === 'horizontalBar';
+        const isDoughnut = chartType === 'doughnut';
 
-        chartConfig = {
+        config = {
             type: isHorizontal ? 'bar' : chartType,
-            data: chartData,
+            data,
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
                 indexAxis: isHorizontal ? 'y' : 'x',
+                cutout: isDoughnut ? '62%' : undefined,
                 plugins: {
-                    title: { display: true, text: 'Expenses by Type' },
-                    legend: { position: 'bottom', display: chartType === 'doughnut' },
+                    title: { display: true, text: 'Spend by type' },
+                    legend: { position: 'bottom', display: isDoughnut },
                     tooltip: {
                         callbacks: {
-                            label: function (context) {
-                                // For horizontal bar charts, use context.parsed.x, for others use context.parsed.y
-                                const value = isHorizontal ? context.parsed.x : (context.parsed.y || context.parsed);
-                                return context.label + ': ₹' + value.toFixed(2);
+                            label: function (ctx) {
+                                const value = isDoughnut ? ctx.parsed
+                                    : (isHorizontal ? ctx.parsed.x : ctx.parsed.y);
+                                return ctx.label + ': ' + money(value);
                             }
                         }
                     }
                 },
-                scales: chartType === 'doughnut' ? {} : {
-                    [isHorizontal ? 'x' : 'y']: {
+                scales: isDoughnut ? {} : {
+                    [isHorizontal ? 'x' : 'y']: axisConfig({
                         beginAtZero: true,
-                        title: { display: true, text: 'Amount (₹)' },
-                        ticks: { callback: function (value) { return '₹' + value.toFixed(0); } }
-                    },
-                    [isHorizontal ? 'y' : 'x']: {
-                        title: { display: true, text: 'Expense Types' }
-                    }
+                        ticks: { color: chartInk(), callback: moneyTick }
+                    }),
+                    [isHorizontal ? 'y' : 'x']: axisConfig()
                 }
             }
         };
     }
 
-    currentChart = new Chart(ctx, chartConfig);
+    currentChart = new Chart(context, config);
+}
+
+function totalsByType() {
+    const totals = {};
+    filteredExpenses.forEach(expense => {
+        totals[expense.type] = (totals[expense.type] || 0) + (parseFloat(expense.amount) || 0);
+    });
+    return totals;
 }
 
 function prepareTypeChartData() {
-    const typeData = {};
-    filteredExpenses.forEach(expense => {
-        typeData[expense.type] = (typeData[expense.type] || 0) + parseFloat(expense.amount);
-    });
-
-    const colors = [
-        '#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe',
-        '#43e97b', '#38f9d7', '#ffecd2', '#fcb69f', '#a8edea', '#fed6e3',
-        '#ff9a9e', '#fecfef', '#ffeaa7', '#fab1a0'
-    ];
-
+    const totals = totalsByType();
+    const labels = Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
     return {
-        labels: Object.keys(typeData),
+        labels,
         datasets: [{
             label: 'Amount',
-            data: Object.values(typeData),
-            backgroundColor: colors.slice(0, Object.keys(typeData).length),
-            borderWidth: 2,
-            borderColor: '#ffffff'
+            data: labels.map(label => totals[label]),
+            backgroundColor: labels.map(label => categoryColor(label).chart),
+            borderWidth: 0,
+            borderRadius: 6
         }]
     };
 }
 
 function prepareLineChartData() {
-    const dailyData = {};
+    const daily = {};
     filteredExpenses.forEach(expense => {
-        const date = expense.date;
-        dailyData[date] = (dailyData[date] || 0) + parseFloat(expense.amount);
+        daily[expense.date] = (daily[expense.date] || 0) + (parseFloat(expense.amount) || 0);
     });
 
-    const sortedDates = Object.keys(dailyData).sort();
-
-    // Calculate cumulative totals
-    let cumulativeTotal = 0;
-    const cumulativeData = sortedDates.map(date => {
-        cumulativeTotal += dailyData[date];
-        return cumulativeTotal;
-    });
+    const sortedDates = Object.keys(daily).sort();
+    let running = 0;
+    const cumulative = sortedDates.map(date => (running += daily[date]));
 
     return {
-        labels: sortedDates.map(date => formatDate(date)),
+        labels: sortedDates.map(formatDate),
         datasets: [{
-            label: 'Cumulative Expenses',
-            data: cumulativeData,
-            borderColor: '#667eea',
-            backgroundColor: 'rgba(102, 126, 234, 0.1)',
-            borderWidth: 3,
+            label: 'Cumulative',
+            data: cumulative,
+            borderColor: '#6366f1',
+            backgroundColor: 'rgba(99, 102, 241, 0.14)',
+            borderWidth: 2.5,
+            pointRadius: sortedDates.length > 40 ? 0 : 3,
+            pointHoverRadius: 5,
             fill: true,
-            tension: 0.4
+            tension: 0.35
         }]
     };
 }
 
 function prepareBubbleChartData() {
-    const typeData = {};
+    const byType = {};
     filteredExpenses.forEach(expense => {
-        if (!typeData[expense.type]) {
-            typeData[expense.type] = { total: 0, count: 0 };
-        }
-        typeData[expense.type].total += parseFloat(expense.amount);
-        typeData[expense.type].count += 1;
+        if (!byType[expense.type]) byType[expense.type] = { total: 0, count: 0 };
+        byType[expense.type].total += parseFloat(expense.amount) || 0;
+        byType[expense.type].count += 1;
     });
 
-    const colors = [
-        '#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe',
-        '#43e97b', '#38f9d7', '#ffecd2', '#fcb69f', '#a8edea', '#fed6e3',
-        '#ff9a9e', '#fecfef', '#ffeaa7', '#fab1a0'
-    ];
-
-    const bubbleData = Object.keys(typeData).map((type, index) => ({
-        x: typeData[type].count,
-        y: typeData[type].total,
-        r: Math.max(Math.sqrt(typeData[type].total) * 0.5, 8), // Better bubble sizing
-        label: type
-    }));
-
+    const labels = Object.keys(byType);
     return {
         datasets: [{
-            label: 'Expense Types',
-            data: bubbleData,
-            backgroundColor: colors.slice(0, bubbleData.length),
-            borderColor: '#ffffff',
+            label: 'Expense types',
+            data: labels.map(label => ({
+                x: byType[label].count,
+                y: byType[label].total,
+                r: Math.max(Math.sqrt(byType[label].total) * 0.5, 8),
+                label
+            })),
+            backgroundColor: labels.map(label => categoryColor(label).chart + 'cc'),
+            borderColor: labels.map(label => categoryColor(label).chart),
             borderWidth: 2
         }]
     };
 }
 
-async function exportToCSV() {
-    // Get CURRENT filter values from the form
-    const startDate = document.getElementById('start-date').value;
-    const endDate = document.getElementById('end-date').value;
-    const billingFilter = document.getElementById('billing-filter').value;
-    const typeFilter = document.getElementById('type-filter').value;
-
-    // Apply filters to get the exact data to export
-    try {
-        let query = supabase.from('expenses').select('*');
-
-        if (startDate) query = query.gte('date', startDate);
-        if (endDate) query = query.lte('date', endDate);
-        if (billingFilter === 'billed') query = query.eq('billed', true);
-        if (billingFilter === 'unbilled') query = query.eq('billed', false);
-        if (typeFilter !== 'all') query = query.eq('type', typeFilter);
-
-        const { data, error } = await query.order('date', { ascending: false });
-        if (error) throw error;
-
-        const expensesToExport = data || [];
-
-        if (expensesToExport.length === 0) {
-            alert('No expenses to export for the selected filters.');
-            return;
-        }
-
-        // Generate filename based on CURRENT filters
-        let filename = 'expenses';
-
-        if (startDate && endDate) {
-            if (startDate === endDate) {
-                filename += `_${startDate}`;
-            } else {
-                filename += `_${startDate}_to_${endDate}`;
-            }
-        } else if (startDate) {
-            filename += `_from_${startDate}`;
-        } else if (endDate) {
-            filename += `_until_${endDate}`;
-        }
-
-        if (typeFilter !== 'all') {
-            filename += `_${typeFilter}`;
-        }
-
-        if (billingFilter === 'billed') {
-            filename += '_billed';
-        } else if (billingFilter === 'unbilled') {
-            filename += '_unbilled';
-        } else {
-            filename += '_both';
-        }
-
-        filename += '.csv';
-
-        const startMonth = startDate ? new Date(startDate).getMonth() + 1 : null;
-        const startYear = startDate ? new Date(startDate).getFullYear() : null;
-        const endMonth = endDate ? new Date(endDate).getMonth() + 1 : null;
-        const endYear = endDate ? new Date(endDate).getFullYear() : null;
-
-        const isSingleMonthExport = startMonth === endMonth && startYear === endYear && startMonth && endMonth;
-
-        const headers = ['Date', 'Type', 'Note', 'Amount', 'Billed'];
-        const rows = expensesToExport.map(expense => [
-            expense.date,
-            `"${expense.type}"`,
-            `"${expense.note || ''}"`,
-            expense.amount,
-            expense.billed ? 'Yes' : 'No'
-        ]);
-
-        const total = expensesToExport.reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-        rows.push(['', '', '', '', '']);
-        rows.push(['', '', 'TOTAL:', `Rs. ${total.toFixed(2)}`, '']);
-
-        const hasBilled = expensesToExport.some(e => e.billed);
-        const hasUnbilled = expensesToExport.some(e => !e.billed);
-
-        if (isSingleMonthExport) {
-            try {
-                const { data: budgetData } = await supabase
-                    .from('user_budgets')
-                    .select('monthly_billed_budget, monthly_unbilled_budget')
-                    .eq('user_id', currentUser.id)
-                    .eq('budget_month', startMonth)
-                    .eq('budget_year', startYear)
-                    .single();
-
-                const exportBilledBudget = budgetData?.monthly_billed_budget || 0;
-                const exportUnbilledBudget = budgetData?.monthly_unbilled_budget || 0;
-
-                if (exportBilledBudget > 0 || exportUnbilledBudget > 0) {
-                    const billedSpent = expensesToExport.filter(e => e.billed).reduce((sum, e) => sum + parseFloat(e.amount), 0);
-                    const unbilledSpent = expensesToExport.filter(e => !e.billed).reduce((sum, e) => sum + parseFloat(e.amount), 0);
-
-                    rows.push(['', '', '', '', '']);
-
-                    if (hasBilled && exportBilledBudget > 0) {
-                        rows.push(['', '', 'BILLED BUDGET:', `Rs. ${exportBilledBudget.toFixed(2)}`, '']);
-                        rows.push(['', '', 'BILLED SPENT:', `Rs. ${billedSpent.toFixed(2)}`, '']);
-                        rows.push(['', '', 'BILLED REMAINING:', `Rs. ${(exportBilledBudget - billedSpent).toFixed(2)}`, '']);
-                        if (hasUnbilled) rows.push(['', '', '', '', '']);
-                    }
-
-                    if (hasUnbilled && exportUnbilledBudget > 0) {
-                        rows.push(['', '', 'UNBILLED BUDGET:', `Rs. ${exportUnbilledBudget.toFixed(2)}`, '']);
-                        rows.push(['', '', 'UNBILLED SPENT:', `Rs. ${unbilledSpent.toFixed(2)}`, '']);
-                        rows.push(['', '', 'UNBILLED REMAINING:', `Rs. ${(exportUnbilledBudget - unbilledSpent).toFixed(2)}`, '']);
-                    }
-                }
-            } catch (error) {
-                console.error('Failed to fetch budget for export month:', error);
-            }
-        }
-
-        const csvContent = [headers.join(','), ...rows.map(row => row.join(','))].join('\n');
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const link = document.createElement('a');
-        const url = URL.createObjectURL(blob);
-        link.setAttribute('href', url);
-        link.setAttribute('download', filename);
-        link.style.visibility = 'hidden';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-
-    } catch (error) {
-        console.error('Export failed:', error);
-        alert('Failed to export expenses: ' + error.message);
-    }
-}
+/* ---------------------------------------------------------------------
+   Editable list under the chart
+   --------------------------------------------------------------------- */
 
 function showExpenseList() {
-    // Remove existing list
-    const existingList = document.querySelector('.expense-list-container');
-    if (existingList) existingList.remove();
+    const mount = $('filtered-list-mount');
+    if (!mount) return;
 
-    if (filteredExpenses.length === 0) return;
-
-    const chartContainer = document.querySelector('.chart-container');
-    const listContainer = document.createElement('div');
-    listContainer.className = 'expense-list-container';
-    listContainer.innerHTML = `
-                <div style="margin-top: 2rem;">
-                    <h4 style="margin-bottom: 1rem; color: #374151;">Filtered Expenses (${filteredExpenses.length})</h4>
-                    <div style="max-height: 300px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 8px;">
-                        ${filteredExpenses.map(expense => `
-                            <div class="expense-item" style="margin: 0; border-radius: 0;" data-id="${expense.id}">
-                                <div class="expense-details">
-                                    <div class="expense-amount" data-original="${expense.amount}">₹${parseFloat(expense.amount).toFixed(2)}</div>
-                                    <div class="expense-note" data-original="${expense.note || ''}">${sanitizeHTML(expense.note) || 'No description'}</div>
-                                    <div class="expense-meta">
-                                        <span class="expense-type" data-original="${expense.type}">${expense.type}</span>
-                                        <span class="billed-status" data-billed="${expense.billed}">
-                                            ${expense.billed ? '<span class="billed-badge">BILLED</span>' : '<span style="color: #ef4444; font-size: 0.7rem; font-weight: 600;">UNBILLED</span>'}
-                                        </span>
-                                        <span class="expense-date" data-original="${expense.date}">${formatDate(expense.date)}</span>
-                                    </div>
-                                </div>
-                                <div style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
-                                    <div style="display: flex; align-items: center; gap: 0.5rem;">
-                                        <svg class="edit-icon" id="edit-icon-${expense.id}" onclick="toggleEditMode(${expense.id})" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" width="24" height="24" style="background: #667eea; color: white; stroke: white; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; padding: 6px;">
-                                            <path d="m18 2 4 4-14 14H4v-4L18 2z"></path>
-                                            <path d="M14.5 5.5 18.5 9.5"></path>
-                                        </svg>
-                                        <svg class="delete-btn" id="delete-btn-${expense.id}" onclick="deleteFilteredExpense(${expense.id})" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24" title="Delete expense" style="background: #ef4444; color: white; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; padding: 6px;">
-                                            <polyline points="3,6 5,6 21,6"></polyline>
-                                            <path d="m19,6v14a2,2 0 0,1 -2,2H7a2,2 0 0,1 -2,-2V6m3,0V4a2,2 0 0,1 2,2h4a2,2 0 0,1 2,2v2"></path>
-                                            <line x1="10" y1="11" x2="10" y2="17"></line>
-                                            <line x1="14" y1="11" x2="14" y2="17"></line>
-                                        </svg>
-                                    </div>
-                                    <div class="edit-toggle-container" id="edit-container-${expense.id}" style="display: none;">
-                                        <div class="billed-toggle ${expense.billed ? 'active' : ''}" onclick="toggleBillingStatus(${expense.id})"></div>
-                                    </div>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                </div>
-            `;
-    // Calculate and display total
-    const totalAmount = filteredExpenses.reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-    listContainer.innerHTML += `
-                <div style="margin-top: 1rem; padding: 1rem; background: linear-gradient(135deg, rgba(102, 126, 234, 0.05), rgba(118, 75, 162, 0.05)); border-radius: 12px; border: 1px solid rgba(102, 126, 234, 0.1);">
-                    <div class="expense-total" style="font-size: 1.1rem; font-weight: 600; color: #374151; text-align: right;">
-                        Total: ₹${totalAmount.toFixed(2)}
-                    </div>
-                </div>
-            `;
-    // Add save changes button after the expense list
-    if (filteredExpenses.length > 0) {
-        listContainer.innerHTML += `
-                    <div style="display: flex; justify-content: flex-end; margin-top: 1rem;">
-                        <button class="save-changes-btn" style="display: none;" onclick="saveAllChanges()">Save Changes</button>
-                    </div>
-                `;
-    }
-    chartContainer.parentNode.insertBefore(listContainer, chartContainer.nextSibling);
-}
-
-// Utility functions
-function showAlert(containerId, message, type) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
-    setTimeout(() => {
-        container.innerHTML = '';
-    }, 5000);
-}
-
-function formatDate(dateString) {
-    const date = new Date(dateString);
-    return date.toLocaleDateString('en-IN', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric'
-    });
-}
-
-// Global variables for edit mode
-let editedExpenses = new Set();
-let expenseEdits = {};
-
-// Delete type functions
-function showDeleteTypeModal() {
-    document.getElementById('delete-type-modal').style.display = 'block';
-    hideLandingIcons();
-
-    // Auto-select the current type if one is selected
-    const currentType = document.getElementById('type').value;
-
-    loadTypesForDeletion().then(() => {
-        if (currentType) {
-            document.getElementById('delete-type-select').value = currentType;
-        }
-    });
-}
-
-function closeDeleteTypeModal() {
-    document.getElementById('delete-type-modal').style.display = 'none';
-    document.getElementById('delete-type-form').reset();
-    document.getElementById('delete-type-alert').innerHTML = '';
-    hideLandingIcons();
-}
-
-async function loadTypesForDeletion() {
-    try {
-        const { data, error } = await supabase
-            .from('expense_types')
-            .select('name')
-            .order('name');
-
-        if (error) throw error;
-
-        const typeSelect = document.getElementById('delete-type-select');
-        typeSelect.innerHTML = '<option value="">Select Type</option>';
-
-        data.forEach(type => {
-            const option = document.createElement('option');
-            option.value = type.name;
-            option.textContent = type.name;
-            typeSelect.appendChild(option);
-        });
-    } catch (error) {
-        console.error('Failed to load types:', error);
-    }
-}
-
-function showSearchModal() {
-    document.getElementById('search-modal').style.display = 'block';
-    document.getElementById('search-input').focus();
-    loadAllExpensesForSearch();
-}
-
-function closeSearchModal() {
-    document.getElementById('search-modal').style.display = 'none';
-    document.getElementById('search-input').value = '';
-    document.getElementById('search-results').innerHTML = '';
-}
-
-// Add this function for search
-async function loadAllExpensesForSearch() {
-    try {
-        const { data, error } = await supabase
-            .from('expenses')
-            .select('*')
-            .order('date', { ascending: false });
-
-        if (error) throw error;
-
-        allExpensesCache = data || [];
-        performSearch(); // Show all initially
-    } catch (error) {
-        console.error('Failed to load expenses for search:', error);
-    }
-}
-
-// Add search function
-function performSearch() {
-    const searchTerm = document.getElementById('search-input').value.toLowerCase();
-    const resultsContainer = document.getElementById('search-results');
-
-    if (!allExpensesCache) {
-        resultsContainer.innerHTML = '<p>Loading...</p>';
+    if (filteredExpenses.length === 0) {
+        mount.innerHTML = '';
         return;
     }
 
-    let filteredResults = allExpensesCache;
-
-    if (searchTerm) {
-        filteredResults = allExpensesCache.filter(expense =>
-            expense.note?.toLowerCase().includes(searchTerm) ||
-            expense.type.toLowerCase().includes(searchTerm) ||
-            expense.amount.toString().includes(searchTerm) ||
-            formatDate(expense.date).toLowerCase().includes(searchTerm)
-        );
-    }
-
-    // Sort by date descending (newest first)
-    filteredResults.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    if (filteredResults.length === 0) {
-        resultsContainer.innerHTML = '<p style="text-align: center; color: #9ca3af; padding: 2rem;">No expenses found</p>';
-        return;
-    }
-
-    const total = filteredResults.reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
-
-    resultsContainer.innerHTML = `
-        <div style="margin-bottom: 1.5rem; padding: 1rem; background: #f9fafb; border-radius: 8px; font-weight: 600;">
-            Found ${filteredResults.length} expense(s) totaling ₹${total.toFixed(2)}
-        </div>
-        ${filteredResults.map(expense => `
-            <div class="expense-item" style="margin-bottom: 0.5rem;">
-                <div class="expense-details">
-                    <div class="expense-amount">₹${parseFloat(expense.amount).toFixed(2)}</div>
-                    <div class="expense-note">${expense.note || 'No description'}</div>
-                    <div class="expense-meta">
-                        <span class="expense-type">${expense.type}</span>
-                        ${expense.billed ? '<span class="billed-badge">BILLED</span>' : '<span style="color: #ef4444; font-size: 0.7rem; font-weight: 600;">UNBILLED</span>'}
-                        <span>${formatDate(expense.date)}</span>
-                    </div>
+    const total = filteredExpenses.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+    const rows = filteredExpenses.map(expense => `
+        <div class="expense-item" data-id="${attr(expense.id)}">
+            <div class="expense-details">
+                <div class="expense-amount" data-original="${attr(expense.amount)}">${esc(money(expense.amount))}</div>
+                <div class="expense-note" data-original="${attr(expense.note || '')}">${esc(expense.note) || 'No description'}</div>
+                <div class="expense-meta">
+                    <span class="expense-type" data-original="${attr(expense.type)}" style="${typeStyleAttr(expense.type)}">${esc(expense.type)}</span>
+                    <span class="billed-status" data-billed="${attr(expense.billed)}">${billingBadge(expense.billed)}</span>
+                    <span class="expense-date" data-original="${attr(expense.date)}">${esc(formatDate(expense.date))}</span>
                 </div>
             </div>
-        `).join('')}
-    `;
-}
-
-// Add spending insights function
-function showInsightsModal() {
-    document.getElementById('insights-modal').style.display = 'block';
-    loadSpendingInsights();
-    hideLandingIcons();
-}
-
-function closeInsightsModal() {
-    document.getElementById('insights-modal').style.display = 'none';
-
-    // Properly destroy both charts
-    if (window.insightsChart) {
-        window.insightsChart.destroy();
-        window.insightsChart = null;
-    }
-    if (window.velocityChart) {
-        window.velocityChart.destroy();
-        window.velocityChart = null;
-    }
-
-    // CRITICAL FIX: Clear the chart data to prevent interference
-    window.insightsChartData = null;
-    window.velocityChartData = null;
-
-    showLandingIcons();
-}
-
-// Add insights calculation
-async function loadSpendingInsights() {
-    try {
-        const { data, error } = await supabase
-            .from('expenses')
-            .select('note, amount, date, type, billed')
-            .order('date', { ascending: false });
-
-        if (error) throw error;
-
-        const insights = calculateInsights(data);
-        displayInsights(insights);
-    } catch (error) {
-        console.error('Failed to load insights:', error);
-    }
-}
-
-function calculateInsights(expenses) {
-    const istNow = getISTDate();
-    const currentMonth = istNow.getMonth() + 1;
-    const currentYear = istNow.getFullYear();
-    const bounds = getISTMonthBounds(currentYear, currentMonth);
-
-    const thisMonth = expenses.filter(expense => {
-        return expense.date >= bounds.first && expense.date <= bounds.last;
-    });
-
-    const lastMonthBounds = currentMonth === 1 ?
-        getISTMonthBounds(currentYear - 1, 12) :
-        getISTMonthBounds(currentYear, currentMonth - 1);
-
-    const lastMonth = expenses.filter(expense => {
-        return expense.date >= lastMonthBounds.first && expense.date <= lastMonthBounds.last;
-    });
-
-    // Calculations
-    const thisMonthTotal = thisMonth.reduce((sum, e) => sum + parseFloat(e.amount), 0);
-    const lastMonthTotal = lastMonth.reduce((sum, e) => sum + parseFloat(e.amount), 0);
-    const monthlyChange = lastMonthTotal > 0 ? ((thisMonthTotal - lastMonthTotal) / lastMonthTotal) * 100 : 0;
-
-    // Top categories this month
-    const categoryTotals = {};
-    thisMonth.forEach(expense => {
-        categoryTotals[expense.type] = (categoryTotals[expense.type] || 0) + parseFloat(expense.amount);
-    });
-
-    const topCategories = Object.entries(categoryTotals)
-        .sort(([, a], [, b]) => b - a)
-        .slice(0, 6);
-
-    // Daily average
-    const daysInMonth = new Date(currentYear, currentMonth, 0).getDate();
-    const currentDay = istNow.getDate();
-    const dailyAverage = thisMonthTotal / currentDay;
-    const projectedMonthly = dailyAverage * daysInMonth;
-
-    // Highest expense
-    const highestExpense = thisMonth.length > 0 ?
-        thisMonth.reduce((max, expense) => parseFloat(expense.amount) > parseFloat(max.amount) ? expense : max) : null;
-
-    // Average per transaction
-    const avgPerTransaction = thisMonth.length > 0 ? thisMonthTotal / thisMonth.length : 0;
-
-    // Lowest expense
-    const lowestExpense = thisMonth.length > 0 ?
-        thisMonth.reduce((min, expense) => parseFloat(expense.amount) < parseFloat(min.amount) ? expense : min) : null;
-
-    // Monthly spending data for trend chart
-    const monthlyData = {};
-    expenses.forEach(expense => {
-        const date = new Date(expense.date);
-        const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-        if (!monthlyData[key]) {
-            monthlyData[key] = { billed: 0, unbilled: 0, total: 0 };
-        }
-        const amount = parseFloat(expense.amount);
-        monthlyData[key].total += amount;
-        if (expense.billed) monthlyData[key].billed += amount;
-        else monthlyData[key].unbilled += amount;
-    });
-
-    return {
-        thisMonthTotal,
-        lastMonthTotal,
-        monthlyChange,
-        topCategories,
-        dailyAverage,
-        projectedMonthly,
-        highestExpense,
-        lowestExpense,
-        totalExpenses: thisMonth.length,
-        avgPerTransaction,
-        monthlyData
-    };
-}
-
-// Helper functions for dynamic Y-axis scaling
-function calculateStepSize(maxValue) {
-    if (maxValue === 0) return 100;
-
-    const magnitude = Math.pow(10, Math.floor(Math.log10(maxValue)));
-    const normalized = maxValue / magnitude;
-
-    let step;
-    if (normalized <= 1) step = magnitude / 10;
-    else if (normalized <= 2) step = magnitude / 5;
-    else if (normalized <= 5) step = magnitude / 2;
-    else step = magnitude;
-
-    return step;
-}
-
-function calculateMaxValue(maxValue) {
-    if (maxValue === 0) return 1000;
-
-    const step = calculateStepSize(maxValue);
-    return Math.ceil(maxValue / step) * step;
-}
-
-async function displayInsights(insights) {
-    const container = document.getElementById('insights-content');
-    const monthName = getCurrentMonthName();
-
-    // IMPORTANT: Define currentDayOfMonth at the very beginning
-    const today = new Date();
-    const currentDayOfMonth = today.getDate();
-
-    container.innerHTML = `
-        <div style="margin-bottom: 1rem;">
-            <canvas id="monthlyTrendChart" style="max-height: 350px;"></canvas>
-        </div>
-
-        <!-- Data View Radio Buttons Below Chart -->
-        <div style="display: flex; justify-content: center; gap: 1rem; margin-top: 1.5rem; padding: 1rem; background: #f9fafb; border-radius: 12px; flex-wrap: wrap;">
-                <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.85rem; font-weight: 500; color: #374151;">
-                    <input type="radio" name="insightsDataView" value="consolidated" checked onchange="updateInsightsChart()" style="cursor: pointer; width: 16px; height: 16px;">
-                    Consolidated
-                </label>
-                <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.85rem; font-weight: 500; color: #374151;">
-                    <input type="radio" name="insightsDataView" value="billed" onchange="updateInsightsChart()" style="cursor: pointer; width: 16px; height: 16px;">
-                    Billed
-                </label>
-                <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.85rem; font-weight: 500; color: #374151;">
-                    <input type="radio" name="insightsDataView" value="unbilled" onchange="updateInsightsChart()" style="cursor: pointer; width: 16px; height: 16px;">
-                    Unbilled
-                </label>
-                <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.85rem; font-weight: 500; color: #374151;">
-                    <input type="radio" name="insightsDataView" value="total" onchange="updateInsightsChart()" style="cursor: pointer; width: 16px; height: 16px;">
-                    Total Only
-                </label>
-            </div>
-        </div>
-
-        <!-- NEW: Velocity Comparison Chart -->
-        <div style="margin-bottom: 1rem; margin-top: 2rem;">
-            <div class="chart-container">
-                <canvas id="velocityChart"></canvas>
-            </div>
-        </div>
-
-        <!-- Chart Type Toggle (Controls Both Charts) -->
-        <div style="display: flex; justify-content: center; gap: 1rem; margin-top: 1.5rem; padding: 1rem; background: #f9fafb; border-radius: 12px; flex-wrap: wrap;">
-            <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.85rem; font-weight: 500; color: #374151;">
-                <input type="radio" name="velocityChartType" value="bar" checked onchange="updateBothChartTypes()" style="cursor: pointer; width: 16px; height: 16px;">
-                Bar Chart
-            </label>
-            <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.85rem; font-weight: 500; color: #374151;">
-                <input type="radio" name="velocityChartType" value="line" onchange="updateBothChartTypes()" style="cursor: pointer; width: 16px; height: 16px;">
-                Line Chart
-            </label>
-        </div>
-
-        <!-- Day Range Slider -->
-        <div style="margin-top: 2rem; padding: 1.5rem; background: #f9fafb; border-radius: 12px;">
-            <h4 style="margin-bottom: 1rem; color: #374151; text-align: center;">Compare Spending by Day Range</h4>
-            <div style="display: flex; align-items: center; gap: 1rem;">
-                <span style="font-size: 0.9rem; font-weight: 600; color: #667eea; min-width: 80px;">Day 1 to Day</span>
-                <input type="range" id="velocity-day-slider" min="1" max="31" value="${currentDayOfMonth}"
-                       oninput="updateVelocityByDay(this.value)"
-                       style="flex: 1; height: 8px; border-radius: 5px; background: linear-gradient(to right, #667eea 0%, #764ba2 100%); outline: none; -webkit-appearance: none;">
-                <span id="velocity-day-display" style="font-size: 1.1rem; font-weight: 700; color: #667eea; min-width: 40px; text-align: center;">${currentDayOfMonth}</span>
-            </div>
-            <p style="margin-top: 0.5rem; text-align: center; font-size: 0.8rem; color: #6b7280;">Slide to compare spending up to different days of each month</p>
-        </div>
-
-        <div style="margin-bottom: 2rem;"></div>
-        <div class="insights-grid" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; margin-bottom: 2rem;">
-
-            <div class="insight-card" style="padding: 1.5rem; background: linear-gradient(135deg, #667eea, #764ba2); color: white; border-radius: 12px;">
-                <h4 style="margin: 0 0 0.5rem 0; font-size: 0.9rem; opacity: 0.9;">This Month Total</h4>
-                <p style="margin: 0; font-size: 2rem; font-weight: 700;">₹${insights.thisMonthTotal.toFixed(2)}</p>
-                <p style="margin: 0.5rem 0 0 0; font-size: 0.85rem; opacity: 0.8;">${insights.totalExpenses} transactions</p>
-            </div>
-
-            <div class="insight-card" style="padding: 1.5rem; background: ${insights.monthlyChange > 0 ? 'linear-gradient(135deg, #d4fc79, #96e6a1)' : 'linear-gradient(135deg, #fbc2eb, #a18cd1)'}; color: white; border-radius: 12px;">
-                <h4 style="margin: 0 0 0.5rem 0; font-size: 0.9rem; opacity: 0.9;">vs Last Month</h4>
-                <p style="margin: 0; font-size: 2rem; font-weight: 700; color: ${insights.monthlyChange > 0 ? '#ff4757' : '#39cc79'};"> ${insights.monthlyChange >= 0 ? '+' : ''}${insights.monthlyChange.toFixed(1)}% </p>
-                <p style="margin: 0.5rem 0 0 0; font-size: 0.85rem; opacity: 0.8;"> ₹${insights.lastMonthTotal.toFixed(2)} last month </p>
-            </div>
-
-            <div class="insight-card" style="padding: 1.5rem; background: linear-gradient(135deg, #4facfe, #00f2fe); color: white; border-radius: 12px;">
-                <h4 style="margin: 0 0 0.5rem 0; font-size: 0.9rem; opacity: 0.9;">Daily Average</h4>
-                <p style="margin: 0; font-size: 2rem; font-weight: 700;">₹${insights.dailyAverage.toFixed(2)}</p>
-                <p style="margin: 0.5rem 0 0 0; font-size: 0.85rem; opacity: 0.8;">Projected: ₹${insights.projectedMonthly.toFixed(2)}</p>
-            </div>
-
-            <div class="insight-card" style="padding: 1.5rem; background: linear-gradient(135deg,rgb(215, 189, 94), #fab1a0); color: #white; border-radius: 12px;">
-                <h4 style="margin: 0 0 0.5rem 0; font-size: 0.9rem; opacity: 0.8;">Avg Per Transaction</h4>
-                <p style="margin: 0; font-size: 2rem; font-weight: 700;">₹${(insights.thisMonthTotal / Math.max(insights.totalExpenses, 1)).toFixed(2)}</p>
-                <p style="margin: 0.5rem 0 0 0; font-size: 0.85rem; opacity: 0.8;">Range analysis</p>
-            </div>
-
-        </div>
-
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin-bottom: 2rem;">
-
-            <div>
-                <h4 style="margin-bottom: 1rem; color: #374151;">Top Categories This Month</h4>
-                <div style="space-y: 0.5rem;">
-                    ${insights.topCategories.map(([category, amount], index) => `
-                        <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: #f9fafb; border-radius: 8px; margin-bottom: 0.5rem;">
-                            <span style="font-weight: 500; color: #374151;">${index + 1}. ${category}</span>
-                            <span style="font-weight: 600; color: #667eea;">₹${amount.toFixed(2)}</span>
-                        </div>
-                    `).join('')}
+            <div class="expense-actions">
+                <div class="edit-toggle-container" id="edit-container-${attr(expense.id)}">
+                    <div class="billed-toggle ${expense.billed ? 'active' : ''}"
+                        onclick="toggleBillingStatus('${attr(expense.id)}')"></div>
                 </div>
+                <button class="icon-btn tone-indigo" type="button" id="edit-icon-${attr(expense.id)}"
+                    title="Edit expense" aria-label="Edit expense"
+                    onclick="toggleEditMode('${attr(expense.id)}')">
+                    <svg class="icon"><use href="#i-pencil" /></svg>
+                </button>
+                <button class="icon-btn tone-red" type="button" id="delete-btn-${attr(expense.id)}"
+                    title="Delete expense" aria-label="Delete expense"
+                    onclick="deleteFilteredExpense('${attr(expense.id)}')">
+                    <svg class="icon"><use href="#i-trash" /></svg>
+                </button>
             </div>
+        </div>`).join('');
 
-            <div>
-                <h4 style="margin-bottom: 1.25rem; color: #374151;">Expense Range</h4>
-                ${insights.highestExpense ? `
-                    <div style="padding: 1rem; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; margin-bottom: 1.5rem;">
-                        <div style="font-size: 0.9rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">Highest Expense</div>
-                        <div style="font-size: 1.5rem; font-weight: 600; color: #dc2626; margin-bottom: 0.5rem;">₹${parseFloat(insights.highestExpense.amount).toFixed(2)}</div>
-                        <div style="color: #6b7280; margin-bottom: 0.25rem;">${insights.highestExpense.note ? sanitizeHTML(insights.highestExpense.note) : 'No description'}</div>
-                        <div style="font-size: 0.875rem; color: #6b7280;">
-                            ${insights.highestExpense.type} • ${formatDate(insights.highestExpense.date)}
-                        </div>
-                    </div>
-                ` : ''}
-                ${insights.lowestExpense ? `
-                    <div style="padding: 1rem; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px;">
-                        <div style="font-size: 0.9rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">Lowest Expense</div>
-                        <div style="font-size: 1.5rem; font-weight: 600; color:rgb(8, 161, 3); margin-bottom: 0.5rem;">₹${parseFloat(insights.lowestExpense.amount).toFixed(2)}</div>
-                        <div style="color: #6b7280; margin-bottom: 0.25rem;">${insights.lowestExpense.note ? sanitizeHTML(insights.lowestExpense.note) : 'No description'}</div>
-                        <div style="font-size: 0.875rem; color: #6b7280;">
-                            ${insights.lowestExpense.type} • ${formatDate(insights.lowestExpense.date)}
-                        </div>
-                    </div>
-                ` : '<p style="color: #9ca3af;">No expenses this month</p>'}
+    mount.innerHTML = `
+        <div class="expense-list-container">
+            <div class="panel-title">Filtered expenses (${filteredExpenses.length})</div>
+            <div class="expense-list-scroll">${rows}</div>
+            <div class="list-total"><span class="expense-total">Total: ${esc(money(total))}</span></div>
+            <div style="display:flex;justify-content:flex-end;margin-top:1rem;">
+                <button class="save-changes-btn" type="button" onclick="saveAllChanges()">Save Changes</button>
             </div>
+        </div>`;
 
-        </div>
-    `;
+    updateSaveButton();
+}
 
-    // Create monthly trend chart - showing only total expenses
-    const monthlyCtx = document.getElementById('monthlyTrendChart').getContext('2d');
-    const sortedMonths = Object.keys(insights.monthlyData)
-        .filter(key => insights.monthlyData[key].total > 0)
-        .sort()
-        .slice(-12); // Last 12 months with spending
+function setIcon(button, symbolId) {
+    button.innerHTML = '<svg class="icon"><use href="#' + symbolId + '" /></svg>';
+}
 
-    // Store data globally for chart updates
-    window.insightsChartData = {
-        sortedMonths,
-        monthlyData: insights.monthlyData
+/**
+ * The dashboard list and the analytics list both carry data-id, so every
+ * edit-mode lookup must be scoped to the analytics list or it can grab
+ * the wrong row.
+ */
+function filteredRow(expenseId) {
+    const mount = $('filtered-list-mount');
+    if (!mount) return null;
+    const wanted = String(expenseId);
+    const rows = mount.querySelectorAll('[data-id]');
+    for (let i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute('data-id') === wanted) return rows[i];
+    }
+    return null;
+}
+
+async function createEditableElements(expenseId, expense) {
+    const item = filteredRow(expenseId);
+    if (!item) return;
+
+    const amountEl = item.querySelector('.expense-amount');
+    amountEl.innerHTML = `<input type="number" step="0.01" min="0" max="${MAX_AMOUNT}"
+        value="${attr(parseFloat(amountEl.dataset.original))}" inputmode="decimal"
+        oninput="trackExpenseChange('${attr(expenseId)}')">`;
+
+    const noteEl = item.querySelector('.expense-note');
+    noteEl.innerHTML = `<input type="text" value="${attr(noteEl.dataset.original)}"
+        placeholder="Add description…" maxlength="${MAX_NOTE_LENGTH}"
+        oninput="trackExpenseChange('${attr(expenseId)}')">`;
+
+    const typeEl = item.querySelector('.expense-type');
+    const originalType = typeEl.dataset.original;
+    const types = await loadTypesForEdit();
+    if (types.indexOf(originalType) === -1) types.unshift(originalType);
+    typeEl.innerHTML = `<select onchange="trackExpenseChange('${attr(expenseId)}')">
+        ${types.map(name =>
+        `<option value="${attr(name)}"${name === originalType ? ' selected' : ''}>${esc(name)}</option>`
+    ).join('')}</select>`;
+
+    const dateEl = item.querySelector('.expense-date');
+    dateEl.innerHTML = `<input type="date" value="${attr(dateEl.dataset.original)}"
+        onchange="trackExpenseChange('${attr(expenseId)}')">`;
+}
+
+function restoreStaticElements(expenseId) {
+    const item = filteredRow(expenseId);
+    if (!item) return;
+    const edits = expenseEdits[expenseId] || {};
+
+    const amountEl = item.querySelector('.expense-amount');
+    const amount = edits.amount !== undefined ? edits.amount : parseFloat(amountEl.dataset.original);
+    amountEl.textContent = money(amount);
+
+    const noteEl = item.querySelector('.expense-note');
+    const note = edits.note !== undefined ? edits.note : noteEl.dataset.original;
+    noteEl.textContent = note || 'No description';
+
+    const typeEl = item.querySelector('.expense-type');
+    const type = edits.type !== undefined ? edits.type : typeEl.dataset.original;
+    typeEl.textContent = type;
+    typeEl.setAttribute('style', typeStyleAttr(type));
+
+    const dateEl = item.querySelector('.expense-date');
+    const date = edits.date !== undefined ? edits.date : dateEl.dataset.original;
+    dateEl.textContent = formatDate(date);
+}
+
+function ensureEditRecord(expenseId) {
+    if (expenseEdits[expenseId]) return expenseEdits[expenseId];
+
+    const item = filteredRow(expenseId);
+    if (!item) return null;
+
+    const billedEl = item.querySelector('.billed-status');
+    expenseEdits[expenseId] = {
+        originalAmount: parseFloat(item.querySelector('.expense-amount').dataset.original),
+        originalNote: item.querySelector('.expense-note').dataset.original,
+        originalType: item.querySelector('.expense-type').dataset.original,
+        originalDate: item.querySelector('.expense-date').dataset.original,
+        originalBilled: billedEl.dataset.billed === 'true',
+        billed: billedEl.dataset.billed === 'true'
     };
-
-    const datasets = [
-        {
-            label: 'Total Expenses',
-            data: sortedMonths.map(m => insights.monthlyData[m].total),
-            borderColor: '#667eea',
-            backgroundColor: 'rgba(102, 126, 234, 0.1)',
-            fill: true,
-            tension: 0.4,
-            borderWidth: 3
-        },
-        {
-            label: 'Billed Expenses',
-            data: sortedMonths.map(m => insights.monthlyData[m].billed),
-            borderColor: '#10b981',
-            backgroundColor: 'rgba(16, 185, 129, 0.5)',
-            fill: false,
-            tension: 0.4,
-            borderWidth: 2
-        },
-        {
-            label: 'Unbilled Expenses',
-            data: sortedMonths.map(m => insights.monthlyData[m].unbilled),
-            borderColor: '#ef4444',
-            backgroundColor: 'rgba(239, 68, 68, 0.5)',
-            fill: false,
-            tension: 0.4,
-            borderWidth: 2
-        }
-    ];
-
-    window.insightsChart = new Chart(monthlyCtx, {
-        type: 'bar',
-        data: {
-            labels: sortedMonths.map(m => {
-                const [y, mo] = m.split('-');
-                return new Date(y, mo - 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
-            }),
-            datasets: datasets
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                title: {
-                    display: true,
-                    text: 'Monthly Spending Trend (Last 12 Months with Activity)',
-                    font: { size: 16 }
-                },
-                legend: {
-                    display: true,
-                    position: 'bottom'
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: v => '₹' + v.toFixed(0),
-                        stepSize: calculateStepSize(Math.max(...sortedMonths.map(m => insights.monthlyData[m].total))),
-                        maxTicksLimit: 11
-                    },
-                    max: calculateMaxValue(Math.max(...sortedMonths.map(m => insights.monthlyData[m].total)))
-                }
-            }
-        }
-    });
-
-    // Create velocity comparison chart
-    const velocityCtx = document.getElementById('velocityChart').getContext('2d');
-
-    // Get last 6 months data up to current day
-    const velocityData = [];
-    const velocityLabels = [];
-
-    // Get all expenses data for velocity calculation
-    const { data: allExpenses, error: velocityError } = await supabase
-        .from('expenses')
-        .select('amount, date')
-        .order('date', { ascending: false });
-
-    if (velocityError) {
-        console.error('Failed to load expenses for velocity:', velocityError);
-    }
-
-    for (let i = 5; i >= 0; i--) {
-        const checkDate = new Date(today.getFullYear(), today.getMonth() - i, 1);
-        const year = checkDate.getFullYear();
-        const month = checkDate.getMonth() + 1;
-
-        // Calculate spending up to current day of that month
-        const monthExpenses = (allExpenses || []).filter(e => {
-            const expDate = new Date(e.date);
-            return expDate.getFullYear() === year &&
-                   expDate.getMonth() + 1 === month &&
-                   expDate.getDate() <= currentDayOfMonth;
-        });
-
-        const total = monthExpenses.reduce((sum, e) => sum + parseFloat(e.amount), 0);
-        velocityData.push(total);
-        velocityLabels.push(checkDate.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }));
-    }
-
-    // Store velocity data globally for chart updates
-    window.velocityChartData = {
-        labels: velocityLabels,
-        data: velocityData,
-        currentDay: currentDayOfMonth
-    };
-
-    // Get initial chart type (default to bar)
-    const velocityChartType = 'bar';
-
-    window.velocityChart = new Chart(velocityCtx, {
-        type: velocityChartType,
-        data: {
-            labels: velocityLabels,
-            datasets: [{
-                label: `Spending up to Day ${currentDayOfMonth}`,
-                data: velocityData,
-                backgroundColor: velocityData.map((val, idx) => {
-                    if (idx === velocityData.length - 1) return 'rgba(239, 68, 68, 0.7)';
-                    return 'rgba(102, 126, 234, 0.7)';
-                }),
-                borderColor: velocityData.map((val, idx) => {
-                    if (idx === velocityData.length - 1) return '#ef4444';
-                    return '#667eea';
-                }),
-                borderWidth: 2,
-                tension: 0.4,
-                fill: velocityChartType === 'line'
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                title: {
-                    display: true,
-                    text: `Spending Velocity - First ${currentDayOfMonth} Days Comparison`,
-                    font: { size: 16 }
-                },
-                legend: {
-                    display: true,
-                    position: 'bottom'
-                },
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            const percentChange = context.dataIndex > 0 ?
-                                ((context.parsed.y - velocityData[context.dataIndex - 1]) / velocityData[context.dataIndex - 1] * 100) : 0;
-                            return [
-                                `Amount: ₹${context.parsed.y.toFixed(2)}`,
-                                context.dataIndex > 0 ? `Change: ${percentChange >= 0 ? '+' : ''}${percentChange.toFixed(1)}%` : ''
-                            ].filter(Boolean);
-                        }
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: v => '₹' + v.toFixed(0),
-                        stepSize: calculateStepSize(Math.max(...velocityData)),
-                        maxTicksLimit: 11
-                    },
-                    max: calculateMaxValue(Math.max(...velocityData))
-                }
-            }
-        }
-    });
+    return expenseEdits[expenseId];
 }
 
-// Function to update chart based on selected data view
-function updateInsightsChart() {
-    const selectedView = document.querySelector('input[name="insightsDataView"]:checked').value;
+function recomputeDirty(expenseId) {
+    const record = expenseEdits[expenseId];
+    if (!record) return;
+    const changed =
+        (record.amount !== undefined && record.amount !== record.originalAmount) ||
+        (record.note !== undefined && record.note !== record.originalNote) ||
+        (record.type !== undefined && record.type !== record.originalType) ||
+        (record.date !== undefined && record.date !== record.originalDate) ||
+        (record.billed !== undefined && record.billed !== record.originalBilled);
 
-    if (!window.insightsChart || !window.insightsChartData) return;
-
-    const { sortedMonths, monthlyData } = window.insightsChartData;
-
-    let datasets = [];
-
-    switch (selectedView) {
-        case 'consolidated':
-            datasets = [
-                {
-                    label: 'Total Expenses',
-                    data: sortedMonths.map(m => monthlyData[m].total),
-                    borderColor: '#667eea',
-                    backgroundColor: 'rgba(102, 126, 234, 0.1)',
-                    fill: true,
-                    tension: 0.4,
-                    borderWidth: 3
-                },
-                {
-                    label: 'Billed Expenses',
-                    data: sortedMonths.map(m => monthlyData[m].billed),
-                    borderColor: '#10b981',
-                    backgroundColor: 'rgba(16, 185, 129, 0.5)',
-                    fill: false,
-                    tension: 0.4,
-                    borderWidth: 2
-                },
-                {
-                    label: 'Unbilled Expenses',
-                    data: sortedMonths.map(m => monthlyData[m].unbilled),
-                    borderColor: '#ef4444',
-                    backgroundColor: 'rgba(239, 68, 68, 0.5)',
-                    fill: false,
-                    tension: 0.4,
-                    borderWidth: 2
-                }
-            ];
-            break;
-
-        case 'billed':
-            datasets = [{
-                label: 'Billed Expenses',
-                data: sortedMonths.map(m => monthlyData[m].billed),
-                borderColor: '#10b981',
-                backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                fill: true,
-                tension: 0.4,
-                borderWidth: 3
-            }];
-            break;
-
-        case 'unbilled':
-            datasets = [{
-                label: 'Unbilled Expenses',
-                data: sortedMonths.map(m => monthlyData[m].unbilled),
-                borderColor: '#ef4444',
-                backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                fill: true,
-                tension: 0.4,
-                borderWidth: 3
-            }];
-            break;
-
-        case 'total':
-            datasets = [{
-                label: 'Total Expenses',
-                data: sortedMonths.map(m => monthlyData[m].total),
-                borderColor: '#667eea',
-                backgroundColor: 'rgba(102, 126, 234, 0.1)',
-                fill: true,
-                tension: 0.4,
-                borderWidth: 3
-            }];
-            break;
-    }
-
-    const chartType = document.querySelector('input[name="velocityChartType"]:checked')?.value || 'line';
-
-    window.insightsChart.destroy();
-
-    const monthlyCtx = document.getElementById('monthlyTrendChart').getContext('2d');
-
-    window.insightsChart = new Chart(monthlyCtx, {
-        type: chartType,
-        data: {
-            labels: sortedMonths.map(m => {
-                const [y, mo] = m.split('-');
-                return new Date(y, mo - 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
-            }),
-            datasets: datasets
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                title: {
-                    display: true,
-                    text: 'Monthly Spending Trend (Last 12 Months with Activity)',
-                    font: { size: 16 }
-                },
-                legend: {
-                    display: true,
-                    position: 'bottom'
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: v => '₹' + v.toFixed(0),
-                        stepSize: calculateStepSize(Math.max(...datasets.flatMap(d => d.data))),
-                        maxTicksLimit: 11
-                    },
-                    max: calculateMaxValue(Math.max(...datasets.flatMap(d => d.data)))
-                }
-            }
-        }
-    });
+    if (changed) editedExpenses.add(String(expenseId));
+    else editedExpenses.delete(String(expenseId));
+    updateSaveButton();
 }
 
-// Function to update BOTH charts based on selected type
-function updateBothChartTypes() {
-    const selectedType = document.querySelector('input[name="velocityChartType"]:checked').value;
+function trackExpenseChange(expenseId) {
+    const item = filteredRow(expenseId);
+    if (!item) return;
+    const record = ensureEditRecord(expenseId);
+    if (!record) return;
 
-    // Update velocity chart
-    if (window.velocityChart && window.velocityChartData) {
-        const { labels, data, currentDay } = window.velocityChartData;
+    const amountInput = item.querySelector('.expense-amount input');
+    const noteInput = item.querySelector('.expense-note input');
+    const typeSelect = item.querySelector('.expense-type select');
+    const dateInput = item.querySelector('.expense-date input');
 
-        window.velocityChart.destroy();
+    if (amountInput) record.amount = parseFloat(amountInput.value) || 0;
+    if (noteInput) record.note = noteInput.value.trim();
+    if (typeSelect) record.type = typeSelect.value;
+    if (dateInput) record.date = dateInput.value;
 
-        const velocityCtx = document.getElementById('velocityChart').getContext('2d');
-
-        window.velocityChart = new Chart(velocityCtx, {
-            type: selectedType,
-            data: {
-                labels: labels,
-                datasets: [{
-                    label: `Spending up to Day ${currentDay}`,
-                    data: data,
-                    backgroundColor: data.map((val, idx) => {
-                        if (idx === data.length - 1) return 'rgba(239, 68, 68, 0.7)';
-                        return 'rgba(102, 126, 234, 0.7)';
-                    }),
-                    borderColor: data.map((val, idx) => {
-                        if (idx === data.length - 1) return '#ef4444';
-                        return '#667eea';
-                    }),
-                    borderWidth: 2,
-                    tension: 0.4,
-                    fill: selectedType === 'line'
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                    title: {
-                        display: true,
-                        text: `Spending Velocity - First ${currentDay} Days Comparison`,
-                        font: { size: 16 }
-                    },
-                    legend: {
-                        display: true,
-                        position: 'bottom'
-                    },
-                    tooltip: {
-                        callbacks: {
-                            label: function(context) {
-                                const percentChange = context.dataIndex > 0 ?
-                                    ((context.parsed.y - data[context.dataIndex - 1]) / data[context.dataIndex - 1] * 100) : 0;
-                                return [
-                                    `Amount: ₹${context.parsed.y.toFixed(2)}`,
-                                    context.dataIndex > 0 ? `Change: ${percentChange >= 0 ? '+' : ''}${percentChange.toFixed(1)}%` : ''
-                                ].filter(Boolean);
-                            }
-                        }
-                    }
-                },
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: {
-                            callback: v => '₹' + v.toFixed(0),
-                            stepSize: calculateStepSize(Math.max(...data)),
-                            maxTicksLimit: 11
-                        },
-                        max: calculateMaxValue(Math.max(...data))
-                    }
-                }
-            }
-        });
-    }
-
-    // Update monthly insights chart
-    if (window.insightsChart && window.insightsChartData) {
-        const { sortedMonths, monthlyData } = window.insightsChartData;
-        const selectedView = document.querySelector('input[name="insightsDataView"]:checked').value;
-
-        let datasets = [];
-
-        switch (selectedView) {
-            case 'consolidated':
-                datasets = [
-                    {
-                        label: 'Total Expenses',
-                        data: sortedMonths.map(m => monthlyData[m].total),
-                        borderColor: '#667eea',
-                        backgroundColor: 'rgba(102, 126, 234, 0.1)',
-                        fill: selectedType === 'line',
-                        tension: 0.4,
-                        borderWidth: 3
-                    },
-                    {
-                        label: 'Billed Expenses',
-                        data: sortedMonths.map(m => monthlyData[m].billed),
-                        borderColor: '#10b981',
-                        backgroundColor: 'rgba(16, 185, 129, 0.5)',
-                        fill: false,
-                        tension: 0.4,
-                        borderWidth: 2
-                    },
-                    {
-                        label: 'Unbilled Expenses',
-                        data: sortedMonths.map(m => monthlyData[m].unbilled),
-                        borderColor: '#ef4444',
-                        backgroundColor: 'rgba(239, 68, 68, 0.5)',
-                        fill: false,
-                        tension: 0.4,
-                        borderWidth: 2
-                    }
-                ];
-                break;
-
-            case 'billed':
-                datasets = [{
-                    label: 'Billed Expenses',
-                    data: sortedMonths.map(m => monthlyData[m].billed),
-                    borderColor: '#10b981',
-                    backgroundColor: 'rgba(16, 185, 129, 0.7)',
-                    fill: selectedType === 'line',
-                    tension: 0.4,
-                    borderWidth: 3
-                }];
-                break;
-
-            case 'unbilled':
-                datasets = [{
-                    label: 'Unbilled Expenses',
-                    data: sortedMonths.map(m => monthlyData[m].unbilled),
-                    borderColor: '#ef4444',
-                    backgroundColor: 'rgba(239, 68, 68, 0.7)',
-                    fill: selectedType === 'line',
-                    tension: 0.4,
-                    borderWidth: 3
-                }];
-                break;
-
-            case 'total':
-                datasets = [{
-                    label: 'Total Expenses',
-                    data: sortedMonths.map(m => monthlyData[m].total),
-                    borderColor: '#667eea',
-                    backgroundColor: 'rgba(102, 126, 234, 0.7)',
-                    fill: selectedType === 'line',
-                    tension: 0.4,
-                    borderWidth: 3
-                }];
-                break;
-        }
-
-        window.insightsChart.destroy();
-
-        const monthlyCtx = document.getElementById('monthlyTrendChart').getContext('2d');
-
-        window.insightsChart = new Chart(monthlyCtx, {
-            type: selectedType,
-            data: {
-                labels: sortedMonths.map(m => {
-                    const [y, mo] = m.split('-');
-                    return new Date(y, mo - 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
-                }),
-                datasets: datasets
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                    title: {
-                        display: true,
-                        text: 'Monthly Spending Trend (Last 12 Months with Activity)',
-                        font: { size: 16 }
-                    },
-                    legend: {
-                        display: true,
-                        position: 'bottom'
-                    }
-                },
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: { callback: v => '₹' + v.toFixed(0) }
-                    }
-                }
-            }
-        });
-    }
+    recomputeDirty(expenseId);
 }
 
-// Function to update velocity chart based on day slider
-async function updateVelocityByDay(selectedDay) {
-    // Update display
-    document.getElementById('velocity-day-display').textContent = selectedDay;
-
-    if (!window.velocityChart) return;
-
-    // Get all expenses data for velocity calculation
-    const { data: allExpenses, error: velocityError } = await supabase
-        .from('expenses')
-        .select('amount, date')
-        .order('date', { ascending: false });
-
-    if (velocityError) {
-        console.error('Failed to load expenses for velocity:', velocityError);
-        return;
-    }
-
-    const today = new Date();
-    const velocityData = [];
-    const velocityLabels = [];
-
-    // Calculate spending up to selected day for last 6 months
-    for (let i = 5; i >= 0; i--) {
-        const checkDate = new Date(today.getFullYear(), today.getMonth() - i, 1);
-        const year = checkDate.getFullYear();
-        const month = checkDate.getMonth() + 1;
-
-        const monthExpenses = (allExpenses || []).filter(e => {
-            const expDate = new Date(e.date);
-            return expDate.getFullYear() === year &&
-                   expDate.getMonth() + 1 === month &&
-                   expDate.getDate() <= parseInt(selectedDay);
-        });
-
-        const total = monthExpenses.reduce((sum, e) => sum + parseFloat(e.amount), 0);
-        velocityData.push(total);
-        velocityLabels.push(checkDate.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }));
-    }
-
-    // Update stored data
-    window.velocityChartData = {
-        labels: velocityLabels,
-        data: velocityData,
-        currentDay: parseInt(selectedDay)
-    };
-
-    // Get current chart type
-    const velocityChartType = document.querySelector('input[name="velocityChartType"]:checked')?.value || 'bar';
-
-    // Destroy and recreate chart
-    window.velocityChart.destroy();
-
-    const velocityCtx = document.getElementById('velocityChart').getContext('2d');
-
-    window.velocityChart = new Chart(velocityCtx, {
-        type: velocityChartType,
-        data: {
-            labels: velocityLabels,
-            datasets: [{
-                label: `Spending up to Day ${selectedDay}`,
-                data: velocityData,
-                backgroundColor: velocityData.map((val, idx) => {
-                    if (idx === velocityData.length - 1) return 'rgba(239, 68, 68, 0.7)';
-                    return 'rgba(102, 126, 234, 0.7)';
-                }),
-                borderColor: velocityData.map((val, idx) => {
-                    if (idx === velocityData.length - 1) return '#ef4444';
-                    return '#667eea';
-                }),
-                borderWidth: 2,
-                tension: 0.4,
-                fill: velocityChartType === 'line'
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                title: {
-                    display: true,
-                    text: `Spending Velocity - First ${selectedDay} Days Comparison`,
-                    font: { size: 16 }
-                },
-                legend: {
-                    display: true,
-                    position: 'bottom'
-                },
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            const percentChange = context.dataIndex > 0 ?
-                                ((context.parsed.y - velocityData[context.dataIndex - 1]) / velocityData[context.dataIndex - 1] * 100) : 0;
-                            return [
-                                `Amount: ₹${context.parsed.y.toFixed(2)}`,
-                                context.dataIndex > 0 ? `Change: ${percentChange >= 0 ? '+' : ''}${percentChange.toFixed(1)}%` : ''
-                            ].filter(Boolean);
-                        }
-                    }
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        callback: v => '₹' + v.toFixed(0),
-                        stepSize: calculateStepSize(Math.max(...velocityData)),
-                        maxTicksLimit: 11
-                    },
-                    max: calculateMaxValue(Math.max(...velocityData))
-                }
-            }
-        }
-    });
+function toggleBillingStatus(expenseId) {
+    const container = $('edit-container-' + expenseId);
+    const toggle = container ? container.querySelector('.billed-toggle') : null;
+    if (!toggle) return;
+    const record = ensureEditRecord(expenseId);
+    if (!record) return;
+    toggle.classList.toggle('active');
+    record.billed = toggle.classList.contains('active');
+    recomputeDirty(expenseId);
 }
 
-document.getElementById('delete-type-form').addEventListener('submit', async function (e) {
-    e.preventDefault();
-    const typeName = document.getElementById('delete-type-select').value;
-
-    if (!typeName) {
-        showAlert('delete-type-alert', 'Please select a type to delete.', 'error');
-        return;
-    }
-
-    try {
-        // Check if type is being used
-        const { data: usedTypes, error: checkError } = await supabase
-            .from('expenses')
-            .select('type')
-            .eq('type', typeName)
-            .limit(1);
-
-        if (checkError) throw checkError;
-
-        if (usedTypes && usedTypes.length > 0) {
-            showAlert('delete-type-alert', 'Cannot delete type that is being used in expenses.', 'error');
-            return;
-        }
-
-        if (!confirm(`Are you sure you want to delete the type "${typeName}"?`)) {
-            return;
-        }
-
-        const { error } = await supabase
-            .from('expense_types')
-            .delete()
-            .eq('name', typeName)
-            .eq('user_id', currentUser.id);
-
-        if (error) throw error;
-
-        loadUserTypes();
-        showAlert('delete-type-alert', 'Type deleted successfully!', 'success');
-        setTimeout(() => closeDeleteTypeModal(), 1500);
-    } catch (error) {
-        showAlert('delete-type-alert', error.message || 'Failed to delete type.', 'error');
-    }
-});
-
-function showEditTypeModal() {
-    document.getElementById('edit-type-modal').style.display = 'block';
-    loadTypesForEdit().then(types => {
-        const editSelect = document.getElementById('edit-type-select');
-        editSelect.innerHTML = '<option value="">Select Type</option>';
-        types.forEach(type => {
-            const option = document.createElement('option');
-            option.value = type;
-            option.textContent = type;
-            editSelect.appendChild(option);
-        });
-
-        // Pre-select current type if one is selected
-        const currentType = document.getElementById('type').value;
-        if (currentType) {
-            editSelect.value = currentType;
-            document.getElementById('edit-type-name').value = currentType;
-        }
-    });
-    hideLandingIcons();
-}
-
-function closeEditTypeModal() {
-    document.getElementById('edit-type-modal').style.display = 'none';
-    document.getElementById('edit-type-form').reset();
-    document.getElementById('edit-type-alert').innerHTML = '';
-    showLandingIcons();
-}
-
-function populateEditField() {
-    const selectedType = document.getElementById('edit-type-select').value;
-    document.getElementById('edit-type-name').value = selectedType;
-}
-
-// Add event listener in DOMContentLoaded:
-document.getElementById('edit-type-form').addEventListener('submit', handleEditType);
-
-async function handleEditType(e) {
-    e.preventDefault();
-    const oldTypeName = document.getElementById('edit-type-select').value;
-    const newTypeName = document.getElementById('edit-type-name').value.trim();
-
-    if (!oldTypeName) {
-        showAlert('edit-type-alert', 'Please select a type to edit.', 'error');
-        return;
-    }
-
-    if (!newTypeName) {
-        showAlert('edit-type-alert', 'Please enter a new type name.', 'error');
-        return;
-    }
-
-    if (oldTypeName === newTypeName) {
-        showAlert('edit-type-alert', 'No changes found. Please modify the type name.', 'error');
-        return;
-    }
-
-    try {
-        // Check if new type name already exists
-        const { data: existing } = await supabase
-            .from('expense_types')
-            .select('name')
-            .ilike('name', newTypeName)
-            .neq('name', oldTypeName);
-
-        if (existing && existing.length > 0) {
-            showAlert('edit-type-alert', 'A type with this name already exists.', 'error');
-            return;
-        }
-
-        // Update type in expense_types table
-        const { error: typeError } = await supabase
-            .from('expense_types')
-            .update({ name: newTypeName })
-            .eq('name', oldTypeName)
-            .eq('user_id', currentUser.id);
-
-        if (typeError) throw typeError;
-
-        // Update all expenses that use this type
-        const { error: expenseError } = await supabase
-            .from('expenses')
-            .update({ type: newTypeName })
-            .eq('type', oldTypeName)
-            .eq('user_id', currentUser.id);
-
-        if (expenseError) throw expenseError;
-
-        // Refresh UI
-        loadUserTypes();
-        document.getElementById('type').value = newTypeName;
-
-        // Refresh visualization if open
-        if (document.getElementById('visualization-modal').style.display === 'block') {
-            loadTypesForFilter();
-            applyDateFilter();
-        }
-
-        showAlert('edit-type-alert', 'Type updated successfully!', 'success');
-        setTimeout(() => closeEditTypeModal(), 1500);
-    } catch (error) {
-        showAlert('edit-type-alert', error.message || 'Failed to update type.', 'error');
-    }
-}
-
-// Edit expense functions
 function toggleEditMode(expenseId) {
-    const container = document.getElementById(`edit-container-${expenseId}`);
-    const icon = document.getElementById(`edit-icon-${expenseId}`);
-    const deleteBtn = document.getElementById(`delete-btn-${expenseId}`);
-    const expenseItem = document.querySelector(`[data-id="${expenseId}"]`);
-    const isVisible = container.style.display === 'flex';
+    const container = $('edit-container-' + expenseId);
+    const editBtn = $('edit-icon-' + expenseId);
+    const deleteBtn = $('delete-btn-' + expenseId);
+    const item = filteredRow(expenseId);
+    if (!container || !editBtn || !deleteBtn || !item) return;
 
-    if (isVisible) {
-        // Save mode - restore static elements and update display
-        expenseItem.classList.remove('edit-mode');
+    const isEditing = item.classList.contains('edit-mode');
+
+    if (isEditing) {
+        item.classList.remove('edit-mode');
         restoreStaticElements(expenseId);
 
-        // Update billed status display
-        const billedStatusSpan = container.closest('.expense-item').querySelector('.billed-status');
-        const currentEdit = expenseEdits[expenseId];
-
-        if (currentEdit && currentEdit.billed !== undefined) {
-            billedStatusSpan.innerHTML = currentEdit.billed ?
-                '<span class="billed-badge">BILLED</span>' :
-                '<span style="color: #ef4444; font-size: 0.7rem; font-weight: 600;">UNBILLED</span>';
-            billedStatusSpan.dataset.billed = currentEdit.billed;
+        const record = expenseEdits[expenseId];
+        const billedEl = item.querySelector('.billed-status');
+        if (record && record.billed !== undefined && billedEl) {
+            billedEl.innerHTML = billingBadge(record.billed);
+            billedEl.dataset.billed = String(record.billed);
         }
 
-        // Hide toggle
         container.style.display = 'none';
+        deleteBtn.style.display = '';
 
-        // Check if there are any changes to determine button display
-        const hasChanges = editedExpenses.has(expenseId);
-
-        if (hasChanges) {
-            // Show cancel (X) button
-            deleteBtn.innerHTML = `<path d="M18 6L6 18M6 6l12 12" stroke="white" stroke-width="2" fill="none"></path>`;
-            deleteBtn.style.background = '#ef4444';
+        if (editedExpenses.has(String(expenseId))) {
+            setIcon(deleteBtn, 'i-close');
+            deleteBtn.title = 'Discard changes';
             deleteBtn.onclick = () => cancelEdit(expenseId);
-            deleteBtn.title = 'Cancel changes';
         } else {
-            // Show delete button
-            deleteBtn.innerHTML = `
-                        <polyline points="3,6 5,6 21,6"></polyline>
-                        <path d="m19,6v14a2,2 0 0,1 -2,2H7a2,2 0 0,1 -2,-2V6m3,0V4a2,2 0 0,1 2,2h4a2,2 0 0,1 2,2v2"></path>
-                        <line x1="10" y1="11" x2="10" y2="17"></line>
-                        <line x1="14" y1="11" x2="14" y2="17"></line>
-                    `;
-            deleteBtn.style.background = '#ef4444';
-            deleteBtn.onclick = () => deleteFilteredExpense(expenseId);
+            setIcon(deleteBtn, 'i-trash');
             deleteBtn.title = 'Delete expense';
+            deleteBtn.onclick = () => deleteFilteredExpense(expenseId);
         }
 
-        deleteBtn.style.display = 'block';
-
-        // Switch back to pencil icon
-        icon.innerHTML = `
-                    <path d="m18 2 4 4-14 14H4v-4L18 2z"></path>
-                    <path d="M14.5 5.5 18.5 9.5"></path>
-                `;
-        icon.style.background = '#667eea';
-        icon.onclick = () => toggleEditMode(expenseId);
+        setIcon(editBtn, 'i-pencil');
+        editBtn.classList.remove('tone-green');
+        editBtn.classList.add('tone-indigo');
     } else {
-        // Edit mode - show editable elements
-        expenseItem.classList.add('edit-mode');
-
-        // Get original data for this expense
-        const expense = filteredExpenses.find(e => e.id == expenseId);
+        item.classList.add('edit-mode');
+        const expense = filteredExpenses.find(e => String(e.id) === String(expenseId));
+        ensureEditRecord(expenseId);
         createEditableElements(expenseId, expense);
 
-        // Show toggle and hide delete button
-        container.style.display = 'flex';
-        deleteBtn.style.display = 'none';
+        container.style.display = trackingBilling() ? 'flex' : 'none';
 
-        // Switch to check/save icon
-        icon.innerHTML = `<polyline points="20,6 9,17 4,12"></polyline>`;
-        icon.style.background = '#10b981';
-        icon.onclick = () => toggleEditMode(expenseId);
+        setIcon(editBtn, 'i-check');
+        editBtn.classList.remove('tone-indigo');
+        editBtn.classList.add('tone-green');
 
-        // Change delete button to cancel (X) button
-        const cancelBtn = document.getElementById(`delete-btn-${expenseId}`);
-        cancelBtn.innerHTML = `<path d="M18 6L6 18M6 6l12 12" stroke="white" stroke-width="2" fill="none"></path>`;
-        cancelBtn.style.background = '#ef4444'; // Changed from '#6b7280' to red
-        cancelBtn.onclick = () => cancelEdit(expenseId);
-        cancelBtn.title = 'Cancel changes';
-        cancelBtn.style.display = 'block';
-
-        // Initialize tracking if not already done
-        if (!expenseEdits[expenseId]) {
-            expenseEdits[expenseId] = {
-                originalAmount: parseFloat(expense.amount),
-                originalNote: expense.note || '',
-                originalType: expense.type,
-                originalDate: expense.date,
-                originalBilled: expense.billed,
-                billed: expense.billed
-            };
-        }
+        setIcon(deleteBtn, 'i-close');
+        deleteBtn.title = 'Discard changes';
+        deleteBtn.onclick = () => cancelEdit(expenseId);
+        deleteBtn.style.display = '';
     }
 
     updateSaveButton();
 }
 
 function cancelEdit(expenseId) {
-    const container = document.getElementById(`edit-container-${expenseId}`);
-    const icon = document.getElementById(`edit-icon-${expenseId}`);
-    const deleteBtn = document.getElementById(`delete-btn-${expenseId}`);
-    const expenseItem = document.querySelector(`[data-id="${expenseId}"]`);
+    const container = $('edit-container-' + expenseId);
+    const editBtn = $('edit-icon-' + expenseId);
+    const deleteBtn = $('delete-btn-' + expenseId);
+    const item = filteredRow(expenseId);
+    const expense = filteredExpenses.find(e => String(e.id) === String(expenseId));
+    if (!item || !expense) return;
 
-    // Remove from edited set and clear edits
-    editedExpenses.delete(expenseId);
+    editedExpenses.delete(String(expenseId));
     delete expenseEdits[expenseId];
+    item.classList.remove('edit-mode');
 
-    // Exit edit mode
-    expenseItem.classList.remove('edit-mode');
-
-    // Restore original static elements from DB data
-    const expense = filteredExpenses.find(e => e.id == expenseId);
-    const amountEl = expenseItem.querySelector('.expense-amount');
-    const noteEl = expenseItem.querySelector('.expense-note');
-    const typeEl = expenseItem.querySelector('.expense-type');
-    const dateEl = expenseItem.querySelector('.expense-date');
-    const billedStatusEl = expenseItem.querySelector('.billed-status');
-
-    // Reset to original DB values
-    amountEl.innerHTML = `₹${parseFloat(expense.amount).toFixed(2)}`;
+    const amountEl = item.querySelector('.expense-amount');
+    amountEl.textContent = money(expense.amount);
     amountEl.dataset.original = expense.amount;
 
-    noteEl.innerHTML = expense.note || 'No description';
+    const noteEl = item.querySelector('.expense-note');
+    noteEl.textContent = expense.note || 'No description';
     noteEl.dataset.original = expense.note || '';
 
-    typeEl.innerHTML = expense.type;
+    const typeEl = item.querySelector('.expense-type');
+    typeEl.textContent = expense.type;
     typeEl.dataset.original = expense.type;
+    typeEl.setAttribute('style', typeStyleAttr(expense.type));
 
-    dateEl.innerHTML = formatDate(expense.date);
+    const dateEl = item.querySelector('.expense-date');
+    dateEl.textContent = formatDate(expense.date);
     dateEl.dataset.original = expense.date;
 
-    // Reset billing status
-    billedStatusEl.innerHTML = expense.billed ?
-        '<span class="billed-badge">BILLED</span>' :
-        '<span style="color: #ef4444; font-size: 0.7rem; font-weight: 600;">UNBILLED</span>';
-    billedStatusEl.dataset.billed = expense.billed;
+    const billedEl = item.querySelector('.billed-status');
+    billedEl.innerHTML = billingBadge(expense.billed);
+    billedEl.dataset.billed = String(expense.billed);
 
-    // Reset toggle to original state
-    const toggle = container.querySelector('.billed-toggle');
-    if (expense.billed) {
-        toggle.classList.add('active');
-    } else {
-        toggle.classList.remove('active');
-    }
+    const toggle = container ? container.querySelector('.billed-toggle') : null;
+    if (toggle) toggle.classList.toggle('active', !!expense.billed);
+    if (container) container.style.display = 'none';
 
-    // Hide toggle and restore delete button
-    container.style.display = 'none';
-    deleteBtn.style.display = 'block';
-
-    // Restore original delete button
-    deleteBtn.innerHTML = `
-                <polyline points="3,6 5,6 21,6"></polyline>
-                <path d="m19,6v14a2,2 0 0,1 -2,2H7a2,2 0 0,1 -2,-2V6m3,0V4a2,2 0 0,1 2,2h4a2,2 0 0,1 2,2v2"></path>
-                <line x1="10" y1="11" x2="10" y2="17"></line>
-                <line x1="14" y1="11" x2="14" y2="17"></line>
-            `;
-    deleteBtn.style.background = '#ef4444';
-    deleteBtn.onclick = () => deleteFilteredExpense(expenseId);
+    setIcon(deleteBtn, 'i-trash');
     deleteBtn.title = 'Delete expense';
+    deleteBtn.onclick = () => deleteFilteredExpense(expenseId);
+    deleteBtn.style.display = '';
 
-    // Switch back to pencil icon
-    icon.innerHTML = `
-                <path d="m18 2 4 4-14 14H4v-4L18 2z"></path>
-                <path d="M14.5 5.5 18.5 9.5"></path>
-            `;
-    icon.style.background = '#667eea';
-    icon.onclick = () => toggleEditMode(expenseId);
-
-    updateSaveButton();
-}
-
-function toggleBillingStatus(expenseId) {
-    const toggle = document.querySelector(`#edit-container-${expenseId} .billed-toggle`);
-    const originalBilledStatus = document.querySelector(`[data-id="${expenseId}"] .billed-status`).dataset.billed === 'true';
-    const isActive = toggle.classList.contains('active');
-    const newStatus = !isActive;
-
-    toggle.classList.toggle('active');
-
-    // Track the change
-    if (!expenseEdits[expenseId]) {
-        const expenseItem = document.querySelector(`[data-id="${expenseId}"]`);
-        expenseEdits[expenseId] = {
-            originalAmount: parseFloat(expenseItem.querySelector('.expense-amount').dataset.original),
-            originalNote: expenseItem.querySelector('.expense-note').dataset.original,
-            originalType: expenseItem.querySelector('.expense-type').dataset.original,
-            originalDate: expenseItem.querySelector('.expense-date').dataset.original,
-            originalBilled: originalBilledStatus
-        };
-    }
-    expenseEdits[expenseId].billed = newStatus;
-
-    // Check if anything has changed from original
-    const hasChanges = newStatus !== expenseEdits[expenseId].originalBilled ||
-        (expenseEdits[expenseId].amount !== undefined && expenseEdits[expenseId].amount !== expenseEdits[expenseId].originalAmount) ||
-        (expenseEdits[expenseId].note !== undefined && expenseEdits[expenseId].note !== expenseEdits[expenseId].originalNote) ||
-        (expenseEdits[expenseId].type !== undefined && expenseEdits[expenseId].type !== expenseEdits[expenseId].originalType) ||
-        (expenseEdits[expenseId].date !== undefined && expenseEdits[expenseId].date !== expenseEdits[expenseId].originalDate);
-
-    if (hasChanges) {
-        editedExpenses.add(expenseId);
-    } else {
-        editedExpenses.delete(expenseId);
-    }
+    setIcon(editBtn, 'i-pencil');
+    editBtn.classList.remove('tone-green');
+    editBtn.classList.add('tone-indigo');
 
     updateSaveButton();
 }
 
 function updateSaveButton() {
-    const saveBtn = document.querySelector('.expense-list-container .save-changes-btn');
-    if (saveBtn) {
-        const hasActualChanges = editedExpenses.size > 0;
-        saveBtn.style.display = hasActualChanges ? 'block' : 'none';
-    }
+    const button = document.querySelector('.expense-list-container .save-changes-btn');
+    if (button) button.style.display = editedExpenses.size > 0 ? 'block' : 'none';
 }
 
 async function saveAllChanges() {
+    const button = document.querySelector('.expense-list-container .save-changes-btn');
+    if (button) button.disabled = true;
+
     try {
-        for (const [expenseId, changes] of Object.entries(expenseEdits)) {
-            const updateData = {};
+        for (const expenseId of Array.from(editedExpenses)) {
+            const changes = expenseEdits[expenseId];
+            if (!changes) continue;
 
-            if (changes.amount !== changes.originalAmount) updateData.amount = changes.amount;
-            if (changes.note !== changes.originalNote) updateData.note = changes.note;
-            if (changes.type !== changes.originalType) updateData.type = changes.type;
-            if (changes.date !== changes.originalDate) updateData.date = changes.date;
-            if (changes.billed !== changes.originalBilled) updateData.billed = changes.billed;
-
-            if (Object.keys(updateData).length > 0) {
-                const { error } = await supabase
-                    .from('expenses')
-                    .update(updateData)
-                    .eq('id', expenseId)
-                    .eq('user_id', currentUser.id);
-
-                if (error) throw error;
+            const update = {};
+            if (changes.amount !== undefined && changes.amount !== changes.originalAmount) {
+                if (!changes.amount || changes.amount <= 0 || changes.amount > MAX_AMOUNT) {
+                    throw new Error('Amount must be between ₹1 and ₹10,00,000');
+                }
+                update.amount = changes.amount;
             }
+            if (changes.note !== undefined && changes.note !== changes.originalNote) {
+                update.note = changes.note;
+            }
+            if (changes.type !== undefined && changes.type !== changes.originalType) {
+                update.type = changes.type;
+            }
+            if (changes.date !== undefined && changes.date !== changes.originalDate) {
+                if (!splitISO(changes.date)) throw new Error('Please pick a valid date');
+                update.date = changes.date;
+            }
+            if (changes.billed !== undefined && changes.billed !== changes.originalBilled) {
+                update.billed = changes.billed;
+            }
+            if (Object.keys(update).length === 0) continue;
+
+            const { error } = await supabase.from('expenses')
+                .update(update).eq('id', expenseId).eq('user_id', currentUser.id);
+            if (error) throw error;
         }
 
-        // Clear edit state
         editedExpenses.clear();
         expenseEdits = {};
-        updateSaveButton();
 
-        // Refresh displays
-        applyDateFilter();
-        await loadExpenses();
-        await updateStatistics();
-        await updateBudgetDisplay();
+        await applyDateFilter();
+        await Promise.all([loadExpenses(), updateStatistics(), updateBudgetDisplay()]);
         await checkBudgetWarnings();
-
-        showNotification('Changes saved successfully!', 'success');
+        showNotification('Changes saved', 'success');
     } catch (error) {
         showNotification('Failed to save changes: ' + error.message, 'error');
+    } finally {
+        if (button) button.disabled = false;
+        updateSaveButton();
     }
 }
 
-async function loadUserBudget() {
-    try {
-        const istNow = getISTDate();
-        const currentMonth = istNow.getMonth() + 1;
-        const currentYear = istNow.getFullYear();
+/* =====================================================================
+   Export
+   ===================================================================== */
 
+/** Escape a single CSV field per RFC 4180. */
+function csvCell(value) {
+    const text = value === null || value === undefined ? '' : String(value);
+    return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+
+async function fetchExportRows() {
+    const startDate = $('start-date').value;
+    const endDate = $('end-date').value;
+    const billingFilter = trackingBilling() ? $('billing-filter').value : 'both';
+    const typeFilter = $('type-filter').value;
+
+    let query = supabase.from('expenses').select('*');
+    if (startDate) query = query.gte('date', startDate);
+    if (endDate) query = query.lte('date', endDate);
+    if (billingFilter === 'billed') query = query.eq('billed', true);
+    if (billingFilter === 'unbilled') query = query.eq('billed', false);
+    if (typeFilter !== 'all') query = query.eq('type', typeFilter);
+
+    const { data, error } = await query.order('date', { ascending: false });
+    if (error) throw error;
+
+    return { rows: data || [], startDate, endDate, billingFilter, typeFilter };
+}
+
+function exportFilename(startDate, endDate, typeFilter, billingFilter, extension) {
+    let name = 'expenses';
+    if (startDate && endDate) {
+        name += startDate === endDate ? '_' + startDate : '_' + startDate + '_to_' + endDate;
+    } else if (startDate) {
+        name += '_from_' + startDate;
+    } else if (endDate) {
+        name += '_until_' + endDate;
+    }
+    if (typeFilter !== 'all') name += '_' + typeFilter.replace(/[^\w-]+/g, '-');
+    if (trackingBilling()) name += '_' + billingFilter;
+    return name + '.' + extension;
+}
+
+/** Body rows + totals + (for single-month exports) the budget summary. */
+async function buildExportMatrix(rows, startDate, endDate) {
+    const tracking = trackingBilling();
+    const headers = tracking
+        ? ['Date', 'Type', 'Note', 'Amount', 'Billed']
+        : ['Date', 'Type', 'Note', 'Amount'];
+
+    const body = rows.map(expense => {
+        const base = [expense.date, expense.type, expense.note || '', Number(expense.amount)];
+        return tracking ? base.concat(expense.billed ? 'Yes' : 'No') : base;
+    });
+
+    // Summary rows always put their caption in the Note column and their
+    // figure in the Amount column — fixed positions 2 and 3, since the
+    // optional "Billed" column is appended after them.
+    const NOTE_COL = 2, AMOUNT_COL = 3;
+    const width = headers.length;
+    const blank = () => new Array(width).fill('');
+    const labelRow = (label, value) => {
+        const row = blank();
+        row[NOTE_COL] = label;
+        row[AMOUNT_COL] = value;
+        return row;
+    };
+
+    const total = rows.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+    body.push(blank());
+    body.push(labelRow('TOTAL', Number(total.toFixed(2))));
+
+    const start = splitISO(startDate);
+    const end = splitISO(endDate);
+    const singleMonth = start && end && start.year === end.year && start.month === end.month;
+
+    if (singleMonth) {
+        try {
+            const { data: budget } = await supabase
+                .from('user_budgets')
+                .select('monthly_billed_budget, monthly_unbilled_budget')
+                .eq('user_id', currentUser.id)
+                .eq('budget_month', start.month)
+                .eq('budget_year', start.year)
+                .maybeSingle();
+
+            const billedBudget = budget ? parseFloat(budget.monthly_billed_budget) || 0 : 0;
+            const unbilledBudget = budget ? parseFloat(budget.monthly_unbilled_budget) || 0 : 0;
+
+            if (billedBudget > 0 || unbilledBudget > 0) {
+                const billedSpent = rows.filter(e => e.billed)
+                    .reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+                const unbilledSpent = rows.filter(e => !e.billed)
+                    .reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+
+                body.push(blank());
+                if (tracking) {
+                    if (billedBudget > 0) {
+                        body.push(labelRow('BILLED BUDGET', billedBudget));
+                        body.push(labelRow('BILLED SPENT', Number(billedSpent.toFixed(2))));
+                        body.push(labelRow('BILLED REMAINING', Number((billedBudget - billedSpent).toFixed(2))));
+                        body.push(blank());
+                    }
+                    if (unbilledBudget > 0) {
+                        body.push(labelRow('UNBILLED BUDGET', unbilledBudget));
+                        body.push(labelRow('UNBILLED SPENT', Number(unbilledSpent.toFixed(2))));
+                        body.push(labelRow('UNBILLED REMAINING', Number((unbilledBudget - unbilledSpent).toFixed(2))));
+                        body.push(blank());
+                    }
+                }
+                const totalBudget = billedBudget + unbilledBudget;
+                body.push(labelRow('TOTAL BUDGET', totalBudget));
+                body.push(labelRow('TOTAL SPENT', Number(total.toFixed(2))));
+                body.push(labelRow('TOTAL REMAINING', Number((totalBudget - total).toFixed(2))));
+            }
+        } catch (error) {
+            console.error('Failed to fetch budget for export month:', error);
+        }
+    }
+
+    return [headers].concat(body);
+}
+
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function exportToCSV() {
+    try {
+        const { rows, startDate, endDate, billingFilter, typeFilter } = await fetchExportRows();
+        if (!rows.length) {
+            showNotification('No expenses to export for the selected filters.', 'warning');
+            return;
+        }
+        const matrix = await buildExportMatrix(rows, startDate, endDate);
+        // BOM keeps ₹ and other non-ASCII characters intact when Excel opens the file.
+        const csv = '﻿' + matrix.map(row => row.map(csvCell).join(',')).join('\r\n');
+        downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8;' }),
+            exportFilename(startDate, endDate, typeFilter, billingFilter, 'csv'));
+        showNotification(rows.length + ' expenses exported', 'success');
+    } catch (error) {
+        console.error('Export failed:', error);
+        showNotification('Failed to export: ' + error.message, 'error');
+    }
+}
+
+async function exportToXLSX() {
+    if (typeof XLSX === 'undefined') {
+        showNotification('The spreadsheet library did not load. Try the CSV export.', 'error');
+        return;
+    }
+    try {
+        const { rows, startDate, endDate, billingFilter, typeFilter } = await fetchExportRows();
+        if (!rows.length) {
+            showNotification('No expenses to export for the selected filters.', 'warning');
+            return;
+        }
+        const matrix = await buildExportMatrix(rows, startDate, endDate);
+        const sheet = XLSX.utils.aoa_to_sheet(matrix);
+        sheet['!cols'] = [{ wch: 12 }, { wch: 18 }, { wch: 40 }, { wch: 14 }, { wch: 10 }]
+            .slice(0, matrix[0].length);
+        const book = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(book, sheet, 'Expenses');
+        XLSX.writeFile(book, exportFilename(startDate, endDate, typeFilter, billingFilter, 'xlsx'));
+        showNotification(rows.length + ' expenses exported', 'success');
+    } catch (error) {
+        console.error('Excel export failed:', error);
+        showNotification('Failed to export: ' + error.message, 'error');
+    }
+}
+
+/**
+ * Complete, restorable snapshot of everything this account owns — not the
+ * filtered view the CSV export gives you.
+ */
+async function downloadFullBackup() {
+    const button = $('backup-btn');
+    if (button) { button.disabled = true; button.textContent = 'Preparing…'; }
+
+    try {
+        const fetchAll = async (table, order) => {
+            const query = supabase.from(table).select('*').eq('user_id', currentUser.id);
+            const { data, error } = order ? await query.order(order) : await query;
+            if (error) throw error;
+            return data || [];
+        };
+
+        const [expenses, types, budgets] = await Promise.all([
+            fetchAll('expenses', 'date'),
+            fetchAll('expense_types', 'name'),
+            fetchAll('user_budgets')
+        ]);
+
+        let recurring = [];
+        try {
+            recurring = await fetchAll('recurring_expenses');
+        } catch (error) {
+            /* Optional table — omitted from the backup when absent. */
+        }
+
+        const backup = {
+            format: 'my-expense-tracker-backup',
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            exportedFor: currentUser.email,
+            timezone: APP_TIMEZONE,
+            counts: {
+                expenses: expenses.length, expense_types: types.length,
+                user_budgets: budgets.length, recurring_expenses: recurring.length
+            },
+            settings,
+            data: {
+                expenses, expense_types: types,
+                user_budgets: budgets, recurring_expenses: recurring
+            }
+        };
+
+        downloadBlob(
+            new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }),
+            'expense-tracker-backup-' + todayISO() + '.json');
+        showNotification(expenses.length + ' expenses backed up', 'success');
+    } catch (error) {
+        console.error('Backup failed:', error);
+        showNotification('Backup failed: ' + error.message, 'error');
+    } finally {
+        if (button) { button.disabled = false; button.textContent = 'Download backup'; }
+    }
+}
+
+/* =====================================================================
+   Search
+   ===================================================================== */
+
+function showSearchModal() {
+    openModal('search-modal');
+    $('search-results').innerHTML = '<div class="skeleton-row"></div>'.repeat(3);
+    loadAllExpensesForSearch();
+    setTimeout(() => $('search-input').focus(), 60);
+}
+
+function closeSearchModal() {
+    closeModal('search-modal');
+    $('search-input').value = '';
+    $('search-results').innerHTML = '';
+}
+
+async function loadAllExpensesForSearch() {
+    try {
         const { data, error } = await supabase
-            .from('user_budgets')
-            .select('monthly_billed_budget, monthly_unbilled_budget')
-            .eq('user_id', currentUser.id)
-            .eq('budget_month', currentMonth)
-            .eq('budget_year', currentYear);
-
-        if (error) {
-            console.error('Budget query error:', error);
-            monthlyBilledBudget = 0;
-            monthlyUnbilledBudget = 0;
-        } else if (data && data.length > 0) {
-            monthlyBilledBudget = data[0].monthly_billed_budget || 0;
-            monthlyUnbilledBudget = data[0].monthly_unbilled_budget || 0;
-        } else {
-            monthlyBilledBudget = 0;
-            monthlyUnbilledBudget = 0;
-        }
-        updateBudgetHeader();
+            .from('expenses').select('*').order('date', { ascending: false });
+        if (error) throw error;
+        allExpensesCache = data || [];
+        performSearch();
     } catch (error) {
-        console.error('Failed to load budget:', error);
-        monthlyBilledBudget = 0;
-        monthlyUnbilledBudget = 0;
-        updateBudgetHeader();
+        console.error('Failed to load expenses for search:', error);
+        $('search-results').innerHTML =
+            '<div class="empty-state"><p>Could not load expenses.</p></div>';
     }
 }
 
-// Update setBudget function
-document.getElementById('budget-form').addEventListener('submit', async function (e) {
-    e.preventDefault();
+function highlight(text, term) {
+    const safe = esc(text);
+    // Skip highlighting when the term contains characters that esc()
+    // rewrites — matching against the escaped string would split entities.
+    if (!term || /[&<>]/.test(term)) return safe;
+    const pattern = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return safe.replace(new RegExp('(' + pattern + ')', 'gi'), '<mark>$1</mark>');
+}
 
-    try {
-        const newBilledBudget = parseFloat(document.getElementById('billed-budget-amount').value) || 0;
-        const newUnbilledBudget = parseFloat(document.getElementById('unbilled-budget-amount').value) || 0;
+function performSearch() {
+    const term = $('search-input').value.trim().toLowerCase();
+    const results = $('search-results');
 
-        if (newBilledBudget === monthlyBilledBudget && newUnbilledBudget === monthlyUnbilledBudget) {
-            showNotification('Please make changes to update the budgets.', 'error');
-            return;
-        }
-
-        if (newBilledBudget < 0 || newUnbilledBudget < 0) {
-            showNotification('Budget amounts cannot be negative.', 'error');
-            return;
-        }
-
-        const istNow = getISTDate();
-        const currentMonth = istNow.getMonth() + 1;
-        const currentYear = istNow.getFullYear();
-
-        const { error } = await supabase
-            .from('user_budgets')
-            .upsert([{
-                user_id: currentUser.id,
-                monthly_billed_budget: newBilledBudget,
-                monthly_unbilled_budget: newUnbilledBudget,
-                budget_month: currentMonth,
-                budget_year: currentYear
-            }], {
-                onConflict: 'user_id,budget_month,budget_year' // Match the new constraint
-            });
-
-        if (error) throw error;
-
-        monthlyBilledBudget = newBilledBudget;
-        monthlyUnbilledBudget = newUnbilledBudget;
-        budgetWarningShown = { billed: false, unbilled: false };
-
-        await updateBudgetDisplay();
-        updateBudgetHeader();
-
-        const budgetBtn = document.querySelector('.budget-tracker h3 + .btn');
-        if (budgetBtn) budgetBtn.textContent = 'Update Budget';
-
-        closeBudgetModal();
-        showNotification(`${getCurrentMonthName()} budgets updated successfully!`, 'success');
-    } catch (error) {
-        console.error('Budget update error:', error);
-        showNotification('Failed to update budget: ' + error.message, 'error');
+    let matches = allExpensesCache;
+    if (term) {
+        matches = allExpensesCache.filter(expense =>
+            (expense.note || '').toLowerCase().includes(term) ||
+            String(expense.type).toLowerCase().includes(term) ||
+            String(expense.amount).includes(term) ||
+            formatDate(expense.date).toLowerCase().includes(term)
+        );
     }
-});
 
-// Edit Profile Functions
+    if (matches.length === 0) {
+        results.innerHTML =
+            '<div class="empty-state"><div class="empty-state-icon">🔍</div><p>No expenses found</p></div>';
+        return;
+    }
+
+    const total = matches.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+    const capped = matches.slice(0, 200);
+
+    results.innerHTML = `
+        <div class="search-summary">${matches.length} expense${matches.length === 1 ? '' : 's'} · ${esc(money(total))}</div>
+        ${capped.map(expense => `
+            <div class="expense-item">
+                <div class="expense-details">
+                    <div class="expense-amount">${esc(money(expense.amount))}</div>
+                    <div class="expense-note">${highlight(expense.note || 'No description', term)}</div>
+                    <div class="expense-meta">
+                        ${typeBadge(expense.type)}
+                        ${billingBadge(expense.billed)}
+                        <span>${esc(formatDate(expense.date))}</span>
+                    </div>
+                </div>
+            </div>`).join('')}
+        ${matches.length > capped.length
+            ? `<p class="muted-sm" style="text-align:center;padding:.75rem;">Showing the first ${capped.length} of ${matches.length}. Refine your search to narrow it down.</p>`
+            : ''}`;
+}
+
+/* =====================================================================
+   Insights
+   ===================================================================== */
+
+/* Chart handles live in module state, never on `window`. The browser
+   exposes every element id as a window property, so a handle stored at
+   `window.velocityChart` reads back the <canvas id="velocityChart">
+   before first assignment — and then `.destroy()` throws. */
+let insightsChart = null;
+let velocityChart = null;
+let insightsChartData = null;
+let velocityChartData = null;
+let velocitySource = [];
+
+function showInsightsModal() {
+    openModal('insights-modal');
+    $('insights-content').innerHTML = '<div class="skeleton-row" style="height:320px"></div>';
+    loadSpendingInsights();
+}
+
+function closeInsightsModal() {
+    closeModal('insights-modal');
+    if (insightsChart) {
+        insightsChart.destroy();
+        insightsChart = null;
+    }
+    if (velocityChart) {
+        velocityChart.destroy();
+        velocityChart = null;
+    }
+    insightsChartData = null;
+    velocityChartData = null;
+}
+
+async function loadSpendingInsights() {
+    try {
+        const { data, error } = await supabase
+            .from('expenses').select('note, amount, date, type, billed')
+            .order('date', { ascending: false });
+        if (error) throw error;
+        displayInsights(calculateInsights(data || []), data || []);
+    } catch (error) {
+        console.error('Failed to load insights:', error);
+        $('insights-content').innerHTML =
+            '<div class="empty-state"><p>Could not load insights.</p></div>';
+    }
+}
+
+function calculateInsights(expenses) {
+    const { year, month, day } = todayParts();
+    const bounds = monthBounds(year, month);
+    const prev = previousMonth(year, month);
+    const prevBounds = monthBounds(prev.year, prev.month);
+
+    const thisMonth = expenses.filter(e => withinRange(e.date, bounds.first, bounds.last));
+    const lastMonth = expenses.filter(e => withinRange(e.date, prevBounds.first, prevBounds.last));
+
+    const thisMonthTotal = thisMonth.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+    const lastMonthTotal = lastMonth.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+    const monthlyChange = lastMonthTotal > 0
+        ? ((thisMonthTotal - lastMonthTotal) / lastMonthTotal) * 100 : 0;
+
+    const categoryTotals = {};
+    thisMonth.forEach(e => {
+        categoryTotals[e.type] = (categoryTotals[e.type] || 0) + (parseFloat(e.amount) || 0);
+    });
+    const topCategories = Object.entries(categoryTotals).sort((a, b) => b[1] - a[1]).slice(0, 6);
+
+    const dailyAverage = thisMonthTotal / Math.max(day, 1);
+    const projectedMonthly = dailyAverage * daysInMonth(year, month);
+
+    const highestExpense = thisMonth.length
+        ? thisMonth.reduce((max, e) => parseFloat(e.amount) > parseFloat(max.amount) ? e : max) : null;
+    const lowestExpense = thisMonth.length
+        ? thisMonth.reduce((min, e) => parseFloat(e.amount) < parseFloat(min.amount) ? e : min) : null;
+
+    // Group by the stored month string — never via a Date, which would
+    // shift month boundaries for devices outside IST.
+    const monthlyData = {};
+    expenses.forEach(expense => {
+        const parts = splitISO(expense.date);
+        if (!parts) return;
+        const key = parts.year + '-' + pad2(parts.month);
+        if (!monthlyData[key]) monthlyData[key] = { billed: 0, unbilled: 0, total: 0 };
+        const amount = parseFloat(expense.amount) || 0;
+        monthlyData[key].total += amount;
+        if (expense.billed) monthlyData[key].billed += amount;
+        else monthlyData[key].unbilled += amount;
+    });
+
+    // Per-day totals for the heatmap.
+    const dailyTotals = {};
+    thisMonth.forEach(expense => {
+        const parts = splitISO(expense.date);
+        if (!parts) return;
+        dailyTotals[parts.day] = (dailyTotals[parts.day] || 0) + (parseFloat(expense.amount) || 0);
+    });
+
+    return {
+        thisMonthTotal, lastMonthTotal, monthlyChange, topCategories,
+        dailyAverage, projectedMonthly, highestExpense, lowestExpense,
+        totalExpenses: thisMonth.length,
+        avgPerTransaction: thisMonth.length ? thisMonthTotal / thisMonth.length : 0,
+        monthlyData, dailyTotals
+    };
+}
+
+/**
+ * Calendar heatmap of the current month. Blank cells are days with no
+ * entry — the point is to make the gaps visible so you backfill them.
+ */
+function renderMonthHeatmap(dailyTotals) {
+    const mount = $('month-heatmap');
+    if (!mount) return;
+
+    const { year, month, day: today } = todayParts();
+    const total = daysInMonth(year, month);
+    // Monday-first column index for the 1st of the month.
+    const firstWeekday = (new Date(Date.UTC(year, month - 1, 1)).getUTCDay() + 6) % 7;
+
+    const values = Object.keys(dailyTotals).map(key => dailyTotals[key]);
+    const peak = safeMax(values);
+    let logged = 0;
+
+    const cells = [];
+    for (let i = 0; i < firstWeekday; i++) {
+        cells.push('<div class="heat-cell heat-pad" aria-hidden="true"></div>');
+    }
+
+    for (let date = 1; date <= total; date++) {
+        const amount = dailyTotals[date] || 0;
+        const future = date > today;
+        if (amount > 0) logged++;
+
+        // Square-root scale, not linear: one big outlier (rent) would
+        // otherwise flatten every ordinary day into the palest bucket.
+        let level = 0;
+        if (amount > 0 && peak > 0) {
+            level = Math.min(4, Math.max(1, Math.ceil(Math.sqrt(amount / peak) * 4)));
+        }
+
+        const classes = ['heat-cell', 'level-' + level];
+        if (date === today) classes.push('is-today');
+        if (future) classes.push('is-future');
+        if (!future && amount === 0) classes.push('is-empty');
+
+        const label = `${date} ${MONTH_NAMES[month - 1]}: ` +
+            (amount > 0 ? money(amount) : future ? 'upcoming' : 'nothing logged');
+        cells.push(`<div class="${classes.join(' ')}" title="${attr(label)}">${date}</div>`);
+    }
+
+    const missed = Math.max(today - logged, 0);
+    mount.innerHTML = `
+        <div class="panel">
+            <div class="panel-title">${esc(monthLabel(year, month, false))} — daily spend</div>
+            <div class="heat-week-labels">
+                ${['M', 'T', 'W', 'T', 'F', 'S', 'S'].map(d =>
+        `<span>${d}</span>`).join('')}
+            </div>
+            <div class="heat-grid">${cells.join('')}</div>
+            <div class="heat-legend">
+                <span>${logged} of ${today} day${today === 1 ? '' : 's'} logged${missed ? ` · ${missed} blank` : ''}</span>
+                <span class="heat-scale">
+                    less
+                    ${[0, 1, 2, 3, 4].map(l => `<i class="heat-cell level-${l}"></i>`).join('')}
+                    more
+                </span>
+            </div>
+        </div>`;
+}
+
+function displayInsights(insights, allExpenses) {
+    const container = $('insights-content');
+    const { day: currentDay } = todayParts();
+    const tracking = trackingBilling();
+
+    const changeUp = insights.monthlyChange > 0;
+    const changeCard = insights.lastMonthTotal > 0
+        ? `${changeUp ? '+' : ''}${insights.monthlyChange.toFixed(1)}%`
+        : '—';
+
+    container.innerHTML = `
+        <div class="insights-grid">
+            <div class="insight-card c-indigo">
+                <h4>This month</h4>
+                <div class="insight-value">${esc(moneyShort(insights.thisMonthTotal))}</div>
+                <div class="insight-sub">${insights.totalExpenses} transaction${insights.totalExpenses === 1 ? '' : 's'}</div>
+            </div>
+            <div class="insight-card ${changeUp ? 'c-rose' : 'c-green'}">
+                <h4>vs last month</h4>
+                <div class="insight-value">${esc(changeCard)}</div>
+                <div class="insight-sub">${esc(moneyShort(insights.lastMonthTotal))} last month</div>
+            </div>
+            <div class="insight-card c-sky">
+                <h4>Daily average</h4>
+                <div class="insight-value">${esc(moneyShort(insights.dailyAverage))}</div>
+                <div class="insight-sub">Projected ${esc(moneyShort(insights.projectedMonthly))}</div>
+            </div>
+            <div class="insight-card c-amber">
+                <h4>Per transaction</h4>
+                <div class="insight-value">${esc(moneyShort(insights.avgPerTransaction))}</div>
+                <div class="insight-sub">Average this month</div>
+            </div>
+        </div>
+
+        <div id="month-heatmap"></div>
+
+        <div class="chart-container" style="margin-top:1.25rem;"><canvas id="monthlyTrendChart"></canvas></div>
+        ${tracking ? `
+        <div class="radio-bar" id="insights-view-bar">
+            <label class="radio-pill checked"><input type="radio" name="insightsDataView" value="consolidated" checked onchange="updateInsightsChart()"> All</label>
+            <label class="radio-pill"><input type="radio" name="insightsDataView" value="billed" onchange="updateInsightsChart()"> Billed</label>
+            <label class="radio-pill"><input type="radio" name="insightsDataView" value="unbilled" onchange="updateInsightsChart()"> Unbilled</label>
+            <label class="radio-pill"><input type="radio" name="insightsDataView" value="total" onchange="updateInsightsChart()"> Total only</label>
+        </div>` : ''}
+
+        <div class="chart-container" style="margin-top:1.25rem;"><canvas id="velocityChart"></canvas></div>
+        <div class="radio-bar" id="insights-type-bar">
+            <label class="radio-pill checked"><input type="radio" name="velocityChartType" value="bar" checked onchange="updateBothChartTypes()"> Bars</label>
+            <label class="radio-pill"><input type="radio" name="velocityChartType" value="line" onchange="updateBothChartTypes()"> Lines</label>
+        </div>
+
+        <div class="slider-panel">
+            <div class="panel-title" style="text-align:center;">Compare spending by day of month</div>
+            <div class="slider-row">
+                <span class="slider-label">Day 1 →</span>
+                <input type="range" id="velocity-day-slider" min="1" max="31" value="${currentDay}"
+                    oninput="updateVelocityByDay(this.value)" aria-label="Day of month">
+                <span class="slider-value" id="velocity-day-display">${currentDay}</span>
+            </div>
+            <p class="muted-sm" style="text-align:center;margin-top:.5rem;">
+                Compares the same stretch of each month, so a part-way month is judged fairly.</p>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1rem;margin-top:1.5rem;">
+            <div class="panel">
+                <div class="panel-title">Top categories this month</div>
+                ${insights.topCategories.length ? insights.topCategories.map(([category, amount], index) => `
+                    <div class="rank-row">
+                        <span class="rank-name"><span class="rank-num">${index + 1}</span>${esc(category)}</span>
+                        <span class="rank-value">${esc(money(amount))}</span>
+                    </div>`).join('') : '<p class="muted-sm">No spending yet this month.</p>'}
+            </div>
+            <div class="panel">
+                <div class="panel-title">Expense range</div>
+                ${insights.highestExpense ? `
+                    <div class="extreme-card high">
+                        <div class="extreme-label">Highest</div>
+                        <div class="extreme-value">${esc(money(insights.highestExpense.amount))}</div>
+                        <div class="extreme-note">${esc(insights.highestExpense.note) || 'No description'}</div>
+                        <div class="extreme-meta">${esc(insights.highestExpense.type)} · ${esc(formatDate(insights.highestExpense.date))}</div>
+                    </div>` : ''}
+                ${insights.lowestExpense ? `
+                    <div class="extreme-card low">
+                        <div class="extreme-label">Lowest</div>
+                        <div class="extreme-value">${esc(money(insights.lowestExpense.amount))}</div>
+                        <div class="extreme-note">${esc(insights.lowestExpense.note) || 'No description'}</div>
+                        <div class="extreme-meta">${esc(insights.lowestExpense.type)} · ${esc(formatDate(insights.lowestExpense.date))}</div>
+                    </div>` : '<p class="muted-sm">No expenses this month.</p>'}
+            </div>
+        </div>`;
+
+    wireRadioPills();
+    renderMonthHeatmap(insights.dailyTotals || {});
+
+    if (!chartsAvailable()) return;
+
+    const sortedMonths = Object.keys(insights.monthlyData)
+        .filter(key => insights.monthlyData[key].total > 0)
+        .sort()
+        .slice(-12);
+
+    insightsChartData = { sortedMonths, monthlyData: insights.monthlyData };
+    velocitySource = allExpenses;
+
+    renderMonthlyTrendChart('bar');
+    renderVelocityChart(currentDay, 'bar');
+}
+
+/** Older Safari lacks :has(); mirror the checked state onto a class. */
+function wireRadioPills() {
+    document.querySelectorAll('#insights-content .radio-bar').forEach(bar => {
+        const sync = () => bar.querySelectorAll('.radio-pill').forEach(pill => {
+            const input = pill.querySelector('input');
+            pill.classList.toggle('checked', !!(input && input.checked));
+        });
+        bar.addEventListener('change', sync);
+        sync();
+    });
+}
+
+function monthKeyLabel(key) {
+    const [year, month] = key.split('-');
+    return monthLabel(Number(year), Number(month), true);
+}
+
+function insightsDatasets(chartType) {
+    const { sortedMonths, monthlyData } = insightsChartData;
+    const view = trackingBilling()
+        ? (document.querySelector('input[name="insightsDataView"]:checked') || {}).value || 'consolidated'
+        : 'total';
+    const fill = chartType === 'line';
+
+    const series = {
+        total: {
+            label: 'Total', key: 'total', color: '#6366f1', soft: 'rgba(99,102,241,.18)'
+        },
+        billed: {
+            label: 'Billed', key: 'billed', color: '#10b981', soft: 'rgba(16,185,129,.18)'
+        },
+        unbilled: {
+            label: 'Unbilled', key: 'unbilled', color: '#f43f5e', soft: 'rgba(244,63,94,.18)'
+        }
+    };
+
+    const build = (name, primary) => ({
+        label: series[name].label,
+        data: sortedMonths.map(month => monthlyData[month][series[name].key]),
+        borderColor: series[name].color,
+        backgroundColor: chartType === 'bar' ? series[name].color : series[name].soft,
+        borderWidth: primary ? 2.5 : 2,
+        fill: fill && primary,
+        tension: 0.35,
+        borderRadius: 6,
+        pointRadius: 3
+    });
+
+    if (view === 'consolidated') return [build('total', true), build('billed', false), build('unbilled', false)];
+    if (view === 'billed') return [build('billed', true)];
+    if (view === 'unbilled') return [build('unbilled', true)];
+    return [build('total', true)];
+}
+
+function renderMonthlyTrendChart(chartType) {
+    const canvas = $('monthlyTrendChart');
+    if (!canvas || !insightsChartData) return;
+
+    if (insightsChart) {
+        insightsChart.destroy();
+        insightsChart = null;
+    }
+
+    const { sortedMonths } = insightsChartData;
+    if (!sortedMonths.length) {
+        setChartEmptyState(canvas, 'No spending recorded yet');
+        return;
+    }
+    setChartEmptyState(canvas, null);
+
+    const datasets = insightsDatasets(chartType);
+    const peak = safeMax(datasets.flatMap(dataset => dataset.data));
+
+    insightsChart = new Chart(canvas.getContext('2d'), {
+        type: chartType,
+        data: { labels: sortedMonths.map(monthKeyLabel), datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                title: { display: true, text: 'Monthly spending trend' },
+                legend: { display: datasets.length > 1, position: 'bottom' },
+                tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + money(ctx.parsed.y) } }
+            },
+            scales: {
+                x: axisConfig(),
+                y: axisConfig({
+                    beginAtZero: true,
+                    max: calculateMaxValue(peak),
+                    ticks: {
+                        color: chartInk(),
+                        callback: value => moneyShort(value),
+                        stepSize: calculateStepSize(peak),
+                        maxTicksLimit: 8
+                    }
+                })
+            }
+        }
+    });
+}
+
+function velocityTotals(day) {
+    const expenses = velocitySource || [];
+    const { year, month } = todayParts();
+    const labels = [];
+    const data = [];
+
+    for (let back = 5; back >= 0; back--) {
+        let targetMonth = month - back;
+        let targetYear = year;
+        while (targetMonth <= 0) {
+            targetMonth += 12;
+            targetYear -= 1;
+        }
+        const first = `${targetYear}-${pad2(targetMonth)}-01`;
+        const cutoffDay = Math.min(day, daysInMonth(targetYear, targetMonth));
+        const cutoff = `${targetYear}-${pad2(targetMonth)}-${pad2(cutoffDay)}`;
+
+        const total = expenses
+            .filter(expense => withinRange(expense.date, first, cutoff))
+            .reduce((sum, expense) => sum + (parseFloat(expense.amount) || 0), 0);
+
+        labels.push(monthLabel(targetYear, targetMonth, true));
+        data.push(total);
+    }
+    return { labels, data };
+}
+
+function renderVelocityChart(day, chartType) {
+    const canvas = $('velocityChart');
+    if (!canvas) return;
+
+    if (velocityChart) {
+        velocityChart.destroy();
+        velocityChart = null;
+    }
+
+    const { labels, data } = velocityTotals(Number(day));
+    velocityChartData = { labels, data, currentDay: Number(day) };
+    const peak = safeMax(data);
+
+    velocityChart = new Chart(canvas.getContext('2d'), {
+        type: chartType,
+        data: {
+            labels,
+            datasets: [{
+                label: 'Spend through day ' + day,
+                data,
+                backgroundColor: data.map((_, index) =>
+                    index === data.length - 1 ? 'rgba(244,63,94,.75)' : 'rgba(99,102,241,.72)'),
+                borderColor: data.map((_, index) =>
+                    index === data.length - 1 ? '#f43f5e' : '#6366f1'),
+                borderWidth: 2,
+                borderRadius: 6,
+                tension: 0.35,
+                pointRadius: 3,
+                fill: chartType === 'line'
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: `Spending velocity — first ${day} days of each month` },
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function (ctx) {
+                            const previous = data[ctx.dataIndex - 1];
+                            const lines = ['Amount: ' + money(ctx.parsed.y)];
+                            if (ctx.dataIndex > 0 && previous > 0) {
+                                const change = ((ctx.parsed.y - previous) / previous) * 100;
+                                lines.push('Change: ' + (change >= 0 ? '+' : '') + change.toFixed(1) + '%');
+                            }
+                            return lines;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: axisConfig(),
+                y: axisConfig({
+                    beginAtZero: true,
+                    max: calculateMaxValue(peak),
+                    ticks: {
+                        color: chartInk(),
+                        callback: value => moneyShort(value),
+                        stepSize: calculateStepSize(peak),
+                        maxTicksLimit: 8
+                    }
+                })
+            }
+        }
+    });
+}
+
+function selectedInsightsChartType() {
+    const checked = document.querySelector('input[name="velocityChartType"]:checked');
+    return checked ? checked.value : 'bar';
+}
+
+function updateInsightsChart() {
+    renderMonthlyTrendChart(selectedInsightsChartType());
+}
+
+function updateBothChartTypes() {
+    const chartType = selectedInsightsChartType();
+    renderMonthlyTrendChart(chartType);
+    const day = velocityChartData ? velocityChartData.currentDay : todayParts().day;
+    renderVelocityChart(day, chartType);
+}
+
+let velocityRedrawTimer = null;
+
+// Declared as a function (not a debounced const) so the inline
+// oninput="updateVelocityByDay(...)" attribute can resolve it.
+function updateVelocityByDay(day) {
+    setText('velocity-day-display', String(day));
+    clearTimeout(velocityRedrawTimer);
+    velocityRedrawTimer = setTimeout(() => {
+        renderVelocityChart(Number(day), selectedInsightsChartType());
+    }, 90);
+}
+
+/* =====================================================================
+   Profile
+   ===================================================================== */
+
+function currentDisplayName() {
+    const meta = currentUser && currentUser.user_metadata ? currentUser.user_metadata : {};
+    return meta.display_name || meta.name || meta.full_name || '';
+}
+
 function showEditProfile() {
-    // Reset modal content completely
-    document.getElementById('edit-profile-alert').innerHTML = '';
-    document.getElementById('save-profile-btn').style.display = 'none';
+    $('edit-profile-alert').innerHTML = '';
+    show('save-profile-btn', false);
+    openModal('edit-profile-modal');
 
-    document.getElementById('edit-profile-modal').style.display = 'block';
-    hideLandingIcons();
+    $('profile-name').value = currentDisplayName();
+    $('profile-email').value = currentUser.email;
 
-    // Populate current values fresh
-    const displayName = currentUser.user_metadata?.display_name ||
-        currentUser.user_metadata?.name ||
-        currentUser.user_metadata?.full_name ||
-        '';
-
-    document.getElementById('profile-name').value = displayName;
-    document.getElementById('profile-email').value = currentUser.email;
-
-    // Remove any existing event listeners
-    const nameInput = document.getElementById('profile-name');
-    const emailInput = document.getElementById('profile-email');
-
-    nameInput.oninput = null;
-    emailInput.oninput = null;
-
-    // Add fresh event listeners
-    nameInput.oninput = emailInput.oninput = checkProfileChanges;
-
-    nameInput.focus();
+    $('profile-name').oninput = checkProfileChanges;
+    $('profile-email').oninput = checkProfileChanges;
+    $('profile-name').focus();
 }
 
 function closeEditProfileModal() {
-    document.getElementById('edit-profile-modal').style.display = 'none';
-    document.getElementById('edit-profile-form').reset();
-    document.getElementById('edit-profile-alert').innerHTML = '';
-    document.getElementById('save-profile-btn').style.display = 'none';
-    showLandingIcons();
+    closeModal('edit-profile-modal');
+    $('edit-profile-form').reset();
+    $('edit-profile-alert').innerHTML = '';
+    show('save-profile-btn', false);
 }
 
 function checkProfileChanges() {
-    const currentName = currentUser.user_metadata?.display_name ||
-        currentUser.user_metadata?.name ||
-        currentUser.user_metadata?.full_name ||
-        '';
-
-    const newName = document.getElementById('profile-name').value.trim();
-    const newEmail = document.getElementById('profile-email').value.trim();
-    const currentEmail = currentUser.email;
-
-    const nameChanged = newName !== currentName;
-    const emailChanged = newEmail !== currentEmail;
-
-    const saveBtn = document.getElementById('save-profile-btn');
-    saveBtn.style.display = (nameChanged || emailChanged) ? 'block' : 'none';
+    const nameChanged = $('profile-name').value.trim() !== currentDisplayName();
+    const emailChanged = $('profile-email').value.trim() !== currentUser.email;
+    show('save-profile-btn', nameChanged || emailChanged, 'flex');
 }
 
-async function handleEditProfile(e) {
-    e.preventDefault();
+async function handleEditProfile(event) {
+    event.preventDefault();
 
-    const currentName = currentUser.user_metadata?.display_name ||
-        currentUser.user_metadata?.name ||
-        currentUser.user_metadata?.full_name ||
-        '';
-
-    const newName = document.getElementById('profile-name').value.trim();
-    const newEmail = document.getElementById('profile-email').value.trim();
-    const currentEmail = currentUser.email;
-
-    const nameChanged = newName !== currentName;
-    const emailChanged = newEmail !== currentEmail;
+    const newName = $('profile-name').value.trim();
+    const newEmail = $('profile-email').value.trim();
+    const nameChanged = newName !== currentDisplayName();
+    const emailChanged = newEmail !== currentUser.email;
 
     if (!nameChanged && !emailChanged) {
         closeEditProfileModal();
@@ -3366,44 +4534,28 @@ async function handleEditProfile(e) {
     }
 
     try {
-        // Handle name change
         if (nameChanged) {
             const { error } = await supabase.auth.updateUser({
-                data: {
-                    display_name: newName,
-                    name: newName,
-                    full_name: newName
-                }
+                data: { display_name: newName, name: newName, full_name: newName }
             });
-
             if (error) throw error;
-
-            // Update display immediately
-            document.getElementById('user-name').textContent = `Welcome, ${newName}!`;
-            document.getElementById('user-avatar').textContent = newName.charAt(0).toUpperCase();
+            setText('user-name', 'Welcome, ' + newName + '!');
+            setText('user-avatar', newName.charAt(0).toUpperCase());
         }
 
-        // Handle email change - Supabase will send verification to OLD email when "Secure email change" is ON
         if (emailChanged) {
-            // Store pending change for reference
             localStorage.setItem('pendingEmailChange', JSON.stringify({
-                oldEmail: currentEmail,
-                newEmail: newEmail,
-                timestamp: Date.now()
+                oldEmail: currentUser.email, newEmail, timestamp: Date.now()
             }));
 
-            // Use Supabase's built-in email change with redirect to current domain
             const { error } = await supabase.auth.updateUser(
                 { email: newEmail },
-                {
-                    emailRedirectTo: `${window.location.origin}?type=email_change`
-                }
+                { emailRedirectTo: window.location.origin + '?type=email_change' }
             );
-
             if (error) throw error;
 
             showAlert('edit-profile-alert',
-                `Email change verification sent to your current email and old email. Please check both your email and click the verification link to complete the change.`,
+                'Verification sent to both your current and new email. Open the link in each to finish the change.',
                 'success');
 
             setTimeout(async () => {
@@ -3411,211 +4563,141 @@ async function handleEditProfile(e) {
                 currentUser = null;
                 closeEditProfileModal();
                 showSignIn();
-                showNotification('Signed out. Check your email for verification link.', 'info', 5000);
+                showNotification('Signed out. Check your email for the verification link.', 'info', 5000);
             }, 5000);
-
             return;
         }
 
-        // If only name changed
-        if (nameChanged && !emailChanged) {
-            showAlert('edit-profile-alert', 'Name updated successfully!', 'success');
-            setTimeout(() => {
-                closeEditProfileModal();
-                showNotification('Profile updated successfully!', 'success');
-            }, 1500);
-        }
-
+        showAlert('edit-profile-alert', 'Name updated successfully!', 'success');
+        setTimeout(() => {
+            closeEditProfileModal();
+            showNotification('Profile updated', 'success');
+        }, 1200);
     } catch (error) {
         showAlert('edit-profile-alert', error.message, 'error');
     }
 }
 
-// Handle email change confirmation when user clicks verification link
 async function handleEmailChangeConfirmation() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const token = urlParams.get('token');
-    const type = urlParams.get('type');
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('token');
+    const type = params.get('type');
+    if (type !== 'email_change' || !token) return;
 
-    if (type === 'email_change' && token) {
-        try {
-            // Verify the email change token
-            const { data, error } = await supabase.auth.verifyOtp({
-                token_hash: token,
-                type: 'email_change'
-            });
+    try {
+        const { error } = await supabase.auth.verifyOtp({ token_hash: token, type: 'email_change' });
+        if (error) throw error;
 
-            if (error) throw error;
+        localStorage.removeItem('pendingEmailChange');
+        await supabase.auth.signOut();
+        localStorage.removeItem('supabase.auth.token');
+        const projectId = supabaseUrl.split('//')[1] ? supabaseUrl.split('//')[1].split('.')[0] : null;
+        if (projectId) localStorage.removeItem('sb-' + projectId + '-auth-token');
 
-            // Get pending change info
-            const pendingChange = JSON.parse(localStorage.getItem('pendingEmailChange') || '{}');
-
-            // Clear pending change immediately
-            localStorage.removeItem('pendingEmailChange');
-
-            // Sign out from all sessions to force re-login with new email
-            await supabase.auth.signOut();
-
-            // Clear all auth-related storage
-            localStorage.removeItem('supabase.auth.token');
-            const projectId = supabaseUrl.split('//')[1]?.split('.')[0];
-            if (projectId) {
-                localStorage.removeItem(`sb-${projectId}-auth-token`);
-            }
-
-            // Reset application state
-            currentUser = null;
-            isPasswordResetFlow = false;
-
-            // Show success and redirect to sign in
-            showNotification(`Email successfully changed! Please sign in with your new email address.`, 'success');
-            showSignIn();
-
-            // Clean URL
-            window.history.replaceState({}, document.title, window.location.pathname);
-
-        } catch (error) {
-            console.error('Email change verification error:', error);
-            showNotification('Email verification failed. Please try the process again.', 'error');
-
-            // Clean URL and show sign in
-            window.history.replaceState({}, document.title, window.location.pathname);
-            showSignIn();
-        }
+        currentUser = null;
+        isPasswordResetFlow = false;
+        showNotification('Email changed. Please sign in with your new address.', 'success', 5000);
+        showSignIn();
+    } catch (error) {
+        console.error('Email change verification error:', error);
+        showNotification('Email verification failed. Please try again.', 'error');
+        showSignIn();
+    } finally {
+        window.history.replaceState({}, document.title, window.location.pathname);
     }
 }
 
-// Close modal when clicking outside
-window.onclick = function (event) {
-    const addTypeModal = document.getElementById('add-type-modal');
-    const visualizationModal = document.getElementById('visualization-modal');
-    const changePasswordModal = document.getElementById('change-password-modal');
-    const budgetModal = document.getElementById('budget-modal');
-    const editProfileModal = document.getElementById('edit-profile-modal');
+/* =====================================================================
+   Import
+   ===================================================================== */
 
-    if (event.target === addTypeModal) {
-        closeAddTypeModal();
-    }
-    if (event.target === visualizationModal) {
-        closeVisualizationModal();
-    }
-    if (event.target === changePasswordModal && !isPasswordResetFlow) {
-        closeChangePasswordModal();
-    }
-    if (event.target === budgetModal) {
-        closeBudgetModal();
-    }
-    if (event.target === editProfileModal) {
-        closeEditProfileModal();
-    }
-    if (event.target === document.getElementById('delete-type-modal')) {
-        closeDeleteTypeModal();
-    }
-    if (event.target === document.getElementById('edit-type-modal')) {
-        closeEditTypeModal();
-    }
-    if (event.target === document.getElementById('search-modal')) {
-        closeSearchModal();
-    }
-    if (event.target === document.getElementById('insights-modal')) {
-        closeInsightsModal();
-    }
-}
-
-function toggleFormBilling() {
-    const toggle = document.getElementById('form-billed-toggle');
-    const isActive = toggle.classList.contains('active');
-    toggle.classList.toggle('active');
-
-    // Update hidden checkbox for form submission
-    const checkbox = document.getElementById('billed');
-    checkbox.checked = toggle.classList.contains('active');
-}
-
-// ===================== Import Expenses Feature =====================
 let importParsedRows = [];
 let importValidRows = [];
 
-const REQUIRED_IMPORT_HEADERS = ['Note', 'Type', 'Amount', 'Date', 'Billed/Unbilled'];
+const BASE_IMPORT_HEADERS = ['Note', 'Type', 'Amount', 'Date'];
+const BILLED_IMPORT_HEADER = 'Billed/Unbilled';
 
 function showImportExpenses() {
-    document.getElementById('import-expenses-modal').style.display = 'block';
     resetImportModal();
+    applyBillingMode();
+    openModal('import-expenses-modal');
 }
 
 function closeImportExpensesModal() {
-    document.getElementById('import-expenses-modal').style.display = 'none';
+    closeModal('import-expenses-modal');
     resetImportModal();
 }
 
 function resetImportModal() {
     importParsedRows = [];
     importValidRows = [];
-    document.getElementById('import-step-upload').style.display = 'block';
-    document.getElementById('import-step-progress').style.display = 'none';
-    document.getElementById('import-step-review').style.display = 'none';
-    document.getElementById('import-step-done').style.display = 'none';
-    document.getElementById('import-alert').innerHTML = '';
-    document.getElementById('import-file-input').value = '';
-    document.getElementById('import-preview-body').innerHTML = '';
+    show('import-step-upload', true, 'block');
+    show('import-step-progress', false);
+    show('import-step-review', false);
+    show('import-step-done', false);
+    $('import-alert').innerHTML = '';
+    $('import-file-input').value = '';
+    $('import-preview-body').innerHTML = '';
+    const confirmBtn = $('confirm-import-btn');
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = 'Confirm & Upload Valid Rows';
 }
 
 function initImportExpensesUI() {
-    const dropzone = document.getElementById('import-dropzone');
-    const fileInput = document.getElementById('import-file-input');
-    const sampleLink = document.getElementById('download-sample-csv');
-
+    const dropzone = $('import-dropzone');
+    const fileInput = $('import-file-input');
+    const sampleLink = $('download-sample-csv');
     if (!dropzone) return;
 
     dropzone.addEventListener('click', () => fileInput.click());
-
-    dropzone.addEventListener('dragover', (e) => {
-        e.preventDefault();
+    dropzone.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            fileInput.click();
+        }
+    });
+    dropzone.addEventListener('dragover', event => {
+        event.preventDefault();
         dropzone.classList.add('dragover');
     });
-
-    dropzone.addEventListener('dragleave', () => {
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', event => {
+        event.preventDefault();
         dropzone.classList.remove('dragover');
+        if (event.dataTransfer.files.length) handleImportFile(event.dataTransfer.files[0]);
     });
-
-    dropzone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        dropzone.classList.remove('dragover');
-        if (e.dataTransfer.files.length) {
-            handleImportFile(e.dataTransfer.files[0]);
-        }
+    fileInput.addEventListener('change', event => {
+        if (event.target.files.length) handleImportFile(event.target.files[0]);
     });
-
-    fileInput.addEventListener('change', (e) => {
-        if (e.target.files.length) {
-            handleImportFile(e.target.files[0]);
-        }
-    });
-
-    sampleLink.addEventListener('click', (e) => {
-        e.preventDefault();
+    sampleLink.addEventListener('click', event => {
+        event.preventDefault();
         downloadSampleCsv();
     });
 }
 
 function downloadSampleCsv() {
-    const sampleContent = 'Note,Type,Amount,Date,Billed/Unbilled\nSample Note,Type,500,01/01/2026,Unbilled\n';
-    const blob = new Blob([sampleContent], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'expense_import_sample.csv';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    const tracking = trackingBilling();
+    const header = BASE_IMPORT_HEADERS.concat(tracking ? [BILLED_IMPORT_HEADER] : []).join(',');
+    const example = ['Lunch with team', 'Food', '500', '01/01/2026']
+        .concat(tracking ? ['Unbilled'] : []).join(',');
+    downloadBlob(new Blob([header + '\n' + example + '\n'], { type: 'text/csv' }),
+        'expense_import_sample.csv');
 }
 
 function handleImportFile(file) {
+    if (typeof XLSX === 'undefined') {
+        showAlert('import-alert', 'The spreadsheet library did not load. Reload the page and try again.', 'error');
+        return;
+    }
+
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onerror = () => showAlert('import-alert', 'Could not read that file.', 'error');
+    reader.onload = event => {
         try {
-            const workbook = XLSX.read(e.target.result, { type: 'binary', cellDates: false });
+            // readAsArrayBuffer, not readAsBinaryString: the latter is
+            // deprecated and unreliable in Safari.
+            const bytes = new Uint8Array(event.target.result);
+            const workbook = XLSX.read(bytes, { type: 'array', cellDates: false });
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
             const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
 
@@ -3624,102 +4706,100 @@ function handleImportFile(file) {
                 return;
             }
 
-            const headers = Object.keys(rows[0]).map(h => h.trim());
-            const missing = REQUIRED_IMPORT_HEADERS.filter(h => !headers.includes(h));
+            const headers = Object.keys(rows[0]).map(header => header.trim());
+            const required = BASE_IMPORT_HEADERS.concat(
+                trackingBilling() ? [BILLED_IMPORT_HEADER] : []);
+            const missing = required.filter(header => headers.indexOf(header) === -1);
             if (missing.length) {
-                showAlert('import-alert', `Missing required column(s): ${missing.join(', ')}`, 'error');
+                showAlert('import-alert', 'Missing required column(s): ' + missing.join(', '), 'error');
                 return;
             }
 
             importParsedRows = rows;
             runImportValidation(rows);
-        } catch (err) {
-            console.error('Import parse error:', err);
-            showAlert('import-alert', 'Could not read this file. Please check the format and try again.', 'error');
+        } catch (error) {
+            console.error('Import parse error:', error);
+            showAlert('import-alert',
+                'Could not read this file. Please check the format and try again.', 'error');
         }
     };
-    reader.readAsBinaryString(file);
+    reader.readAsArrayBuffer(file);
 }
 
 async function runImportValidation(rows) {
-    document.getElementById('import-step-upload').style.display = 'none';
-    document.getElementById('import-step-progress').style.display = 'block';
+    show('import-step-upload', false);
+    show('import-step-progress', true, 'block');
 
-    const progressBar = document.getElementById('import-progress-bar');
-    const progressLabel = document.getElementById('import-progress-label');
-    const successCounter = document.getElementById('import-progress-success');
-    const failedCounter = document.getElementById('import-progress-failed');
+    const progressBar = $('import-progress-bar');
+    const progressLabel = $('import-progress-label');
+    const successCounter = $('import-progress-success');
+    const failedCounter = $('import-progress-failed');
 
     const validTypes = await loadTypesForEdit();
-    const validatedRows = [];
+    const validated = [];
     let successCount = 0;
     let failedCount = 0;
 
-    for (let i = 0; i < rows.length; i++) {
-        const raw = rows[i];
-        const result = validateImportRow(raw, validTypes);
-        validatedRows.push(result);
+    // Yield to the browser periodically instead of sleeping per row —
+    // a 500-row file used to take 20 seconds of pure delay.
+    const chunk = Math.max(1, Math.floor(rows.length / 60));
 
+    for (let i = 0; i < rows.length; i++) {
+        const result = validateImportRow(rows[i], validTypes);
+        validated.push(result);
         if (result.valid) successCount++; else failedCount++;
 
-        progressLabel.textContent = `Importing row ${i + 1} of ${rows.length}…`;
-        progressBar.style.width = `${Math.round(((i + 1) / rows.length) * 100)}%`;
-        successCounter.textContent = `✓ ${successCount} valid`;
-        failedCounter.textContent = `✕ ${failedCount} failed`;
-
-        // small delay so the progress UI feels alive on large files
-        await new Promise(resolve => setTimeout(resolve, 40));
+        if (i % chunk === 0 || i === rows.length - 1) {
+            progressLabel.textContent = `Checking row ${i + 1} of ${rows.length}…`;
+            progressBar.style.width = Math.round(((i + 1) / rows.length) * 100) + '%';
+            successCounter.textContent = '✓ ' + successCount + ' valid';
+            failedCounter.textContent = '✕ ' + failedCount + ' failed';
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
     }
 
-    importValidRows = validatedRows;
-    showImportReview(validatedRows);
+    importValidRows = validated;
+    showImportReview(validated);
 }
 
-function normalizeTypeKey(str) {
-    return (str || '').toString().replace(/[^a-zA-Z]/g, '').toLowerCase();
+function normalizeTypeKey(value) {
+    return String(value || '').replace(/[^a-zA-Z]/g, '').toLowerCase();
 }
 
-function parseDDMMYYYY(dateRaw) {
-    const match = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/.exec(dateRaw.trim());
+function parseDDMMYYYY(raw) {
+    const match = /^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$/.exec(String(raw).trim());
     if (!match) return null;
 
     const day = parseInt(match[1], 10);
     const month = parseInt(match[2], 10);
     const year = parseInt(match[3], 10);
-
     if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    if (day > daysInMonth(year, month)) return null;
 
-    const dateObj = new Date(year, month - 1, day);
-    if (dateObj.getFullYear() !== year || dateObj.getMonth() !== month - 1 || dateObj.getDate() !== day) {
-        return null; // catches invalid dates like 31/02/2026
-    }
-
-    const iso = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    return iso;
+    return `${year}-${pad2(month)}-${pad2(day)}`;
 }
 
 function validateImportRow(raw, validTypes) {
-    const note = (raw['Note'] || '').toString().trim();
-    const typeInput = (raw['Type'] || '').toString().trim();
-    const amountRaw = (raw['Amount'] || '').toString().trim();
-    const dateRaw = (raw['Date'] || '').toString().trim();
-    const billedRaw = (raw['Billed/Unbilled'] || '').toString().trim().toLowerCase();
+    const tracking = trackingBilling();
+    const note = String(raw['Note'] || '').trim();
+    const typeInput = String(raw['Type'] || '').trim();
+    const amountRaw = String(raw['Amount'] || '').trim().replace(/[,\s₹]/g, '');
+    const dateRaw = String(raw['Date'] || '').trim();
+    const billedRaw = String(raw[BILLED_IMPORT_HEADER] || '').trim().toLowerCase();
 
     const issues = [];
-
     if (!note) issues.push('Missing note');
+    if (note.length > MAX_NOTE_LENGTH) issues.push('Note is too long');
 
-    // Loose type matching: strip non-alphabets, lowercase, compare against DB types normalized the same way
     let matchedType = null;
     if (!typeInput) {
         issues.push('Missing type');
     } else {
-        const inputKey = normalizeTypeKey(typeInput);
-        matchedType = validTypes.find(t => normalizeTypeKey(t) === inputKey) || null;
-        if (!matchedType) issues.push(`Unknown type "${typeInput}"`);
+        const key = normalizeTypeKey(typeInput);
+        matchedType = validTypes.find(type => normalizeTypeKey(type) === key) || null;
+        if (!matchedType) issues.push('Unknown type "' + typeInput + '"');
     }
 
-    // Amount must be a whole number (no decimals)
     let amount = NaN;
     if (!amountRaw) {
         issues.push('Missing amount');
@@ -3728,17 +4808,18 @@ function validateImportRow(raw, validTypes) {
     } else {
         amount = parseInt(amountRaw, 10);
         if (amount <= 0) issues.push('Invalid amount');
-        if (amount > 1000000) issues.push('Amount exceeds ₹10,00,000');
+        else if (amount > MAX_AMOUNT) issues.push('Amount exceeds ₹10,00,000');
     }
 
-    // Date must be DD/MM/YYYY
     const isoDate = parseDDMMYYYY(dateRaw);
     if (!isoDate) issues.push('Invalid date (use DD/MM/YYYY)');
 
-    let billed = null;
-    if (billedRaw === 'billed') billed = true;
-    else if (billedRaw === 'unbilled') billed = false;
-    else issues.push('Billed/Unbilled must be "Billed" or "Unbilled"');
+    let billed = false;
+    if (tracking) {
+        if (billedRaw === 'billed') billed = true;
+        else if (billedRaw === 'unbilled') billed = false;
+        else issues.push('Billed/Unbilled must be "Billed" or "Unbilled"');
+    }
 
     return {
         note,
@@ -3753,29 +4834,31 @@ function validateImportRow(raw, validTypes) {
 }
 
 function showImportReview(rows) {
-    document.getElementById('import-step-progress').style.display = 'none';
-    document.getElementById('import-step-review').style.display = 'block';
+    show('import-step-progress', false);
+    show('import-step-review', true, 'block');
 
-    const validCount = rows.filter(r => r.valid).length;
+    const tracking = trackingBilling();
+    const validCount = rows.filter(row => row.valid).length;
     const failedCount = rows.length - validCount;
 
-    document.getElementById('import-summary-banner').textContent =
-        `${rows.length} row(s) read — ${validCount} valid, ${failedCount} failed.`;
+    setText('import-summary-banner',
+        `${rows.length} row(s) read — ${validCount} valid, ${failedCount} failed.`);
 
-    const tbody = document.getElementById('import-preview-body');
-    tbody.innerHTML = rows.map(r => `
-        <tr class="${r.valid ? '' : 'row-invalid'}">
-            <td><span class="import-row-status ${r.valid ? 'valid' : 'invalid'}">${r.valid ? '✓ Valid' : '✕ Failed'}</span></td>
-            <td>${escapeHtml(r.note)}</td>
-            <td>${escapeHtml(r.type)}</td>
-            <td>${isNaN(r.amount) ? '-' : '₹' + r.amount}</td>
-            <td>${escapeHtml(r.displayDate || r.date)}</td>
-            <td>${r.billed === null ? '-' : (r.billed ? 'Billed' : 'Unbilled')}</td>
-            <td style="color:#dc2626; font-size:0.8rem;">${escapeHtml(r.issues.join(', '))}</td>
-        </tr>
-    `).join('');
+    $('import-preview-body').innerHTML = rows.map(row => `
+        <tr class="${row.valid ? '' : 'row-invalid'}">
+            <td><span class="import-row-status ${row.valid ? 'valid' : 'invalid'}">${row.valid ? '✓ Valid' : '✕ Failed'}</span></td>
+            <td>${esc(row.note)}</td>
+            <td>${esc(row.type)}</td>
+            <td>${isNaN(row.amount) ? '—' : esc(moneyShort(row.amount))}</td>
+            <td>${esc(row.displayDate || row.date)}</td>
+            <td class="col-billed"${tracking ? '' : ' style="display:none"'}>${row.billed ? 'Billed' : 'Unbilled'}</td>
+            <td style="color:var(--red-ink);font-size:.8rem;">${esc(row.issues.join(', '))}</td>
+        </tr>`).join('');
 
-    const confirmBtn = document.getElementById('confirm-import-btn');
+    document.querySelectorAll('.import-preview-table .col-billed')
+        .forEach(cell => { cell.style.display = tracking ? '' : 'none'; });
+
+    const confirmBtn = $('confirm-import-btn');
     confirmBtn.disabled = validCount === 0;
     confirmBtn.textContent = validCount === 0
         ? 'No valid rows to upload'
@@ -3787,65 +4870,68 @@ function cancelImportReview() {
 }
 
 async function confirmImportUpload() {
-    const rowsToInsert = importValidRows.filter(r => r.valid).map(r => ({
+    const toInsert = importValidRows.filter(row => row.valid).map(row => ({
         user_id: currentUser.id,
-        amount: r.amount,
-        date: r.date,
-        type: r.type,
-        note: r.note,
-        billed: r.billed
+        amount: row.amount,
+        date: row.date,
+        type: row.type,
+        note: row.note,
+        billed: trackingBilling() ? row.billed : false
     }));
+    if (!toInsert.length) return;
 
-    if (!rowsToInsert.length) return;
-
-    const confirmBtn = document.getElementById('confirm-import-btn');
+    const confirmBtn = $('confirm-import-btn');
     confirmBtn.disabled = true;
     confirmBtn.textContent = 'Uploading…';
 
     try {
-        const { error } = await supabase.from('expenses').insert(rowsToInsert);
-        if (error) throw error;
+        // Chunked so a large import doesn't hit request-size limits.
+        const size = 200;
+        for (let i = 0; i < toInsert.length; i += size) {
+            const { error } = await supabase.from('expenses').insert(toInsert.slice(i, i + size));
+            if (error) throw error;
+        }
 
-        const failedCount = importValidRows.length - rowsToInsert.length;
-
-        document.getElementById('import-step-review').style.display = 'none';
-        document.getElementById('import-step-done').style.display = 'block';
-        document.getElementById('import-done-title').textContent = 'Import complete';
-        document.getElementById('import-done-summary').textContent =
-            `${rowsToInsert.length} expense(s) imported successfully` +
-            (failedCount > 0 ? `, ${failedCount} row(s) were skipped due to errors.` : '.');
+        const failedCount = importValidRows.length - toInsert.length;
+        show('import-step-review', false);
+        show('import-step-done', true, 'block');
+        setText('import-done-title', 'Import complete');
+        setText('import-done-summary',
+            toInsert.length + ' expense(s) imported successfully' +
+            (failedCount > 0 ? ', ' + failedCount + ' row(s) skipped due to errors.' : '.'));
 
         await Promise.all([loadExpenses(), updateStatistics(), updateBudgetDisplay()]);
-        loadRecentTypeBubbles();
-        showNotification(`${rowsToInsert.length} expenses imported!`, 'success');
+        await loadRecentActivity();
+        await checkBudgetWarnings();
+        showNotification(toInsert.length + ' expenses imported', 'success');
     } catch (error) {
         console.error('Import upload error:', error);
         showAlert('import-alert', 'Failed to upload expenses: ' + error.message, 'error');
-        document.getElementById('import-step-review').style.display = 'block';
-        document.getElementById('import-step-done').style.display = 'none';
+        show('import-step-review', true, 'block');
+        show('import-step-done', false);
         confirmBtn.disabled = false;
         confirmBtn.textContent = 'Retry Upload';
     }
 }
 
-function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
-
-document.addEventListener('DOMContentLoaded', initImportExpensesUI);
+/* =====================================================================
+   Misc listeners
+   ===================================================================== */
 
 window.addEventListener('resize', debounce(() => {
-    if (document.getElementById('recent-types-row').style.display !== 'none') {
-        loadRecentTypeBubbles();
-    }
-}, 300));
+    const row = $('recent-types-row');
+    if (row && row.style.display !== 'none') loadRecentTypeBubbles();
+}, 250));
 
-function debounce(fn, delay) {
-    let timer;
-    return (...args) => {
-        clearTimeout(timer);
-        timer = setTimeout(() => fn(...args), delay);
+// Follow the OS theme when the user hasn't chosen one explicitly.
+if (localStorage.getItem('darkMode') === null && window.matchMedia) {
+    const query = window.matchMedia('(prefers-color-scheme: dark)');
+    isDarkMode = query.matches;
+    const onChange = event => {
+        if (localStorage.getItem('darkMode') !== null) return;
+        isDarkMode = event.matches;
+        applyTheme();
     };
+    if (query.addEventListener) query.addEventListener('change', onChange);
+    else if (query.addListener) query.addListener(onChange);
 }
