@@ -1,12 +1,12 @@
 {
     "name": "expense-tracker",
-    "version": "1.1.0",
-    "description": "Expense tracker with billed/unbilled budgets, analytics and CSV/Excel import-export",
+    "version": "1.2.0",
+    "description": "Offline-capable expense tracker with receipt scanning, billed/unbilled budgets, analytics, Excel import-export and an admin panel",
     "scripts": {
         "dev": "python3 -m http.server 8000",
         "start": "python3 -m http.server 8000",
         "validate": "node tests/validate.js",
-        "test": "node tests/validate.js && node tests/smoke.js"
+        "test": "node tests/validate.js && node tests/scan.test.js && node tests/smoke.js"
     },
     "devDependencies": {
         "puppeteer-core": "^24.0.0"

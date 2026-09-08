@@ -13,6 +13,11 @@
     mv script_temp.js script.js
   """
 
+# The receipt scanner's cloud reader. Unconfigured (no GEMINI_API_KEY), it
+# returns 501 and the app falls back to reading on the device.
+[functions]
+  directory = "netlify/functions"
+
 [build.environment]
   NODE_VERSION = "18"
   SECRETS_SCAN_ENABLED = "false"
@@ -28,7 +33,7 @@
     X-Content-Type-Options = "nosniff"
     X-XSS-Protection = "1; mode=block"
     Referrer-Policy = "strict-origin-when-cross-origin"
-    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://*.supabase.co https://*.workers.dev; font-src 'self' data:;"
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' blob: https://*.supabase.co https://*.workers.dev https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; font-src 'self' data:;"
 
 # index.html must never be served stale: it is what points at the versioned
 # script.js / style.css.
@@ -36,6 +41,14 @@
   for = "/index.html"
   [headers.values]
     Cache-Control = "public, max-age=0, must-revalidate"
+
+# The service worker must never be served stale, or a deploy cannot replace
+# the shell it caches — the browser would keep handing out the old one.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+    Service-Worker-Allowed = "/"
 
 # Test files are not part of the app.
 [[redirects]]

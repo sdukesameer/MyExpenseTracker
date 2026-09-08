@@ -533,7 +533,9 @@ const MODAL_CLOSERS = {
     'import-expenses-modal': closeImportExpensesModal,
     'settings-modal': closeSettingsModal,
     'recurring-modal': closeRecurringModal,
-    'change-password-modal': closeChangePasswordModal
+    'change-password-modal': closeChangePasswordModal,
+    'scan-modal': closeScanModal,
+    'admin-modal': closeAdminModal
 };
 
 function closeTopModal() {
@@ -711,6 +713,8 @@ document.addEventListener('DOMContentLoaded', async function () {
     renderAmountChips();
     initImportExpensesUI();
     wireForms();
+    registerServiceWorker();
+    wireOfflineHandling();
     handleSecureEmailLink();
     handleEmailChangeConfirmation();
 
@@ -778,6 +782,16 @@ function wireForms() {
     $('delete-type-form').addEventListener('submit', handleDeleteType);
     $('change-password-form').addEventListener('submit', handleChangePassword);
     $('edit-profile-form').addEventListener('submit', handleEditProfile);
+    $('profile-password-form').addEventListener('submit', handleProfilePasswordChange);
+
+    // The analytics filters used to need an Apply button. They now re-run
+    // themselves — debounced, because a date input fires `change` on every
+    // arrow-key nudge through a month and each run is a round trip.
+    const rerunFilter = debounce(applyDateFilter, 250);
+    ['start-date', 'end-date', 'type-filter', 'billing-filter'].forEach(id => {
+        const field = $(id);
+        if (field) field.addEventListener('change', rerunFilter);
+    });
     $('budget-form').addEventListener('submit', handleBudgetSubmit);
     $('search-input').addEventListener('input', debounce(performSearch, 180));
     $('recurring-form').addEventListener('submit', handleRecurringSubmit);
@@ -1001,18 +1015,22 @@ async function showForcedPasswordChange() {
     $('new-password').focus();
 }
 
-async function handleChangePassword(event) {
-    event.preventDefault();
-    const newPassword = $('new-password').value;
-    const confirmNewPassword = $('confirm-new-password').value;
-
-    if (newPassword !== confirmNewPassword) {
-        showAlert('change-password-alert', 'New passwords do not match.', 'error');
-        return;
+/**
+ * Setting a new password, shared by the two places that can do it: the
+ * recovery modal (which the PASSWORD_RECOVERY flow forces open and which
+ * cannot be dismissed), and the section inside Edit Profile. Same rules and
+ * the same Supabase call either way — only where the message lands differs.
+ *
+ * Returns true when the password actually changed.
+ */
+async function applyNewPassword(newPassword, confirmPassword, alertId) {
+    if (newPassword !== confirmPassword) {
+        showAlert(alertId, 'New passwords do not match.', 'error');
+        return false;
     }
     if (newPassword.length < 6) {
-        showAlert('change-password-alert', 'Password must be at least 6 characters long.', 'error');
-        return;
+        showAlert(alertId, 'Password must be at least 6 characters long.', 'error');
+        return false;
     }
 
     try {
@@ -1025,27 +1043,41 @@ async function handleChangePassword(event) {
                     { onConflict: 'user_id' });
         }
 
-        showAlert('change-password-alert', 'Password changed successfully!', 'success');
-
-        if (isPasswordResetFlow) {
-            setTimeout(() => {
-                isPasswordResetFlow = false;
-                closeChangePasswordModal();
-                showDashboard();
-                showNotification('Password updated. You can now use your account.', 'success');
-            }, 1400);
-        } else {
-            setTimeout(() => closeChangePasswordModal(), 1600);
-        }
+        showAlert(alertId, 'Password changed successfully!', 'success');
+        return true;
     } catch (error) {
-        showAlert('change-password-alert', error.message, 'error');
+        showAlert(alertId, error.message, 'error');
+        return false;
     }
 }
 
-function showChangePassword() {
-    openModal('change-password-modal');
-    // NOTE: focus the field that actually exists on this form.
-    $('new-password').focus();
+async function handleChangePassword(event) {
+    event.preventDefault();
+    const ok = await applyNewPassword($('new-password').value,
+        $('confirm-new-password').value, 'change-password-alert');
+    if (!ok) return;
+
+    if (isPasswordResetFlow) {
+        setTimeout(() => {
+            isPasswordResetFlow = false;
+            closeChangePasswordModal();
+            showDashboard();
+            showNotification('Password updated. You can now use your account.', 'success');
+        }, 1400);
+    } else {
+        setTimeout(() => closeChangePasswordModal(), 1600);
+    }
+}
+
+// The Edit Profile copy. It stays open afterwards — you may well have come in
+// to change your name too — so it just clears the fields.
+async function handleProfilePasswordChange(event) {
+    event.preventDefault();
+    const ok = await applyNewPassword($('profile-new-password').value,
+        $('profile-confirm-password').value, 'profile-password-alert');
+    if (!ok) return;
+    $('profile-password-form').reset();
+    showNotification('Password updated', 'success');
 }
 
 function closeChangePasswordModal() {
@@ -1066,6 +1098,8 @@ function closeChangePasswordModal() {
 }
 
 async function logout() {
+    isAdminUser = false;
+    show('admin-menu-item', false);
     try {
         const { error } = await supabase.auth.signOut();
         if (error) console.error('Logout error:', error);
@@ -1091,6 +1125,11 @@ async function logout() {
 
 async function showDashboard() {
     if (!currentUser) return;
+
+    // Anything queued on a previous visit goes now, before the dashboard is
+    // painted from figures that would otherwise be missing it.
+    flushOutbox({ quiet: true });
+    refreshAdminFlag();
 
     try {
         const { data } = await supabase
@@ -1852,7 +1891,7 @@ async function submitQuickAdd() {
             amount: parsed.amount, note: parsed.note,
             type: parsed.type, date: todayISO(),
             billed: trackingBilling() && settings.defaultBilled === true
-        }, 'Added ' + money(parsed.amount) + ' · ' + parsed.type);
+        }, 'Added ' + money(parsed.amount) + ' · ' + parsed.type, { warnDuplicate: true });
         if (saved) {
             input.value = '';
             updateQuickAddPreview();
@@ -1905,10 +1944,11 @@ function renderPresetChips() {
 async function applyPreset(index) {
     const preset = quickAddModel.presets[index];
     if (!preset) return;
+    // A one-tap chip is the easiest thing in the app to press twice.
     await createExpense({
         amount: preset.amount, note: preset.note, type: preset.type,
         date: todayISO(), billed: trackingBilling() ? preset.billed : false
-    }, 'Added ' + money(preset.amount) + ' · ' + preset.type);
+    }, 'Added ' + money(preset.amount) + ' · ' + preset.type, { warnDuplicate: true });
 }
 
 function setDateOffset(days) {
@@ -1968,16 +2008,60 @@ function resetBillingToggle() {
 }
 
 /**
+ * Same amount, same type, same day — almost always a double tap on Add, or
+ * the same receipt entered twice from two devices. Returns the offending row
+ * so the warning can name it, or null.
+ *
+ * Deliberately narrow: the note is not compared, because the whole point is
+ * to catch the entry you have forgotten you already made, which you will not
+ * have worded identically. Two genuine ₹40 chais on one day are the false
+ * positive we accept, and the prompt lets them straight through.
+ */
+async function findSameDayDuplicate(fields) {
+    if (!currentUser) return null;
+    try {
+        const { data, error } = await supabase
+            .from('expenses').select('id, note, amount, type, date')
+            .eq('user_id', currentUser.id)
+            .eq('date', fields.date)
+            .eq('type', fields.type)
+            .eq('amount', fields.amount)
+            .limit(1);
+        if (error) throw error;
+        return (data && data[0]) || null;
+    } catch (error) {
+        // A warning that cannot be looked up must never block the write.
+        console.error('Duplicate check failed:', error);
+        return null;
+    }
+}
+
+/**
  * The single write path for new expenses: validates, inserts, refreshes
  * every dependent view, and offers an undo. Used by the form, the quick-add
  * box, presets and recurring.
+ *
+ * `opts.warnDuplicate` asks for the same-day check first. It is opt-in
+ * because three of the callers repeat an expense on purpose — Repeat this
+ * expense, a recurring rule, a CSV import — and being asked "are you sure?"
+ * about the thing you just explicitly requested is noise, not a safeguard.
  */
-async function createExpense(fields, successMessage) {
+async function createExpense(fields, successMessage, opts) {
     const errors = validateExpenseInput(fields.amount, fields.type, fields.note);
     if (!fields.date || !splitISO(fields.date)) errors.push('A valid date is required');
     if (errors.length) {
         showNotification(errors[0], 'error');
         return null;
+    }
+
+    if (opts && opts.warnDuplicate) {
+        const clash = await findSameDayDuplicate(fields);
+        if (clash && !confirm(
+            'You already logged ' + money(clash.amount) + ' of ' + clash.type +
+            ' on ' + formatDate(clash.date) + ' — "' + (clash.note || 'no description') +
+            '".\n\nAdd this one as well?')) {
+            return null;
+        }
     }
 
     try {
@@ -2001,6 +2085,23 @@ async function createExpense(fields, successMessage) {
             row ? { label: 'Undo', onClick: () => deleteExpense(row.id, false, true) } : null);
         return row || true;
     } catch (error) {
+        // No network is not a failure to report — it is a write to hold on
+        // to. Anything the server actually refused still surfaces as an error,
+        // because queueing a row the database rejected would only fail again.
+        if (isOfflineError(error)) {
+            try {
+                const queued = await queueExpense(fields, currentUser.id);
+                await refreshAfterMutation();
+                showNotification('Saved on this device — it will sync when you reconnect',
+                    'warning', 5000);
+                return { id: queued.id, pending: true };
+            } catch (queueError) {
+                console.error('Could not queue offline expense:', queueError);
+                showNotification('You are offline and this device cannot hold the ' +
+                    'expense. Try again when you have a connection.', 'error');
+                return null;
+            }
+        }
         console.error('Add expense error:', error);
         showNotification('Failed to add expense: ' + error.message, 'error');
         return null;
@@ -2024,7 +2125,7 @@ async function handleAddExpense(event) {
 
     button.disabled = true;
     try {
-        const saved = await createExpense(fields);
+        const saved = await createExpense(fields, null, { warnDuplicate: true });
         if (!saved) return;
 
         $('expense-form').reset();
@@ -2052,13 +2153,18 @@ async function loadExpenses() {
     if (!container || !currentUser) return;
 
     const limit = parseInt(($('recent-limit') || {}).value, 10) || 5;
+    // Queued rows always come first and are never trimmed by the limit: they
+    // are the ones you cannot see anywhere else.
+    const pending = await pendingExpenses(currentUser.id);
 
     try {
-        const { data, error } = await supabase
+        const { data: saved, error } = await supabase
             .from('expenses').select('*')
             .order('updated_at', { ascending: false })
             .limit(limit);
         if (error) throw error;
+
+        const data = pending.concat(saved || []);
 
         if (!data.length) {
             container.innerHTML =
@@ -2067,34 +2173,37 @@ async function loadExpenses() {
             return;
         }
 
-        container.innerHTML = data.map(expense => `
-            <div class="expense-item" data-id="${attr(expense.id)}">
-                <div class="expense-details">
-                    <div class="expense-amount">${esc(money(expense.amount))}</div>
-                    <div class="expense-note">${esc(expense.note) || 'No description'}</div>
-                    <div class="expense-meta">
-                        ${typeBadge(expense.type)}
-                        ${billingBadge(expense.billed)}
-                        <span>${esc(formatDate(expense.date))}</span>
-                    </div>
-                </div>
-                <div class="expense-actions">
-                    <button class="icon-btn tone-indigo" type="button" title="Repeat this expense today"
-                        aria-label="Repeat this expense today"
-                        onclick="duplicateExpense('${attr(expense.id)}')">
-                        <svg class="icon"><use href="#i-copy" /></svg>
-                    </button>
-                    <button class="icon-btn tone-red" type="button" title="Delete expense"
-                        aria-label="Delete expense"
-                        onclick="deleteExpense('${attr(expense.id)}', true)">
-                        <svg class="icon"><use href="#i-trash" /></svg>
-                    </button>
-                </div>
-            </div>`).join('');
+        // Repeat belongs to this list only; everything else — edit in place,
+        // the billed toggle, delete — is the shared row.
+        const repeat = expense => `
+                <button class="icon-btn tone-indigo repeat-btn" type="button"
+                    title="Repeat this expense today" aria-label="Repeat this expense today"
+                    onclick="duplicateExpense('${attr(expense.id)}')">
+                    <svg class="icon"><use href="#i-copy" /></svg>
+                </button>`;
+
+        container.innerHTML =
+            data.map(expense => expenseItemMarkup(expense, 'recent', repeat(expense))).join('') +
+            `<div style="display:flex;justify-content:flex-end;margin-top:0.75rem;">
+                <button class="save-changes-btn" type="button" data-save-scope="recent"
+                    onclick="saveAllChanges('recent')">Save Changes</button>
+            </div>`;
 
         container._rows = data;
+        // The list was just redrawn from scratch, so anything half-edited in
+        // it is gone from the DOM; drop the records rather than orphan them.
+        clearPendingEdits('recent');
     } catch (error) {
         console.error('Failed to load expenses:', error);
+        // Offline with something queued: showing "could not load" over the top
+        // of an expense you just added is how people conclude it was lost.
+        if (pending.length) {
+            container.innerHTML =
+                '<div class="offline-note">Offline — showing what is waiting to sync.</div>' +
+                pending.map(expense => expenseItemMarkup(expense, 'recent')).join('');
+            container._rows = pending;
+            return;
+        }
         container.innerHTML =
             '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
             '<p>Could not load your expenses. Check your connection and try again.</p></div>';
@@ -2206,8 +2315,12 @@ async function updateStatistics() {
     if (!currentUser) return;
 
     try {
-        const { data, error } = await supabase.from('expenses').select('amount, date, billed');
+        const { data: saved, error } = await supabase.from('expenses').select('amount, date, billed');
         if (error) throw error;
+
+        // Anything queued offline is money already spent; leaving it out makes
+        // the dashboard disagree with the list directly beneath it.
+        const data = saved.concat(await pendingExpenses(currentUser.id));
 
         const { year, month } = todayParts();
         const thisMonth = monthBounds(year, month);
@@ -2511,13 +2624,16 @@ async function updateBudgetDisplay() {
         const { year, month } = todayParts();
         const bounds = monthBounds(year, month);
 
-        const { data, error } = await supabase
+        const { data: saved, error } = await supabase
             .from('expenses')
             .select('amount, billed')
             .eq('user_id', currentUser.id)
             .gte('date', bounds.first)
             .lte('date', bounds.last);
         if (error) throw error;
+
+        const data = saved.concat((await pendingExpenses(currentUser.id))
+            .filter(row => withinRange(row.date, bounds.first, bounds.last)));
 
         let billedSpent = 0, unbilledSpent = 0;
         for (const expense of data) {
@@ -3013,8 +3129,7 @@ function closeVisualizationModal() {
         currentChart.destroy();
         currentChart = null;
     }
-    editedExpenses.clear();
-    expenseEdits = {};
+    clearPendingEdits('filtered');
 }
 
 async function loadTypesForFilter() {
@@ -3091,8 +3206,7 @@ async function applyDateFilter() {
         showNotification('Could not load expenses for that filter.', 'error');
     }
 
-    editedExpenses.clear();
-    expenseEdits = {};
+    clearPendingEdits('filtered');
     updateChart(currentChartType);
     showExpenseList();
 }
@@ -3324,34 +3438,8 @@ function showExpenseList() {
     }
 
     const total = filteredExpenses.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
-    const rows = filteredExpenses.map(expense => `
-        <div class="expense-item" data-id="${attr(expense.id)}">
-            <div class="expense-details">
-                <div class="expense-amount" data-original="${attr(expense.amount)}">${esc(money(expense.amount))}</div>
-                <div class="expense-note" data-original="${attr(expense.note || '')}">${esc(expense.note) || 'No description'}</div>
-                <div class="expense-meta">
-                    <span class="expense-type" data-original="${attr(expense.type)}" style="${typeStyleAttr(expense.type)}">${esc(expense.type)}</span>
-                    <span class="billed-status" data-billed="${attr(expense.billed)}">${billingBadge(expense.billed)}</span>
-                    <span class="expense-date" data-original="${attr(expense.date)}">${esc(formatDate(expense.date))}</span>
-                </div>
-            </div>
-            <div class="expense-actions">
-                <div class="edit-toggle-container" id="edit-container-${attr(expense.id)}">
-                    <div class="billed-toggle ${expense.billed ? 'active' : ''}"
-                        onclick="toggleBillingStatus('${attr(expense.id)}')"></div>
-                </div>
-                <button class="icon-btn tone-indigo" type="button" id="edit-icon-${attr(expense.id)}"
-                    title="Edit expense" aria-label="Edit expense"
-                    onclick="toggleEditMode('${attr(expense.id)}')">
-                    <svg class="icon"><use href="#i-pencil" /></svg>
-                </button>
-                <button class="icon-btn tone-red" type="button" id="delete-btn-${attr(expense.id)}"
-                    title="Delete expense" aria-label="Delete expense"
-                    onclick="deleteFilteredExpense('${attr(expense.id)}')">
-                    <svg class="icon"><use href="#i-trash" /></svg>
-                </button>
-            </div>
-        </div>`).join('');
+    const rows = filteredExpenses
+        .map(expense => expenseItemMarkup(expense, 'filtered')).join('');
 
     mount.innerHTML = `
         <div class="expense-list-container">
@@ -3359,7 +3447,8 @@ function showExpenseList() {
             <div class="expense-list-scroll">${rows}</div>
             <div class="list-total"><span class="expense-total">Total: ${esc(money(total))}</span></div>
             <div style="display:flex;justify-content:flex-end;margin-top:1rem;">
-                <button class="save-changes-btn" type="button" onclick="saveAllChanges()">Save Changes</button>
+                <button class="save-changes-btn" type="button" data-save-scope="filtered"
+                    onclick="saveAllChanges('filtered')">Save Changes</button>
             </div>
         </div>`;
 
@@ -3370,13 +3459,43 @@ function setIcon(button, symbolId) {
     button.innerHTML = '<svg class="icon"><use href="#' + symbolId + '" /></svg>';
 }
 
-/**
- * The dashboard list and the analytics list both carry data-id, so every
- * edit-mode lookup must be scoped to the analytics list or it can grab
- * the wrong row.
- */
-function filteredRow(expenseId) {
-    const mount = $('filtered-list-mount');
+/* ---------------------------------------------------------------------
+   Inline editing, in both lists
+
+   Two lists show expenses and both can be edited in place: Recent Expenses
+   on the dashboard, and the filtered list inside Analytics. They can show
+   the *same* expense at the same time, so nothing below may be keyed on the
+   expense id alone — every lookup, every element id and every pending-edit
+   record carries the scope that owns the row. Getting this wrong meant a
+   click in one list silently rewrote the other.
+   --------------------------------------------------------------------- */
+
+const EDIT_SCOPES = {
+    recent: {
+        mount: 'expenses-container',
+        rows: () => (($('expenses-container') || {})._rows) || [],
+        remove: id => deleteExpense(id, true)
+    },
+    filtered: {
+        mount: 'filtered-list-mount',
+        rows: () => filteredExpenses,
+        remove: id => deleteFilteredExpense(id)
+    }
+};
+
+function editKey(scope, expenseId) { return scope + ':' + expenseId; }
+
+// Forget one list's half-finished edits, leaving the other list's alone.
+function clearPendingEdits(scope) {
+    Array.from(editedExpenses)
+        .filter(key => key.indexOf(scope + ':') === 0)
+        .forEach(key => { editedExpenses.delete(key); delete expenseEdits[key]; });
+    updateSaveButton();
+}
+
+function expenseRow(scope, expenseId) {
+    const spec = EDIT_SCOPES[scope];
+    const mount = spec && $(spec.mount);
     if (!mount) return null;
     const wanted = String(expenseId);
     const rows = mount.querySelectorAll('[data-id]');
@@ -3386,38 +3505,114 @@ function filteredRow(expenseId) {
     return null;
 }
 
-async function createEditableElements(expenseId, expense) {
-    const item = filteredRow(expenseId);
+function expenseInScope(scope, expenseId) {
+    return EDIT_SCOPES[scope].rows()
+        .find(row => String(row.id) === String(expenseId)) || null;
+}
+
+/**
+ * One row of an expense list. Both lists render the same shape — the
+ * data-original attributes are what edit mode reads the pre-edit values back
+ * out of, so a row without them cannot be edited or cancelled.
+ *
+ * `leading` is markup for any extra action button that belongs to this list
+ * alone, such as Repeat on the dashboard.
+ */
+function expenseItemMarkup(expense, scope, leading) {
+    const id = attr(expense.id);
+
+    // A queued expense has no database row yet, so there is nothing to edit,
+    // repeat or bin — only to wait for, or to throw away before it goes.
+    if (expense.pending) {
+        return `
+        <div class="expense-item is-pending" data-id="${id}">
+            <div class="expense-details">
+                <div class="expense-amount">${esc(money(expense.amount))}</div>
+                <div class="expense-note">${esc(expense.note) || 'No description'}</div>
+                <div class="expense-meta">
+                    <span class="expense-type" style="${typeStyleAttr(expense.type)}">${esc(expense.type)}</span>
+                    <span class="pending-badge">PENDING</span>
+                    <span class="expense-date">${esc(formatDate(expense.date))}</span>
+                </div>
+            </div>
+            <div class="expense-actions">
+                <button class="icon-btn tone-red" type="button"
+                    title="Discard this queued expense" aria-label="Discard this queued expense"
+                    onclick="discardQueued('${id}')">
+                    <svg class="icon"><use href="#i-trash" /></svg>
+                </button>
+            </div>
+        </div>`;
+    }
+
+    return `
+        <div class="expense-item" data-id="${id}">
+            <div class="expense-details">
+                <div class="expense-amount" data-original="${attr(expense.amount)}">${esc(money(expense.amount))}</div>
+                <div class="expense-note" data-original="${attr(expense.note || '')}">${esc(expense.note) || 'No description'}</div>
+                <div class="expense-meta">
+                    <span class="expense-type" data-original="${attr(expense.type)}" style="${typeStyleAttr(expense.type)}">${esc(expense.type)}</span>
+                    <span class="billed-status" data-billed="${attr(expense.billed)}">${billingBadge(expense.billed)}</span>
+                    <span class="expense-date" data-original="${attr(expense.date)}">${esc(formatDate(expense.date))}</span>
+                </div>
+            </div>
+            <div class="expense-actions">
+                <div class="edit-toggle-container" id="edit-container-${attr(scope)}-${id}">
+                    <div class="billed-toggle ${expense.billed ? 'active' : ''}"
+                        onclick="toggleBillingStatus('${attr(scope)}', '${id}')"></div>
+                </div>
+                ${leading || ''}
+                <button class="icon-btn tone-indigo" type="button" id="edit-icon-${attr(scope)}-${id}"
+                    title="Edit expense" aria-label="Edit expense"
+                    onclick="toggleEditMode('${attr(scope)}', '${id}')">
+                    <svg class="icon"><use href="#i-pencil" /></svg>
+                </button>
+                <button class="icon-btn tone-red" type="button" id="delete-btn-${attr(scope)}-${id}"
+                    title="Delete expense" aria-label="Delete expense"
+                    onclick="removeExpenseFrom('${attr(scope)}', '${id}')">
+                    <svg class="icon"><use href="#i-trash" /></svg>
+                </button>
+            </div>
+        </div>`;
+}
+
+function removeExpenseFrom(scope, expenseId) {
+    EDIT_SCOPES[scope].remove(expenseId);
+}
+
+async function createEditableElements(scope, expenseId) {
+    const item = expenseRow(scope, expenseId);
     if (!item) return;
+    const key = attr(scope) + "', '" + attr(expenseId);
 
     const amountEl = item.querySelector('.expense-amount');
     amountEl.innerHTML = `<input type="number" step="0.01" min="0" max="${MAX_AMOUNT}"
         value="${attr(parseFloat(amountEl.dataset.original))}" inputmode="decimal"
-        oninput="trackExpenseChange('${attr(expenseId)}')">`;
+        oninput="trackExpenseChange('${key}')">`;
 
     const noteEl = item.querySelector('.expense-note');
     noteEl.innerHTML = `<input type="text" value="${attr(noteEl.dataset.original)}"
         placeholder="Add description…" maxlength="${MAX_NOTE_LENGTH}"
-        oninput="trackExpenseChange('${attr(expenseId)}')">`;
+        oninput="trackExpenseChange('${key}')">`;
 
     const typeEl = item.querySelector('.expense-type');
     const originalType = typeEl.dataset.original;
     const types = await loadTypesForEdit();
     if (types.indexOf(originalType) === -1) types.unshift(originalType);
-    typeEl.innerHTML = `<select onchange="trackExpenseChange('${attr(expenseId)}')">
+    typeEl.innerHTML = `<select onchange="trackExpenseChange('${key}')">
         ${types.map(name =>
         `<option value="${attr(name)}"${name === originalType ? ' selected' : ''}>${esc(name)}</option>`
     ).join('')}</select>`;
 
     const dateEl = item.querySelector('.expense-date');
     dateEl.innerHTML = `<input type="date" value="${attr(dateEl.dataset.original)}"
-        onchange="trackExpenseChange('${attr(expenseId)}')">`;
+        onchange="trackExpenseChange('${key}')">`;
 }
 
-function restoreStaticElements(expenseId) {
-    const item = filteredRow(expenseId);
+function restoreStaticElements(scope, expenseId) {
+    const item = expenseRow(scope, expenseId);
     if (!item) return;
-    const edits = expenseEdits[expenseId] || {};
+    const edits = expenseEdits[editKey(scope, expenseId)] || {};
 
     const amountEl = item.querySelector('.expense-amount');
     const amount = edits.amount !== undefined ? edits.amount : parseFloat(amountEl.dataset.original);
@@ -3437,14 +3632,17 @@ function restoreStaticElements(expenseId) {
     dateEl.textContent = formatDate(date);
 }
 
-function ensureEditRecord(expenseId) {
-    if (expenseEdits[expenseId]) return expenseEdits[expenseId];
+function ensureEditRecord(scope, expenseId) {
+    const key = editKey(scope, expenseId);
+    if (expenseEdits[key]) return expenseEdits[key];
 
-    const item = filteredRow(expenseId);
+    const item = expenseRow(scope, expenseId);
     if (!item) return null;
 
     const billedEl = item.querySelector('.billed-status');
-    expenseEdits[expenseId] = {
+    expenseEdits[key] = {
+        id: expenseId,
+        scope: scope,
         originalAmount: parseFloat(item.querySelector('.expense-amount').dataset.original),
         originalNote: item.querySelector('.expense-note').dataset.original,
         originalType: item.querySelector('.expense-type').dataset.original,
@@ -3452,11 +3650,12 @@ function ensureEditRecord(expenseId) {
         originalBilled: billedEl.dataset.billed === 'true',
         billed: billedEl.dataset.billed === 'true'
     };
-    return expenseEdits[expenseId];
+    return expenseEdits[key];
 }
 
-function recomputeDirty(expenseId) {
-    const record = expenseEdits[expenseId];
+function recomputeDirty(scope, expenseId) {
+    const key = editKey(scope, expenseId);
+    const record = expenseEdits[key];
     if (!record) return;
     const changed =
         (record.amount !== undefined && record.amount !== record.originalAmount) ||
@@ -3465,15 +3664,15 @@ function recomputeDirty(expenseId) {
         (record.date !== undefined && record.date !== record.originalDate) ||
         (record.billed !== undefined && record.billed !== record.originalBilled);
 
-    if (changed) editedExpenses.add(String(expenseId));
-    else editedExpenses.delete(String(expenseId));
+    if (changed) editedExpenses.add(key);
+    else editedExpenses.delete(key);
     updateSaveButton();
 }
 
-function trackExpenseChange(expenseId) {
-    const item = filteredRow(expenseId);
+function trackExpenseChange(scope, expenseId) {
+    const item = expenseRow(scope, expenseId);
     if (!item) return;
-    const record = ensureEditRecord(expenseId);
+    const record = ensureEditRecord(scope, expenseId);
     if (!record) return;
 
     const amountInput = item.querySelector('.expense-amount input');
@@ -3486,34 +3685,34 @@ function trackExpenseChange(expenseId) {
     if (typeSelect) record.type = typeSelect.value;
     if (dateInput) record.date = dateInput.value;
 
-    recomputeDirty(expenseId);
+    recomputeDirty(scope, expenseId);
 }
 
-function toggleBillingStatus(expenseId) {
-    const container = $('edit-container-' + expenseId);
+function toggleBillingStatus(scope, expenseId) {
+    const container = $('edit-container-' + scope + '-' + expenseId);
     const toggle = container ? container.querySelector('.billed-toggle') : null;
     if (!toggle) return;
-    const record = ensureEditRecord(expenseId);
+    const record = ensureEditRecord(scope, expenseId);
     if (!record) return;
     toggle.classList.toggle('active');
     record.billed = toggle.classList.contains('active');
-    recomputeDirty(expenseId);
+    recomputeDirty(scope, expenseId);
 }
 
-function toggleEditMode(expenseId) {
-    const container = $('edit-container-' + expenseId);
-    const editBtn = $('edit-icon-' + expenseId);
-    const deleteBtn = $('delete-btn-' + expenseId);
-    const item = filteredRow(expenseId);
+function toggleEditMode(scope, expenseId) {
+    const container = $('edit-container-' + scope + '-' + expenseId);
+    const editBtn = $('edit-icon-' + scope + '-' + expenseId);
+    const deleteBtn = $('delete-btn-' + scope + '-' + expenseId);
+    const item = expenseRow(scope, expenseId);
     if (!container || !editBtn || !deleteBtn || !item) return;
 
     const isEditing = item.classList.contains('edit-mode');
 
     if (isEditing) {
         item.classList.remove('edit-mode');
-        restoreStaticElements(expenseId);
+        restoreStaticElements(scope, expenseId);
 
-        const record = expenseEdits[expenseId];
+        const record = expenseEdits[editKey(scope, expenseId)];
         const billedEl = item.querySelector('.billed-status');
         if (record && record.billed !== undefined && billedEl) {
             billedEl.innerHTML = billingBadge(record.billed);
@@ -3523,14 +3722,14 @@ function toggleEditMode(expenseId) {
         container.style.display = 'none';
         deleteBtn.style.display = '';
 
-        if (editedExpenses.has(String(expenseId))) {
+        if (editedExpenses.has(editKey(scope, expenseId))) {
             setIcon(deleteBtn, 'i-close');
             deleteBtn.title = 'Discard changes';
-            deleteBtn.onclick = () => cancelEdit(expenseId);
+            deleteBtn.onclick = () => cancelEdit(scope, expenseId);
         } else {
             setIcon(deleteBtn, 'i-trash');
             deleteBtn.title = 'Delete expense';
-            deleteBtn.onclick = () => deleteFilteredExpense(expenseId);
+            deleteBtn.onclick = () => removeExpenseFrom(scope, expenseId);
         }
 
         setIcon(editBtn, 'i-pencil');
@@ -3538,9 +3737,8 @@ function toggleEditMode(expenseId) {
         editBtn.classList.add('tone-indigo');
     } else {
         item.classList.add('edit-mode');
-        const expense = filteredExpenses.find(e => String(e.id) === String(expenseId));
-        ensureEditRecord(expenseId);
-        createEditableElements(expenseId, expense);
+        ensureEditRecord(scope, expenseId);
+        createEditableElements(scope, expenseId);
 
         container.style.display = trackingBilling() ? 'flex' : 'none';
 
@@ -3550,23 +3748,23 @@ function toggleEditMode(expenseId) {
 
         setIcon(deleteBtn, 'i-close');
         deleteBtn.title = 'Discard changes';
-        deleteBtn.onclick = () => cancelEdit(expenseId);
+        deleteBtn.onclick = () => cancelEdit(scope, expenseId);
         deleteBtn.style.display = '';
     }
 
     updateSaveButton();
 }
 
-function cancelEdit(expenseId) {
-    const container = $('edit-container-' + expenseId);
-    const editBtn = $('edit-icon-' + expenseId);
-    const deleteBtn = $('delete-btn-' + expenseId);
-    const item = filteredRow(expenseId);
-    const expense = filteredExpenses.find(e => String(e.id) === String(expenseId));
+function cancelEdit(scope, expenseId) {
+    const container = $('edit-container-' + scope + '-' + expenseId);
+    const editBtn = $('edit-icon-' + scope + '-' + expenseId);
+    const deleteBtn = $('delete-btn-' + scope + '-' + expenseId);
+    const item = expenseRow(scope, expenseId);
+    const expense = expenseInScope(scope, expenseId);
     if (!item || !expense) return;
 
-    editedExpenses.delete(String(expenseId));
-    delete expenseEdits[expenseId];
+    editedExpenses.delete(editKey(scope, expenseId));
+    delete expenseEdits[editKey(scope, expenseId)];
     item.classList.remove('edit-mode');
 
     const amountEl = item.querySelector('.expense-amount');
@@ -3596,7 +3794,7 @@ function cancelEdit(expenseId) {
 
     setIcon(deleteBtn, 'i-trash');
     deleteBtn.title = 'Delete expense';
-    deleteBtn.onclick = () => deleteFilteredExpense(expenseId);
+    deleteBtn.onclick = () => removeExpenseFrom(scope, expenseId);
     deleteBtn.style.display = '';
 
     setIcon(editBtn, 'i-pencil');
@@ -3606,18 +3804,32 @@ function cancelEdit(expenseId) {
     updateSaveButton();
 }
 
+// Each list carries its own Save Changes button, and only shows it when that
+// list has something pending. A dirty row in Analytics must not put a live
+// Save button on the dashboard behind it.
 function updateSaveButton() {
-    const button = document.querySelector('.expense-list-container .save-changes-btn');
-    if (button) button.style.display = editedExpenses.size > 0 ? 'block' : 'none';
+    Object.keys(EDIT_SCOPES).forEach(scope => {
+        const button = document.querySelector('[data-save-scope="' + scope + '"]');
+        if (!button) return;
+        const pending = Array.from(editedExpenses)
+            .filter(key => key.indexOf(scope + ':') === 0).length;
+        button.style.display = pending > 0 ? 'block' : 'none';
+        button.textContent = pending > 1
+            ? 'Save ' + pending + ' Changes'
+            : 'Save Changes';
+    });
 }
 
-async function saveAllChanges() {
-    const button = document.querySelector('.expense-list-container .save-changes-btn');
+async function saveAllChanges(scope) {
+    const button = document.querySelector('[data-save-scope="' + scope + '"]');
     if (button) button.disabled = true;
 
+    const keys = Array.from(editedExpenses)
+        .filter(key => key.indexOf(scope + ':') === 0);
+
     try {
-        for (const expenseId of Array.from(editedExpenses)) {
-            const changes = expenseEdits[expenseId];
+        for (const key of keys) {
+            const changes = expenseEdits[key];
             if (!changes) continue;
 
             const update = {};
@@ -3643,14 +3855,16 @@ async function saveAllChanges() {
             if (Object.keys(update).length === 0) continue;
 
             const { error } = await supabase.from('expenses')
-                .update(update).eq('id', expenseId).eq('user_id', currentUser.id);
+                .update(update).eq('id', changes.id).eq('user_id', currentUser.id);
             if (error) throw error;
+
+            editedExpenses.delete(key);
+            delete expenseEdits[key];
         }
 
-        editedExpenses.clear();
-        expenseEdits = {};
-
-        await applyDateFilter();
+        // Both lists are redrawn: the same expense may be showing in the
+        // other one, still displaying the value that has just been replaced.
+        if ($('visualization-modal').classList.contains('open')) await applyDateFilter();
         await Promise.all([loadExpenses(), updateStatistics(), updateBudgetDisplay()]);
         await checkBudgetWarnings();
         showNotification('Changes saved', 'success');
@@ -3665,12 +3879,6 @@ async function saveAllChanges() {
 /* =====================================================================
    Export
    ===================================================================== */
-
-/** Escape a single CSV field per RFC 4180. */
-function csvCell(value) {
-    const text = value === null || value === undefined ? '' : String(value);
-    return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
-}
 
 async function fetchExportRows() {
     const startDate = $('start-date').value;
@@ -3797,28 +4005,9 @@ function downloadBlob(blob, filename) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function exportToCSV() {
-    try {
-        const { rows, startDate, endDate, billingFilter, typeFilter } = await fetchExportRows();
-        if (!rows.length) {
-            showNotification('No expenses to export for the selected filters.', 'warning');
-            return;
-        }
-        const matrix = await buildExportMatrix(rows, startDate, endDate);
-        // BOM keeps ₹ and other non-ASCII characters intact when Excel opens the file.
-        const csv = '﻿' + matrix.map(row => row.map(csvCell).join(',')).join('\r\n');
-        downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8;' }),
-            exportFilename(startDate, endDate, typeFilter, billingFilter, 'csv'));
-        showNotification(rows.length + ' expenses exported', 'success');
-    } catch (error) {
-        console.error('Export failed:', error);
-        showNotification('Failed to export: ' + error.message, 'error');
-    }
-}
-
 async function exportToXLSX() {
     if (typeof XLSX === 'undefined') {
-        showNotification('The spreadsheet library did not load. Try the CSV export.', 'error');
+        showNotification('The spreadsheet library did not load. Reload the page and try again.', 'error');
         return;
     }
     try {
@@ -3843,7 +4032,7 @@ async function exportToXLSX() {
 
 /**
  * Complete, restorable snapshot of everything this account owns — not the
- * filtered view the CSV export gives you.
+ * filtered view the Excel export gives you.
  */
 async function downloadFullBackup() {
     const button = $('backup-btn');
@@ -4496,6 +4685,8 @@ function currentDisplayName() {
 
 function showEditProfile() {
     $('edit-profile-alert').innerHTML = '';
+    $('profile-password-alert').innerHTML = '';
+    $('profile-password-form').reset();
     show('save-profile-btn', false);
     openModal('edit-profile-modal');
 
@@ -4511,6 +4702,8 @@ function closeEditProfileModal() {
     closeModal('edit-profile-modal');
     $('edit-profile-form').reset();
     $('edit-profile-alert').innerHTML = '';
+    $('profile-password-form').reset();
+    $('profile-password-alert').innerHTML = '';
     show('save-profile-btn', false);
 }
 

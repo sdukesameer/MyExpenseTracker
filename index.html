@@ -33,7 +33,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <script src="https://unpkg.com/@supabase/supabase-js@2.39.0/dist/umd/supabase.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-    <link href="style.css?v=1.1.0" rel="stylesheet" />
+    <link href="style.css?v=1.2.0" rel="stylesheet" />
 </head>
 
 <body>
@@ -85,6 +85,12 @@
             <symbol id="i-chart" viewBox="0 0 24 24">
                 <path d="M3 3v18h18" />
                 <path d="M7 15l4-5 3 3 5-7" />
+            </symbol>
+            <symbol id="i-receipt" viewBox="0 0 24 24">
+                <path d="M5 3.5v17l2.2-1.4 2.3 1.4 2.5-1.4 2.5 1.4 2.3-1.4L19 20.5v-17H5z" />
+                <path d="M8.5 8h7" />
+                <path d="M8.5 12h7" />
+                <path d="M8.5 16h4" />
             </symbol>
             <symbol id="i-wallet" viewBox="0 0 24 24">
                 <path d="M3 7a2 2 0 0 1 2-2h13v4" />
@@ -224,6 +230,8 @@
                 <div class="user-info-text">
                     <h2 id="user-name">Welcome Back!</h2>
                     <p id="user-email"></p>
+                    <button type="button" class="offline-chip" id="offline-chip" style="display: none;"
+                        aria-live="polite">⚡ Offline</button>
                 </div>
                 <div class="user-menu-wrap">
                     <button class="user-avatar" id="user-avatar" onclick="toggleUserMenu(event)"
@@ -244,10 +252,11 @@
                         <button class="user-menu-item" onclick="showSettingsModal(); closeUserMenu();" role="menuitem">
                             <span class="umi-icon">⚙️</span> Settings
                         </button>
-                        <button class="user-menu-item" onclick="showChangePassword(); closeUserMenu();" role="menuitem">
-                            <span class="umi-icon">🔐</span> Change Password
-                        </button>
                         <div class="user-menu-sep"></div>
+                        <button class="user-menu-item" id="admin-menu-item" style="display: none;"
+                            onclick="showAdminModal(); closeUserMenu();" role="menuitem">
+                            <span class="umi-icon">🛡️</span> Admin
+                        </button>
                         <button class="user-menu-item danger" onclick="logout(); closeUserMenu();" role="menuitem">
                             <span class="umi-icon">🚪</span> Logout
                         </button>
@@ -349,7 +358,13 @@
 
             <!-- ============ Add Expense ============ -->
             <section class="expense-form card" id="add-expense-card">
-                <h3 class="card-title">Add New Expense</h3>
+                <div class="expenses-header">
+                    <h3 class="card-title">Add New Expense</h3>
+                    <button class="btn btn-small btn-secondary" type="button" onclick="openScanModal()"
+                        title="Read a bill or order screenshot" aria-label="Scan a receipt">
+                        <svg class="icon"><use href="#i-receipt" /></svg> Scan receipt
+                    </button>
+                </div>
 
                 <div class="quick-add" id="quick-add">
                     <label class="sr-only" for="quick-add-input">Quick add</label>
@@ -644,6 +659,23 @@
                 <button class="btn btn-success" id="save-profile-btn" style="display: none;" type="submit">Save
                     Changes</button>
             </form>
+
+            <div class="form-divider"><span>or change your password</span></div>
+
+            <div id="profile-password-alert"></div>
+            <form id="profile-password-form">
+                <div class="form-group">
+                    <label for="profile-new-password">New password</label>
+                    <input autocomplete="new-password" id="profile-new-password" minlength="6" required
+                        type="password" />
+                </div>
+                <div class="form-group">
+                    <label for="profile-confirm-password">Confirm new password</label>
+                    <input autocomplete="new-password" id="profile-confirm-password" minlength="6" required
+                        type="password" />
+                </div>
+                <button class="btn" type="submit">Change Password</button>
+            </form>
         </div>
     </div>
 
@@ -893,12 +925,11 @@
                     <button type="button" class="chip" onclick="applyRangePreset('all')">All time</button>
                 </div>
                 <div class="filter-actions">
-                    <button class="btn btn-small" onclick="applyDateFilter()" type="button">Apply Filter</button>
                     <button class="btn btn-small btn-secondary" onclick="showSearchModal()" type="button">
                         <svg class="icon"><use href="#i-search" /></svg> Search
                     </button>
-                    <button class="btn btn-small btn-secondary" onclick="exportToCSV()" type="button">Export CSV</button>
                     <button class="btn btn-small btn-secondary" onclick="exportToXLSX()" type="button">Export Excel</button>
+                    <span class="filter-hint" id="filter-hint" aria-live="polite">Filters apply as you change them</span>
                 </div>
             </div>
             <div class="chart-toolbar" id="chart-toolbar">
@@ -934,7 +965,43 @@
         </div>
     </div>
 
-    <script src="script.js?v=1.1.0"></script>
+    <!-- ============ Scan Receipt Modal ============ -->
+    <div class="modal" id="scan-modal">
+        <div class="modal-content" style="max-width: 620px;">
+            <button class="close-modal" onclick="closeScanModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Scan a Receipt</h3>
+            <div id="scan-stage"></div>
+        </div>
+    </div>
+
+    <!-- ============ Admin Modal ============ -->
+    <div class="modal" id="admin-modal">
+        <div class="modal-content" style="max-width: 900px;">
+            <button class="close-modal" onclick="closeAdminModal()" aria-label="Close">
+                <svg class="icon"><use href="#i-close" /></svg>
+            </button>
+            <h3>Admin</h3>
+            <div class="chart-toolbar" id="admin-tabs">
+                <button type="button" class="seg active" data-admin-tab="people"
+                    onclick="switchAdminTab('people')">People</button>
+                <button type="button" class="seg" data-admin-tab="access"
+                    onclick="switchAdminTab('access')">Access</button>
+                <button type="button" class="seg" data-admin-tab="audit"
+                    onclick="switchAdminTab('audit')">Audit</button>
+            </div>
+            <div id="admin-body"></div>
+        </div>
+    </div>
+
+    <!-- offline.js, scan.js and admin.js load first: script.js calls into all
+         three, and MODAL_CLOSERS names their close functions without a
+         forward reference. -->
+    <script src="offline.js?v=1.2.0"></script>
+    <script src="scan.js?v=1.2.0"></script>
+    <script src="admin.js?v=1.2.0"></script>
+    <script src="script.js?v=1.2.0"></script>
 </body>
 
 </html>

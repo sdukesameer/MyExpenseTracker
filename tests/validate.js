@@ -1,7 +1,11 @@
 const fs = require('fs');
 const path = require('path').join(__dirname, '..') + '/';
 const html = fs.readFileSync(path + 'index.html', 'utf8');
-const js   = fs.readFileSync(path + 'script.js', 'utf8');
+// index.html loads several top-level scripts into one global scope, so every
+// check that reasons about "the app's JS" has to see all of them.
+const SCRIPTS = ['script.js', 'scan.js', 'offline.js', 'admin.js'];
+const sources = SCRIPTS.map(name => [name, fs.readFileSync(path + name, 'utf8')]);
+const js = sources.map(([, src]) => src).join('\n');
 const css  = fs.readFileSync(path + 'style.css', 'utf8');
 
 let problems = 0;
@@ -74,8 +78,10 @@ const banned = [
   ['CSS.escape',            'brittle selector escaping'],
 ];
 // Strip comments first: a comment naming a bad API is documentation, not a use.
-const jsCode = js.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-for (const [needle, why] of banned) if (jsCode.includes(needle)) fail(`script.js still contains "${needle}" (${why})`);
+for (const [file, src] of sources) {
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  for (const [needle, why] of banned) if (code.includes(needle)) fail(`${file} still contains "${needle}" (${why})`);
+}
 
 // ---- 7. CSS classes used by JS that must exist ----
 console.log('\n[7] key CSS classes exist');
@@ -85,7 +91,12 @@ for (const cls of ['modal-open','chart-empty','simple-mode','signed-in','skeleto
 }
 
 // ---- 8. External scripts must be allowed by the CSP ----
-console.log('\n[8] CSP allows every external script host');
+console.log('\n[8] local scripts are all covered by these checks');
+for (const m of html.matchAll(/<script src="(?!https:)([^"?]+)/g)) {
+  if (!SCRIPTS.includes(m[1])) fail(`index.html loads ${m[1]}, which tests/validate.js does not read`);
+}
+
+console.log('\n[9] CSP allows every external script host');
 const toml = fs.readFileSync(path + 'netlify.toml', 'utf8');
 for (const m of html.matchAll(/<script src="https:\/\/([^/]+)/g)) {
   if (!toml.includes(m[1])) fail(`script host ${m[1]} is not in the CSP script-src`);

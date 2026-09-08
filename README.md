@@ -6,6 +6,44 @@ A comprehensive, feature-rich expense tracking web application built with vanill
 [![GitHub Stars](https://img.shields.io/github/stars/sdukesameer/myExpenseTracker?style=for-the-badge)](https://github.com/sdukesameer/myExpenseTracker)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
+## 🆕 What's new in 1.2
+
+**New — [scan a receipt](#-receipt-scanning).** Read a Zepto/Blinkit/Instamart/
+Swiggy order screenshot into an editable list, untick what you do not want, and
+the kept lines are summed into the amount and written into the note as
+`Milk Maid ×2 + Potato ×1`.
+
+**New — [it works offline](#-offline).** There is a service worker now, so the
+app opens with no signal, and an expense added while offline is queued on the
+device and sent when the connection comes back. Queued rows show as PENDING and
+count towards the month's totals, so adding something offline no longer looks
+like it did nothing.
+
+**New — duplicate warning.** Adding an expense with the same amount, type and
+date as one already logged asks first. Only the three routes where you type an
+expense are checked; Repeat, recurring rules and CSV import are not, because
+repeating is the point of all three.
+
+**New — [an admin panel](#-admin).** Behind a flag on a real account: see
+everybody, read their expense log, block an address, close signups or make the
+app invite-only, create or invite accounts, reset a password, and sign in as
+somebody. Every action is written to an append-only audit log. Needs one
+migration and two Netlify environment variables — nothing changes until you
+run them.
+
+**Changed — edit from Recent Expenses.** Inline editing was only in Analytics.
+Both lists now use the same editor, each with its own Save button.
+
+**Changed — filters apply themselves.** The Apply Filter button is gone;
+changing a date, type or billing filter re-runs it.
+
+**Changed — one export.** Export CSV is gone. Excel keeps every format the CSV
+had, including the totals and budget rows.
+
+**Changed — Change Password moved.** It was its own item in the user menu, next
+to five other things you might actually want. It now lives inside Edit Profile,
+where you were already going to change your details.
+
 ## 🆕 What's new in 1.1
 
 **Fixed — timezone.** The dashboard used to roll over to the next day at
@@ -78,14 +116,28 @@ theme, and a set of iOS Safari fixes. See the full list at the end of this file.
 - **Session Management** - Auto-login, secure logout from all devices
 - **Security Features** - Row Level Security, input sanitization, CSRF protection
 
+### 📴 **Offline**
+- **Opens without a network** - a service worker caches the app shell
+- **Queued writes** - expenses added offline are held in IndexedDB and sent on reconnect
+- **Nothing is hidden** - queued rows show as PENDING and count towards totals and the budget
+
+### 🛡️ **Admin**
+- **See everybody** - accounts, spend, expense counts, and any one person's full log
+- **Control who may sign up** - close registration entirely, or go invite-only with an allow list
+- **Block an address** - signs them out everywhere and stops them registering again
+- **Act as somebody** - a single-use sign-in link for support, recorded in the audit log
+- **Append-only audit** - every admin action, with who did it and when
+
 ### 💳 **Expense Management** 
 - **Quick Entry Form** - Add expenses with amount, type, date, notes, and billing status
 - **Inline Editing** - Edit expense details directly in the list with real-time validation
 - **Bulk Operations** - Save multiple expense edits simultaneously
 - **Billed/Unbilled Toggle** - Track reimbursable vs personal expenses
 - **Smart Validation** - Amount limits (₹1 to ₹10,00,000), required fields, character limits
+- **Scan a receipt** - Read a Zepto/Blinkit/Instamart/Swiggy order screenshot, tick what counts, and prefill the form (see [Receipt scanning](#-receipt-scanning))
 - **Auto-prefill** - SMS integration support for automatic amount entry
 - **Delete Protection** - Confirmation dialogs for destructive actions
+- **Duplicate warning** - the same amount, type and date twice in one day asks first
 
 ### 🏷️ **Category Management**
 - **Custom Expense Types** - Add, edit, delete, and manage expense categories
@@ -163,7 +215,9 @@ theme, and a set of iOS Safari fixes. See the full list at the end of this file.
 - **Styling**: Custom CSS with CSS Grid, Flexbox, and CSS Variables
 - **Authentication**: Supabase Auth with email verification
 - **Database**: PostgreSQL with Row Level Security (RLS)
-- **PWA**: Web App Manifest for native app experience
+- **PWA**: Web App Manifest plus a service worker — installable, and it opens offline
+- **Offline writes**: IndexedDB outbox, flushed on reconnect
+- **Serverless**: Netlify Functions for the receipt reader and the admin auth actions
 
 ## 📱 Installation & Setup
 
@@ -343,6 +397,11 @@ CREATE INDEX IF NOT EXISTS idx_recurring_user
 A day-31 rule lands on the 28th/30th in shorter months, and each rule is
 stamped with the year/month it was last handled so it never double-books.
 
+### Optional migration — the admin panel
+
+[`supabase/admin.sql`](supabase/admin.sql), applied once. Until you run it the
+Admin item never appears and nothing else changes. See [Admin](#-admin).
+
 ### Optional migration — cross-device settings
 
 The app works without this. Per-user preferences (billed tracking on/off,
@@ -373,6 +432,147 @@ todayISO();                  // '2026-08-31' in Asia/Kolkata, on any device
 monthBounds(2026, 8);        // { first: '2026-08-01', last: '2026-08-31' }
 withinRange(e.date, f, l);   // plain string comparison — no timezone involved
 ```
+
+## 🧾 Receipt scanning
+
+*Add New Expense → **Scan receipt***. Pick one or more screenshots of a
+grocery or food order, and the reader turns them into an editable list of
+lines. Untick anything you did not want, correct any count or amount, and
+press **Use these items** — the kept lines are summed into the amount field
+and written into the note as
+
+```
+Milk Maid ×2 + Potato ×1 + Handling Fee ×1
+```
+
+Nothing is saved by the scanner. It fills the form; you still review it and
+press *Add Expense*. There is no image storage on either path.
+
+### Two readers
+
+| | Where it runs | Needs | Accuracy |
+|---|---|---|---|
+| **Vision model** | `netlify/functions/scan.mjs` → Gemini | `GEMINI_API_KEY` | Reads the *layout*: knows the right-hand column is money and that a struck-through number is the old MRP |
+| **Tesseract** | The device, via `cdn.jsdelivr.net` | nothing | Character recognition only; the parser in `scan.js` repairs what it can |
+
+The cloud reader is tried first and the on-device one picks up whenever it
+cannot be used — no key configured, free quota spent, network gone, or nothing
+found — so a deploy with no key still scans. The picker says which one is
+about to run *before* you choose an image, so it never claims the picture
+stays on the phone when it does not.
+
+`GET /.netlify/functions/scan?diagnose=1` reports whether the key is set and
+which model it will actually reach.
+
+### What the parser has to survive
+
+`scan.js` is deliberately forgiving, because real screenshots are not clean.
+It handles prices on their own line (Blinkit/Zepto layout), struck-through
+MRPs (the payable amount is the smaller of the two), pack sizes that look like
+quantities (`12 x 70 g` is one item, `x2` is two), weights that look like
+prices (`500 g`), product thumbnails read as junk before the name, wrapped
+product names, rows duplicated by overlapping screenshots, and app furniture
+(order ids, totals, "you saved", delivery times).
+
+The one worth knowing about: **Tesseract has never been shown a ₹**, so it
+substitutes the nearest glyph it knows — consistently, within one screenshot.
+On a Blinkit order every ₹ comes back as a `2`, which turns ₹35 into 235 and a
+₹469 basket into ₹53,727. `detectRupeeGlyph()` spots this across the whole
+document (no real currency mark anywhere, every amount in the column carrying
+the same stray leading character) and undoes it, then says so in a banner
+above the list.
+
+`node tests/scan.test.js` covers all of the above against real receipts.
+
+## 📴 Offline
+
+`sw.js` caches the app shell, so the app opens with no signal. `offline.js`
+holds writes that cannot reach Supabase in an IndexedDB outbox and sends them
+when it can.
+
+Only the *write* path is queued — reads still need a connection. What happens
+with no signal:
+
+| | Offline |
+|---|---|
+| Opening the app | Works, from the cached shell |
+| Adding an expense | Queued, shown as PENDING, counted in the month's totals and budget |
+| The queued row | Editable only by discarding it; there is no database row to edit yet |
+| Everything else | Needs a connection, and says so rather than showing zeroes |
+
+The queue drains on `online`, when a backgrounded tab becomes visible again,
+on the next sign-in, and when you tap the chip in the header. A row the server
+*refuses* — rather than one that could not be sent — is dropped and reported,
+because retrying it forever would block everything behind it.
+
+**On every deploy, bump `CACHE` in [`sw.js`](sw.js).** The old shell is deleted
+on activate, so a stale `script.js` can never outlive the `index.html` that
+points at it.
+
+## 🛡️ Admin
+
+Hidden entirely until an account has the flag, and off by default. Three steps,
+in this order:
+
+**1. Run the migration.** Apply [`supabase/admin.sql`](supabase/admin.sql) in
+the Supabase SQL editor. It is safe to re-run. It adds `email`, `full_name` and
+`is_admin` to `user_profiles`, creates `app_settings`, `banned_emails`,
+`allowed_emails` and `admin_audit`, and replaces the signup trigger with one
+that also enforces the block list and the signup switches.
+
+**2. Make yourself an admin.**
+
+```sql
+update public.user_profiles set is_admin = true
+ where email = 'you@example.com';
+```
+
+`is_admin` cannot be self-granted from the browser: a trigger refuses any
+change to that column that does not come from `admin_set_profile()` or the
+service role. RLS is row-level, not column-level, so the "manage your own
+profile" policy would otherwise have let anyone promote themselves from the
+console.
+
+**3. Set two Netlify environment variables** (see [Configuration](#-configuration)).
+Without them the panel still reads and edits profiles, but blocking, creating,
+deleting, password links and *sign in as* all report that they are not
+configured — those touch Supabase's own auth tables, which no SQL policy can
+reach.
+
+Then *Admin* appears in the user menu, just above Logout.
+
+### What each tab does
+
+**People** — everyone, searchable, with their spend and expense count. Open
+one to see their totals, their categories, and their expense log. It is
+read-only: an admin can look at somebody's spending without being able to
+quietly rewrite it. The actions are make/remove admin, sign in as them,
+password reset link, sign out everywhere, block, and delete.
+
+**Access** — two switches. *Allow new accounts* off closes registration
+entirely. *Invite only* limits it to the allow list. Below them: create an
+account outright with a password you choose, email an invite, or just add an
+address to the allow list. Then the blocked list and the allow list.
+
+**Audit** — every admin action, newest first, append-only.
+
+### Signing in as somebody
+
+The honest form of "log in as anyone" is a single-use magic link for their
+account. Opening it **replaces your own session in that browser** with theirs —
+you are them until you sign out. The panel says so before it hands the link
+over, and the attempt is recorded whether or not the link is ever opened.
+
+There is no impersonation mode that keeps you signed in as yourself, because
+that would need the app to carry two identities at once and every RLS policy
+to understand which one it is answering.
+
+### Blocking
+
+Two halves, and both matter: a row in `banned_emails` stops a *new* account
+being created with that address, and `banned_until` on the auth user stops the
+*existing* account signing in. Their sessions are ended too, or the block would
+wait out the hour an already-issued token stays valid.
 
 ## 🎯 Usage Guide
 
@@ -453,6 +653,17 @@ const supabaseKey = 'your-anon-key';
 // Optional configurations
 const isDarkMode = localStorage.getItem('darkMode') === 'true';
 ```
+
+Set in the host (Netlify → Site settings → Environment variables), not in the
+source:
+
+| Variable | Needed for | Effect if unset |
+|---|---|---|
+| `GEMINI_API_KEY` | The receipt scanner's cloud reader | Falls back to reading on the device. Nothing else is affected. |
+| `GEMINI_MODEL` | Pinning a model | The function walks its built-in list instead. Set it only when a newer one lands before that list is updated. |
+| `SUPABASE_URL` | The admin panel's auth actions | Blocking, creating, deleting, password links and *sign in as* report that they are not configured. |
+| `SUPABASE_SERVICE_ROLE_KEY` | The same | The same. **Never put this in the page** — it bypasses every RLS policy. It belongs in Netlify's environment and nowhere else. |
+| `SUPABASE_ANON_KEY` | Nothing, strictly | Optional. Identity comes from the caller's own bearer token either way. |
 
 ### PWA Configuration
 Update `manifest.json` with your app details:

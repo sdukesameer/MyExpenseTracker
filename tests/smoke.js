@@ -30,7 +30,35 @@ function check(name, ok, detail) {
 function serve() {
   return new Promise(resolve => {
     const server = http.createServer((req, res) => {
-      const file = path.join(ROOT, decodeURIComponent(req.url.split('?')[0]) === '/' ? 'index.html' : req.url.split('?')[0]);
+      const route = decodeURIComponent(req.url.split('?')[0]);
+
+      // Stand in for Netlify, deployed without GEMINI_API_KEY — the state most
+      // installs are in, and the one where the scanner falls back to reading
+      // on the device. Serving it also keeps a 404 out of the console, which
+      // the error assertion at the end of run A would otherwise trip over.
+      if (route === '/.netlify/functions/admin') {
+        let raw = '';
+        req.on('data', c => { raw += c; });
+        return req.on('end', () => {
+          const body = JSON.parse(raw || '{}');
+          const auth = req.headers.authorization || '';
+          res.writeHead(auth.startsWith('Bearer ') ? 200 : 401,
+            { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(auth.startsWith('Bearer ')
+            ? { ok: true, message: 'Done (' + body.action + ')',
+                link: 'https://example.test/one-time-link' }
+            : { error: 'Not signed in' }));
+        });
+      }
+
+      if (route === '/.netlify/functions/scan') {
+        res.writeHead(req.method === 'GET' ? 200 : 501, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(req.method === 'GET'
+          ? { ready: false }
+          : { error: 'unconfigured' }));
+      }
+
+      const file = path.join(ROOT, route === '/' ? 'index.html' : route);
       fs.readFile(file, (err, data) => {
         if (err) { res.writeHead(404); return res.end('nf'); }
         res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
@@ -179,8 +207,8 @@ const visible = (page, sel) => page.$eval(sel, el => {
       (await txt(page, '#expenses-container .expense-amount')).match(/₹[\d,]+\.\d\d/) !== null,
       await txt(page, '#expenses-container .expense-amount'));
     check('BILLED badge present', (await page.$$('#expenses-container .billed-badge')).length === 2);
-    check('repeat + delete buttons present',
-      (await page.$$('#expenses-container .expense-actions .icon-btn')).length === 10,
+    check('repeat + edit + delete on every row',
+      (await page.$$('#expenses-container .expense-actions .icon-btn')).length === 15,
       String((await page.$$('#expenses-container .expense-actions .icon-btn')).length));
 
     /* ---- Requested feature 2: deactivate the billed flag ---- */
@@ -496,8 +524,8 @@ const visible = (page, sel) => page.$eval(sel, el => {
       ['showAddTypeModal', 'closeAddTypeModal', '#add-type-modal'],
       ['showEditTypeModal', 'closeEditTypeModal', '#edit-type-modal'],
       ['showDeleteTypeModal', 'closeDeleteTypeModal', '#delete-type-modal'],
-      ['showChangePassword', 'closeChangePasswordModal', '#change-password-modal'],
-      ['setBudget', 'closeBudgetModal', '#budget-modal']
+      ['setBudget', 'closeBudgetModal', '#budget-modal'],
+      ['openScanModal', 'closeScanModal', '#scan-modal']
     ]) {
       await page.evaluate(fn => window[fn](), open);
       await new Promise(r => setTimeout(r, 400));
@@ -561,19 +589,19 @@ const visible = (page, sel) => page.$eval(sel, el => {
     const tbRow = matrixTracked.find(r => r[2] === 'TOTAL BUDGET');
     check('TOTAL BUDGET row = 10000', tbRow && tbRow[3] === 10000, JSON.stringify(tbRow));
 
-    // CSV must survive a note containing a comma and a double quote.
+    // A note with a comma and a double quote must reach the sheet intact.
     await page.evaluate(() => {
       window.__MOCK__.state.expenses.push({ id: 8888, user_id: 'user-test-0001', amount: 42,
         date: '2026-08-20', type: 'Food', billed: false,
         note: 'Chai, "extra" sugar', updated_at: '2026-08-20T00:00:00Z' });
     });
-    const csvLine = await page.evaluate(async () => {
+    const awkward = await page.evaluate(async () => {
       const { rows, startDate, endDate } = await fetchExportRows();
       const m = await buildExportMatrix(rows, startDate, endDate);
-      return m.map(r => r.map(csvCell).join(',')).find(l => l.includes('extra'));
+      return m.find(r => String(r[2]).includes('extra'));
     });
-    check('CSV doubles inner quotes (RFC 4180)',
-      csvLine.includes('"Chai, ""extra"" sugar"'), csvLine);
+    check('quotes and commas survive into the export matrix',
+      awkward && awkward[2] === 'Chai, "extra" sugar', JSON.stringify(awkward));
 
     // Same check with billing tracking off (4-column layout).
     await page.evaluate(() => saveSettings({ trackBilling: false }).then(applyBillingMode));
@@ -667,6 +695,253 @@ const visible = (page, sel) => page.$eval(sel, el => {
     await page.evaluate(() => closeSearchModal());
 
     /* ---- XSS ---- */
+    /* ---- Receipt scanner ---- */
+    // The OCR readers need a real screenshot, so what is exercised here is
+    // everything downstream of them: the editable list, the tick that drops a
+    // line, the running total, and the note that reaches the form.
+    console.log('\n── H2. Receipt scanner');
+    const typeInto = (sel, value) => page.evaluate((s, v) => {
+      const el = document.querySelector(s);
+      el.value = v;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }, sel, value);
+
+    await page.evaluate(() => openScanModal());
+    await new Promise(r => setTimeout(r, 350));
+    check('scanner opens on the picker', await visible(page, '#scan-pick'));
+
+    await page.evaluate(() => document.getElementById('scan-manual').click());
+    await new Promise(r => setTimeout(r, 250));
+    check('by-hand route gives one blank line',
+      (await page.$$('#scan-rows .scan-row')).length === 1);
+
+    await typeInto('#scan-rows .scan-row:nth-child(1) .scan-name', 'Milk Maid');
+    await typeInto('#scan-rows .scan-row:nth-child(1) .scan-qty', '2');
+    await typeInto('#scan-rows .scan-row:nth-child(1) .scan-price', '120.50');
+    await page.evaluate(() => document.getElementById('scan-add').click());
+    await new Promise(r => setTimeout(r, 150));
+    await typeInto('#scan-rows .scan-row:nth-child(2) .scan-name', 'Potato');
+    await typeInto('#scan-rows .scan-row:nth-child(2) .scan-price', '30');
+    await page.evaluate(() => document.getElementById('scan-add').click());
+    await new Promise(r => setTimeout(r, 150));
+    await typeInto('#scan-rows .scan-row:nth-child(3) .scan-name', 'Delivery Fee');
+    await typeInto('#scan-rows .scan-row:nth-child(3) .scan-price', '20');
+    await new Promise(r => setTimeout(r, 150));
+
+    check('all three lines count toward the total',
+      (await txt(page, '#scan-foot .is-total .v')) === '₹170.50',
+      await txt(page, '#scan-foot .is-total .v'));
+
+    await page.evaluate(() => {
+      const tick = document.querySelector('#scan-rows .scan-row:nth-child(3) .scan-tick');
+      tick.checked = false;
+      tick.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await new Promise(r => setTimeout(r, 200));
+    check('unticking a line takes it off the total',
+      (await txt(page, '#scan-foot .is-total .v')) === '₹150.50',
+      await txt(page, '#scan-foot .is-total .v'));
+    check('the dropped line is still shown, struck off',
+      await page.evaluate(() =>
+        document.querySelector('#scan-rows .scan-row:nth-child(3)').classList.contains('is-off')));
+    check('note preview leaves the dropped line out',
+      (await txt(page, '#scan-foot .scan-note-preview .val')) === 'Milk Maid ×2 + Potato ×1',
+      await txt(page, '#scan-foot .scan-note-preview .val'));
+
+    await page.evaluate(() => document.getElementById('scan-apply').click());
+    await new Promise(r => setTimeout(r, 400));
+    check('scanner closes on apply', !(await visible(page, '#scan-modal')));
+    check('note prefilled with the itemisation',
+      await page.evaluate(() => document.getElementById('note').value) === 'Milk Maid ×2 + Potato ×1',
+      await page.evaluate(() => document.getElementById('note').value));
+    check('amount prefilled with the kept total',
+      await page.evaluate(() => document.getElementById('amount').value) === '150.50',
+      await page.evaluate(() => document.getElementById('amount').value));
+
+    await page.evaluate(() => {
+      document.getElementById('note').value = '';
+      document.getElementById('amount').value = '';
+    });
+
+    /* ---- Filters that apply themselves ---- */
+    console.log('\n── H3. Filters, offline queue, admin');
+    await page.evaluate(() => showVisualizationModal());
+    await new Promise(r => setTimeout(r, 700));
+    check('no Apply Filter button left',
+      await page.evaluate(() => !/Apply Filter/.test(document.getElementById('filter-hint')
+        .closest('.filter-actions').textContent)));
+    check('no CSV export button left',
+      await page.evaluate(() => !/Export CSV/.test(document.body.textContent)));
+
+    const rowsBefore = (await page.$$('#filtered-list-mount .expense-item')).length;
+    await page.evaluate(() => {
+      const field = document.getElementById('type-filter');
+      field.value = 'Travel';
+      field.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await new Promise(r => setTimeout(r, 900));
+    const rowsAfter = (await page.$$('#filtered-list-mount .expense-item')).length;
+    check('changing a filter re-runs it with no Apply press',
+      rowsAfter > 0 && rowsAfter < rowsBefore, `before=${rowsBefore} after=${rowsAfter}`);
+    check('…and narrows to exactly that type',
+      await page.evaluate(() => Array.from(
+        document.querySelectorAll('#filtered-list-mount .expense-type'))
+        .every(el => el.textContent.trim() === 'Travel')));
+    await page.evaluate(() => {
+      const field = document.getElementById('type-filter');
+      field.value = 'all';
+      field.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await new Promise(r => setTimeout(r, 800));
+    await page.evaluate(() => closeVisualizationModal());
+
+    /* ---- Editing from the dashboard list ---- */
+    const recentId = await page.evaluate(() =>
+      document.querySelector('#expenses-container .expense-item').getAttribute('data-id'));
+    await page.evaluate(id => toggleEditMode('recent', id), recentId);
+    await new Promise(r => setTimeout(r, 400));
+    check('Recent Expenses rows edit in place',
+      await page.evaluate(id =>
+        !!document.querySelector(`#expenses-container [data-id="${id}"] .expense-note input`),
+        recentId));
+    await page.evaluate(id => {
+      const input = document.querySelector(
+        `#expenses-container [data-id="${id}"] .expense-note input`);
+      input.value = 'Edited from the dashboard';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }, recentId);
+    await new Promise(r => setTimeout(r, 250));
+    check('its own Save button appears, not the analytics one',
+      await page.evaluate(() =>
+        document.querySelector('[data-save-scope="recent"]').style.display === 'block'));
+    await page.evaluate(() => saveAllChanges('recent'));
+    await new Promise(r => setTimeout(r, 900));
+    check('the edit reaches the database',
+      await page.evaluate(id => (window.__MOCK__.state.expenses
+        .find(e => String(e.id) === String(id)) || {}).note === 'Edited from the dashboard',
+        recentId));
+
+    /* ---- Change password lives in Edit Profile ---- */
+    await page.evaluate(() => showEditProfile());
+    await new Promise(r => setTimeout(r, 400));
+    check('Edit Profile carries the password fields',
+      await visible(page, '#profile-new-password') && await visible(page, '#profile-confirm-password'));
+    check('Change Password is gone from the user menu',
+      await page.evaluate(() => !/Change Password/.test(
+        document.getElementById('user-menu').textContent)));
+    await page.evaluate(() => closeEditProfileModal());
+
+    /* ---- The offline outbox ---- */
+    check('queued rows are readable before anything is queued',
+      (await page.evaluate(() => pendingExpenses('user-test-0001').then(r => r.length))) === 0);
+    const queued = await page.evaluate(async () => {
+      const entry = await queueExpense({ amount: 275, date: '2026-08-31', type: 'Food',
+        note: 'Queued while offline', billed: false }, 'user-test-0001');
+      await loadExpenses();
+      return entry.id;
+    });
+    await new Promise(r => setTimeout(r, 500));
+    check('a queued expense shows as PENDING in Recent Expenses',
+      (await page.$$('#expenses-container .expense-item.is-pending')).length === 1);
+    check('it is not in the database yet',
+      await page.evaluate(() => !window.__MOCK__.state.expenses
+        .some(e => e.note === 'Queued while offline')));
+    check('the queue chip says how many are waiting',
+      (await txt(page, '#offline-chip')).includes('1 waiting'),
+      await txt(page, '#offline-chip'));
+    await page.evaluate(() => flushOutbox({ quiet: true }));
+    await new Promise(r => setTimeout(r, 900));
+    check('flushing sends it',
+      await page.evaluate(() => window.__MOCK__.state.expenses
+        .some(e => e.note === 'Queued while offline')));
+    check('and the queue empties',
+      (await page.evaluate(() => pendingExpenses('user-test-0001').then(r => r.length))) === 0);
+    await page.evaluate(id => removeQueued(id), queued);
+
+    /* ---- Admin ---- */
+    // Checked with the menu actually open: an item inside a closed menu still
+    // has a box, so viewport visibility alone would pass either way.
+    const menuShows = async label => {
+      await page.evaluate(() => toggleUserMenu(new Event('click')));
+      await new Promise(r => setTimeout(r, 250));
+      const seen = await visible(page, label);
+      await page.evaluate(() => closeUserMenu());
+      await new Promise(r => setTimeout(r, 200));
+      return seen;
+    };
+
+    check('Admin is hidden for an ordinary account', !(await menuShows('#admin-menu-item')));
+
+    await page.evaluate(() => {
+      const rows = window.__MOCK__.state.user_profiles;
+      const mine = rows.find(p => p.user_id === 'user-test-0001');
+      const me = { user_id: 'user-test-0001', email: 'tester@example.com',
+                   full_name: 'Test User', is_admin: true, created_at: '2026-01-02T00:00:00Z' };
+      if (mine) Object.assign(mine, me); else rows.push(me);
+      rows.push({ user_id: 'user-test-0002', email: 'someone@example.com',
+                  full_name: 'Someone Else', is_admin: false,
+                  created_at: '2026-02-02T00:00:00Z' });
+      return refreshAdminFlag();
+    });
+    await new Promise(r => setTimeout(r, 300));
+    check('Admin appears once the flag is set, above Logout',
+      (await menuShows('#admin-menu-item')) &&
+      await page.evaluate(() => {
+        const items = Array.from(document.querySelectorAll('#user-menu .user-menu-item'));
+        return items.findIndex(el => el.id === 'admin-menu-item') ===
+               items.findIndex(el => /Logout/.test(el.textContent)) - 1;
+      }));
+
+    await page.evaluate(() => showAdminModal());
+    await new Promise(r => setTimeout(r, 800));
+    check('People tab lists everybody',
+      (await page.$$('#admin-user-list .admin-row')).length === 2,
+      String((await page.$$('#admin-user-list .admin-row')).length));
+    check('the ADMIN tag marks the admin',
+      (await page.$$('#admin-user-list .admin-tag.is-admin')).length === 1);
+
+    await page.evaluate(() => openAdminUser('user-test-0001'));
+    await new Promise(r => setTimeout(r, 600));
+    check("a person's expense log opens",
+      (await page.$$('#admin-detail .admin-log-row')).length > 0,
+      String((await page.$$('#admin-detail .admin-log-row')).length));
+    check('acting as yourself is refused, not offered',
+      await page.evaluate(() => !/Sign in as them/.test(
+        document.getElementById('admin-detail').textContent)));
+
+    await page.evaluate(() => openAdminUser('user-test-0002'));
+    await new Promise(r => setTimeout(r, 600));
+    check('somebody else gets the full action set',
+      await page.evaluate(() => {
+        const text = document.getElementById('admin-detail').textContent;
+        return ['Make admin', 'Sign in as them', 'Block', 'Delete account']
+          .every(label => text.includes(label));
+      }));
+
+    await page.evaluate(() => switchAdminTab('access'));
+    await new Promise(r => setTimeout(r, 600));
+    check('Access shows both signup switches',
+      await visible(page, '#admin-signups-switch') && await visible(page, '#admin-invite-switch'));
+    check('signups start open',
+      await page.evaluate(() =>
+        document.getElementById('admin-signups-switch').classList.contains('on')));
+    await page.evaluate(() => adminToggleSetting('signups_enabled'));
+    await new Promise(r => setTimeout(r, 500));
+    check('closing signups persists',
+      await page.evaluate(() => window.__MOCK__.state.settings.signups_enabled === false));
+    check('and the switch follows',
+      await page.evaluate(() =>
+        !document.getElementById('admin-signups-switch').classList.contains('on')));
+
+    await page.evaluate(() => switchAdminTab('audit'));
+    await new Promise(r => setTimeout(r, 600));
+    check('the audit log records it',
+      (await page.$eval('#admin-body', e => e.textContent)).includes('changed a setting'));
+
+    await page.evaluate(() => closeAdminModal());
+    await new Promise(r => setTimeout(r, 300));
+    check('admin modal closes', !(await visible(page, '#admin-modal')));
+
     console.log('\n── I. Injection safety');
     await page.evaluate(() => {
       window.__MOCK__.state.expenses.push({
@@ -682,7 +957,7 @@ const visible = (page, sel) => page.$eval(sel, el => {
     await new Promise(r => setTimeout(r, 400));
     await page.evaluate(() => applyRangePreset('all'));
     await new Promise(r => setTimeout(r, 800));
-    await page.evaluate(() => toggleEditMode('9999'));
+    await page.evaluate(() => toggleEditMode('filtered', '9999'));
     await new Promise(r => setTimeout(r, 400));
     check('hostile note does not execute (list + edit mode)',
       await page.evaluate(() => window.__XSS__ === undefined));
@@ -710,9 +985,9 @@ const visible = (page, sel) => page.$eval(sel, el => {
       (await la.page.$eval('#date', e => e.value)) === '2026-08-31',
       await la.page.$eval('#date', e => e.value));
     check('a 31 Aug expense renders as 31 Aug (no off-by-one)',
-      (await la.page.$eval('#expenses-container .expense-item .expense-meta span:last-child',
+      (await la.page.$eval('#expenses-container .expense-item .expense-date',
         e => e.textContent)).includes('31 Aug 2026'),
-      await la.page.$eval('#expenses-container .expense-item .expense-meta span:last-child',
+      await la.page.$eval('#expenses-container .expense-item .expense-date',
         e => e.textContent));
     check('no errors in the LA run', la.errors.length === 0, la.errors.slice(0, 5).join(' | '));
     await la.page.close();

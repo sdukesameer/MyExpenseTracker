@@ -575,7 +575,9 @@ select:focus-visible,
 .form-group input,
 .form-group select,
 .mini-select,
-.search-field input {
+.search-field input,
+.admin-form-row input,
+.admin-link-input {
     width: 100%;
     padding: 0.72rem 0.9rem;
     border: 1.5px solid var(--border-strong);
@@ -593,7 +595,8 @@ select:focus-visible,
 }
 
 .form-group input::placeholder,
-.search-field input::placeholder {
+.search-field input::placeholder,
+.admin-form-row input::placeholder {
     color: var(--muted);
 }
 
@@ -608,7 +611,8 @@ select:focus-visible,
 
 .form-group input:focus,
 .form-group select:focus,
-.search-field input:focus {
+.search-field input:focus,
+.admin-form-row input:focus {
     outline: none;
     border-color: var(--brand-1);
     box-shadow: var(--ring);
@@ -1409,6 +1413,12 @@ input[type="number"]::-webkit-inner-spin-button {
     align-items: center;
 }
 
+/* Repeat copies the row as it is *saved*, so offering it beside a half-typed
+   edit invites the one mistake this row cannot undo. */
+.expense-item.edit-mode .repeat-btn {
+    display: none;
+}
+
 .billed-toggle {
     position: relative;
     width: 104px;
@@ -2145,6 +2155,14 @@ body.simple-mode .import-preview-table .col-billed {
 
 .filter-actions .btn-small {
     flex: 1 1 auto;
+}
+
+/* There is no Apply button any more, so the bar has to say so once. */
+.filter-hint {
+    flex: 1 1 100%;
+    color: var(--muted);
+    font-size: 0.78rem;
+    padding-top: 0.15rem;
 }
 
 .chart-toolbar {
@@ -3049,6 +3067,765 @@ body.signed-in .fab {
         animation-duration: 0.001ms !important;
         animation-iteration-count: 1 !important;
         transition-duration: 0.001ms !important;
+    }
+}
+
+/* =====================================================================
+   Receipt scanner
+   ===================================================================== */
+
+.scan-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 1.5rem 0.5rem 0.5rem;
+    text-align: center;
+}
+
+.scan-state .scan-art {
+    font-size: 3rem;
+    line-height: 1;
+}
+
+.scan-state h4 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.scan-state p {
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.55;
+    max-width: 34ch;
+}
+
+.scan-state .btn {
+    max-width: 280px;
+}
+
+.scan-where {
+    font-size: 0.8rem !important;
+    color: var(--muted);
+}
+
+.scan-link {
+    background: none;
+    border: 0;
+    padding: 0.35rem;
+    color: var(--brand-ink);
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+.scan-link:hover {
+    color: var(--brand-1);
+}
+
+.scan-bar {
+    width: 100%;
+    max-width: 260px;
+    height: 6px;
+    border-radius: var(--r-pill);
+    background: var(--surface-3);
+    overflow: hidden;
+}
+
+.scan-bar span {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: var(--r-pill);
+    background: var(--brand-grad);
+    transition: width 0.25s ease;
+}
+
+/* A note about how the read went — a folded duplicate, a misread ₹ glyph,
+   a fallback to the on-device reader. Never fatal, always worth a glance. */
+.scan-warn {
+    margin-bottom: 0.75rem;
+    padding: 0.6rem 0.8rem;
+    border-left: 3px solid var(--amber);
+    border-radius: 0 var(--r-sm) var(--r-sm) 0;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 0.82rem;
+    line-height: 1.5;
+}
+
+.scan-head {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-bottom: 0.6rem;
+}
+
+/* --------------------------------------------------------------------
+   The editable rows
+   -------------------------------------------------------------------- */
+
+.scan-list {
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    overflow: hidden;
+    max-height: 46vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.scan-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.65rem;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+}
+
+.scan-row:first-child {
+    border-top: 0;
+}
+
+.scan-row.is-fee {
+    background: var(--surface-2);
+}
+
+/* Unticked lines stay visible — you can see what the reader found and put
+   it back — but they read as struck off the list. */
+.scan-row.is-off {
+    background: var(--surface-2);
+    opacity: 0.5;
+}
+
+.scan-row.is-off .scan-name,
+.scan-row.is-off .scan-price {
+    text-decoration: line-through;
+}
+
+.scan-tick {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    accent-color: var(--brand-1);
+    cursor: pointer;
+}
+
+.scan-cell {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.scan-name {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: 0;
+    border-bottom: 1px solid transparent;
+    border-radius: 0;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 0.2rem 0;
+}
+
+.scan-name:focus {
+    outline: none;
+    border-bottom-color: var(--brand-1);
+    box-shadow: none;
+}
+
+.scan-fee-tag {
+    flex: none;
+    padding: 0.1rem 0.4rem;
+    border-radius: var(--r-pill);
+    background: var(--surface-3);
+    color: var(--muted);
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.scan-qty-wrap {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.1rem;
+    color: var(--muted);
+    font-size: 0.85rem;
+}
+
+.scan-qty {
+    width: 34px;
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text);
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-align: center;
+    padding: 0.2rem 0.1rem;
+}
+
+.scan-price {
+    flex: none;
+    width: 82px;
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text);
+    font: var(--font-num);
+    font-size: 0.9rem;
+    font-weight: 700;
+    text-align: right;
+    padding: 0.2rem 0.45rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.scan-qty:focus,
+.scan-price:focus {
+    outline: none;
+    border-color: var(--brand-1);
+    box-shadow: var(--ring);
+}
+
+.scan-del {
+    flex: none;
+    width: 26px;
+    height: 26px;
+    border: 0;
+    border-radius: 50%;
+    background: none;
+    color: var(--muted);
+    font-size: 1.15rem;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.scan-del:hover {
+    background: var(--surface-3);
+    color: var(--red);
+}
+
+.scan-row-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: 0.7rem 0;
+}
+
+.scan-row-actions .btn {
+    flex: 1 1 140px;
+}
+
+/* --------------------------------------------------------------------
+   What it adds up to, and the note it will write
+   -------------------------------------------------------------------- */
+
+.scan-foot {
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+    padding: 0.75rem 0.9rem;
+    margin-bottom: 0.9rem;
+}
+
+.scan-foot-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding: 0.12rem 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+}
+
+.scan-foot-line .v {
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+}
+
+.scan-foot-line.is-dropped {
+    color: var(--red-ink);
+}
+
+.scan-foot-line.is-total {
+    padding-top: 0.4rem;
+    color: var(--text);
+    font-size: 1rem;
+    font-weight: 700;
+}
+
+.scan-note-preview {
+    margin-top: 0.6rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--border-strong);
+    display: flex;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+.scan-note-preview .lbl {
+    flex: none;
+    color: var(--muted);
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    padding-top: 0.1rem;
+}
+
+.scan-note-preview .val {
+    color: var(--text-2);
+    word-break: break-word;
+}
+
+@media (max-width: 480px) {
+    /* A phone cannot hold name, count, amount and a delete button on one
+       line without squeezing the name to nothing. So the tick and the name
+       take the first line — the basis is exactly what is left after the
+       checkbox and its gap, which is what forces the break — and the
+       controls drop underneath, indented to line up with the name. */
+    .scan-row {
+        flex-wrap: wrap;
+        row-gap: 0.3rem;
+        padding: 0.6rem 0.65rem 0.7rem;
+    }
+
+    .scan-tick {
+        order: 0;
+    }
+
+    .scan-cell {
+        order: 1;
+        flex: 1 1 calc(100% - 18px - 0.5rem);
+    }
+
+    .scan-qty-wrap {
+        order: 2;
+        margin-left: calc(18px + 0.5rem);
+    }
+
+    .scan-price {
+        order: 3;
+        margin-left: auto;
+    }
+
+    .scan-del {
+        order: 4;
+    }
+
+    /* One scrolling area inside another is miserable on touch, and the inner
+       one clips a row mid-height. The modal already scrolls; let it. */
+    .scan-list {
+        max-height: none;
+        overflow-y: visible;
+    }
+}
+
+/* =====================================================================
+   Offline: the queue chip and pending rows
+   ===================================================================== */
+
+.offline-chip {
+    display: none;
+    align-items: center;
+    gap: 0.3rem;
+    margin-top: 0.4rem;
+    padding: 0.2rem 0.65rem;
+    border: 1px solid var(--amber);
+    border-radius: var(--r-pill);
+    background: rgba(245, 158, 11, 0.12);
+    color: var(--amber-ink);
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+}
+
+.offline-chip.is-offline {
+    border-color: var(--border-strong);
+    background: var(--surface-3);
+    color: var(--muted);
+    cursor: default;
+}
+
+/* A queued row is deliberately quieter than a saved one: it is a promise,
+   not a record, and it must not read as though it is already in the account. */
+.expense-item.is-pending {
+    background: var(--surface-2);
+    border-left: 3px solid var(--amber);
+}
+
+.pending-badge {
+    display: inline-block;
+    padding: 0.1rem 0.4rem;
+    border-radius: var(--r-pill);
+    background: rgba(245, 158, 11, 0.16);
+    color: var(--amber-ink);
+    font-size: 0.62rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+}
+
+.offline-note {
+    margin-bottom: 0.6rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    color: var(--muted);
+    font-size: 0.8rem;
+}
+
+/* =====================================================================
+   Admin panel
+
+   Built out of the app's own pieces — .btn, .switch, .seg, .setting-row —
+   so it reads as a tab of this app rather than a console bolted on.
+   ===================================================================== */
+
+/* Three tabs, not the chart toolbar's four — and the mobile breakpoint drops
+   .chart-toolbar to two columns, which wrapped Audit onto its own row. */
+#admin-tabs {
+    grid-template-columns: repeat(3, 1fr);
+    margin-bottom: 0.25rem;
+}
+
+.admin-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0.6rem;
+    margin: 1rem 0;
+}
+
+.admin-stats-tight {
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    margin: 0.75rem 0;
+}
+
+.admin-stat {
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+}
+
+.admin-stat-label {
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.admin-stat-value {
+    color: var(--text);
+    font-family: var(--font-num);
+    font-size: 1.3rem;
+    font-weight: 750;
+    line-height: 1.25;
+}
+
+.admin-stat-sub {
+    color: var(--muted);
+    font-size: 0.75rem;
+}
+
+.admin-search {
+    margin-bottom: 0.75rem;
+}
+
+.admin-list {
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    overflow: hidden;
+    max-height: 340px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.admin-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    width: 100%;
+    padding: 0.65rem 0.85rem;
+    border: 0;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.admin-row:first-child {
+    border-top: 0;
+}
+
+.admin-row.is-static {
+    cursor: default;
+}
+
+.admin-row:not(.is-static):hover {
+    background: var(--surface-2);
+}
+
+.admin-row.is-open {
+    background: var(--brand-soft);
+    box-shadow: inset 3px 0 0 var(--brand-1);
+}
+
+.admin-row-main {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+    flex: 1;
+}
+
+.admin-row-name {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    font-size: 0.9rem;
+    font-weight: 650;
+    color: var(--text);
+}
+
+.admin-row-sub {
+    color: var(--muted);
+    font-size: 0.76rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.admin-row-figures {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.1rem;
+    flex: none;
+}
+
+.admin-row-amount {
+    font-family: var(--font-num);
+    font-size: 0.95rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.admin-verb {
+    color: var(--muted);
+    font-weight: 500;
+}
+
+.admin-tag {
+    padding: 0.05rem 0.4rem;
+    border-radius: var(--r-pill);
+    background: var(--surface-3);
+    color: var(--muted);
+    font-size: 0.6rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+}
+
+.admin-tag.is-admin {
+    background: var(--brand-soft-2);
+    color: var(--brand-ink);
+}
+
+.admin-tag.is-banned {
+    background: rgba(239, 68, 68, 0.16);
+    color: var(--red-ink);
+}
+
+.admin-sub-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin: 1.1rem 0 0.5rem;
+    color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.admin-sub-head span {
+    color: var(--muted);
+    font-size: 0.74rem;
+    font-weight: 500;
+}
+
+.admin-detail {
+    margin-top: 1rem;
+    padding: 1rem;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+}
+
+.admin-detail-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.admin-detail-head h4 {
+    font-size: 1rem;
+    font-weight: 700;
+}
+
+.admin-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 0.25rem;
+}
+
+.admin-chip {
+    padding: 0.15rem 0.55rem;
+    border-radius: var(--r-pill);
+    background: var(--type-bg);
+    color: var(--type-fg);
+    border: 1px solid var(--type-bd);
+    font-size: 0.72rem;
+    font-weight: 650;
+}
+
+/* Somebody else's expenses: readable, and visibly not editable. */
+.admin-log {
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    max-height: 260px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.admin-log-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.45rem 0.7rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.82rem;
+}
+
+.admin-log-row:first-child {
+    border-top: 0;
+}
+
+.admin-log-amount {
+    flex: none;
+    width: 92px;
+    font-family: var(--font-num);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+}
+
+.admin-log-note {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-2);
+}
+
+.admin-log-date {
+    flex: none;
+    color: var(--muted);
+    font-size: 0.74rem;
+}
+
+.admin-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.admin-form-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.admin-form-row input {
+    flex: 1 1 200px;
+    min-width: 0;
+}
+
+.admin-empty {
+    padding: 1.5rem 1rem;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.85rem;
+}
+
+.admin-empty .empty-state-icon {
+    font-size: 1.8rem;
+    margin-bottom: 0.4rem;
+}
+
+/* A single-use sign-in or reset link. It has to be readable and copyable,
+   which a toast is not. */
+.admin-link-panel {
+    margin-bottom: 1rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--amber);
+    border-radius: var(--r-md);
+    background: rgba(245, 158, 11, 0.09);
+}
+
+.admin-link-input {
+    width: 100%;
+    margin: 0.5rem 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+}
+
+.btn-textish {
+    background: none;
+    border: 0;
+    padding: 0;
+    color: var(--brand-ink);
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 650;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+@media (max-width: 560px) {
+    .admin-log-amount {
+        width: 74px;
+    }
+
+    .admin-log-row .expense-type {
+        display: none;
+    }
+
+    .admin-actions .btn {
+        flex: 1 1 45%;
     }
 }
 
