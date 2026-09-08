@@ -121,16 +121,29 @@ function adminBusy(message) {
         '<p>' + esc(message || 'Loading…') + '</p></div>';
 }
 
+// The three ways this fails on a fresh install all look alike from here, and
+// each has a different fix, so say which one it is rather than echoing the
+// database's wording and leaving somebody to guess.
 function adminFailed(error) {
     const message = String((error && error.message) || error);
-    const needsMigration = /admin_|does not exist|schema cache/i.test(message);
+    let hint = '';
+
+    if (/schema cache|does not exist|42883/i.test(message)) {
+        hint = 'The admin functions are not in the database yet. Apply ' +
+               'supabase/admin.sql in the Supabase SQL editor.';
+    } else if (/not an administrator/i.test(message)) {
+        hint = 'The migration is applied but this account does not have the ' +
+               'flag. In the SQL editor: select public.grant_admin(\'' +
+               ((currentUser && currentUser.email) || 'you@example.com') + '\');';
+    } else if (/failed to fetch|networkerror|load failed/i.test(message)) {
+        hint = 'Could not reach the database. If this app talks to Supabase ' +
+               'through a proxy, check that it forwards /rest/v1/rpc/.';
+    }
+
     $('admin-body').innerHTML =
         '<div class="admin-empty"><div class="empty-state-icon">🛠️</div>' +
         '<p>' + esc(message) + '</p>' +
-        (needsMigration
-            ? '<p class="setting-desc">If this is the first run, apply ' +
-              '<code>supabase/admin.sql</code> in the Supabase SQL editor.</p>'
-            : '') +
+        (hint ? '<p class="setting-desc">' + esc(hint) + '</p>' : '') +
         '</div>';
 }
 

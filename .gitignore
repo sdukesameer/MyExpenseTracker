@@ -5,3 +5,6 @@ node_modules/
 
 # test artefacts
 tests/screenshots/
+
+# Supabase CLI scratch
+supabase/.temp/

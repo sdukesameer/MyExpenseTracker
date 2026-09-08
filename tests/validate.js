@@ -3,7 +3,7 @@ const path = require('path').join(__dirname, '..') + '/';
 const html = fs.readFileSync(path + 'index.html', 'utf8');
 // index.html loads several top-level scripts into one global scope, so every
 // check that reasons about "the app's JS" has to see all of them.
-const SCRIPTS = ['script.js', 'scan.js', 'offline.js', 'admin.js'];
+const SCRIPTS = ['config.js', 'script.js', 'scan.js', 'offline.js', 'admin.js'];
 const sources = SCRIPTS.map(name => [name, fs.readFileSync(path + name, 'utf8')]);
 const js = sources.map(([, src]) => src).join('\n');
 const css  = fs.readFileSync(path + 'style.css', 'utf8');

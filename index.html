@@ -523,7 +523,7 @@
                 <div class="setting-copy">
                     <div class="setting-title">Full backup</div>
                     <p class="setting-desc">Every expense, type, budget and recurring rule as one JSON
-                        file — unlike the CSV export, nothing is filtered out.</p>
+                        file — unlike the Excel export, nothing is filtered out.</p>
                 </div>
                 <button type="button" class="btn btn-small btn-secondary" id="backup-btn"
                     onclick="downloadFullBackup()">Download backup</button>
@@ -995,9 +995,12 @@
         </div>
     </div>
 
-    <!-- offline.js, scan.js and admin.js load first: script.js calls into all
-         three, and MODAL_CLOSERS names their close functions without a
-         forward reference. -->
+    <!-- config.js first of all: it is the only file the deploy rewrites, and
+         script.js reads its Supabase settings straight out of it.
+         offline.js, scan.js and admin.js next: script.js calls into all three,
+         and MODAL_CLOSERS names their close functions without a forward
+         reference. -->
+    <script src="config.js?v=1.2.0"></script>
     <script src="offline.js?v=1.2.0"></script>
     <script src="scan.js?v=1.2.0"></script>
     <script src="admin.js?v=1.2.0"></script>

@@ -1554,6 +1554,14 @@ body.simple-mode .import-preview-table .col-billed {
     border-bottom: none;
 }
 
+/* The text half of a setting row. It takes the slack so a long description
+   wraps instead of squeezing the switch, and min-width:0 lets it: a flex item
+   will not shrink below its content without it. */
+.setting-copy {
+    flex: 1;
+    min-width: 0;
+}
+
 .setting-title {
     font-weight: 620;
     font-size: 0.94rem;

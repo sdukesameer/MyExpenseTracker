@@ -1,17 +1,12 @@
 [build]
   publish = "."
-  # NOTE: script.js no longer contains %VITE_*% placeholders (the Supabase URL
-  # and publishable key are inline), so these substitutions are currently a
-  # no-op. Kept so the env-var workflow still works if you reintroduce them.
-  command = """
-    # Create a temporary copy of script.js
-    cp script.js script_temp.js && \
-    # Replace environment variables
-    sed -i 's|%VITE_SUPABASE_URL%|'\"${VITE_SUPABASE_URL}\"'|g' script_temp.js && \
-    sed -i 's|%VITE_SUPABASE_ANON_KEY%|'\"${VITE_SUPABASE_ANON_KEY}\"'|g' script_temp.js && \
-    # Move back to script.js
-    mv script_temp.js script.js
-  """
+  # There is no bundler, so there is nothing to inline an environment variable
+  # into. This rewrites config.js — the one file the page reads its Supabase
+  # settings out of — from SUPABASE_URL, SUPABASE_PROXY_URL and
+  # SUPABASE_ANON_KEY. A no-op when none are set, so the committed defaults
+  # keep working. It refuses to write a service_role key, or a SUPABASE_URL
+  # that is not a Supabase project URL.
+  command = "node scripts/build-config.mjs"
 
 # The receipt scanner's cloud reader. Unconfigured (no GEMINI_API_KEY), it
 # returns 501 and the app falls back to reading on the device.
@@ -20,7 +15,24 @@
 
 [build.environment]
   NODE_VERSION = "18"
-  SECRETS_SCAN_ENABLED = "false"
+
+  # Left ON deliberately. It is what would catch SUPABASE_SERVICE_ROLE_KEY or
+  # GEMINI_API_KEY ending up in the deployed files, which is the one mistake
+  # here that would actually matter.
+  #
+  # The omitted keys are public by design — the publishable key, the project
+  # URL and the proxy are written into config.js on purpose and are delivered
+  # to every visitor. Without the omission the scanner would fail every build
+  # for finding exactly what it was told to put there.
+  #
+  # SUPABASE_SERVICE_ROLE_KEY and GEMINI_API_KEY are deliberately NOT omitted.
+  # Catching one of those in a deployed file is the entire point.
+  #
+  # The VITE_ names are the old spellings, kept here only while Netlify is
+  # being tidied up. Delete them from this line once they are gone from the
+  # dashboard.
+  SECRETS_SCAN_ENABLED = "true"
+  SECRETS_SCAN_OMIT_KEYS = "SUPABASE_URL,SUPABASE_ANON_KEY,SUPABASE_PROXY_URL,VITE_SUPABASE_URL,VITE_SUPABASE_ANON_KEY,VITE_SUPABASE_PROXY_URL"
   # The publish directory is the repo root, so anything npm installs would be
   # deployed with the site. puppeteer-core is a test-only dependency — never
   # install it here.
@@ -49,6 +61,13 @@
   [headers.values]
     Cache-Control = "public, max-age=0, must-revalidate"
     Service-Worker-Allowed = "/"
+
+# Neither the tests nor the build scripts are part of the app, but the publish
+# directory is the repo root, so both are uploaded with it.
+[[redirects]]
+  from = "/scripts/*"
+  to = "/index.html"
+  status = 404
 
 # Test files are not part of the app.
 [[redirects]]

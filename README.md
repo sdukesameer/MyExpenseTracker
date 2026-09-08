@@ -103,7 +103,7 @@ theme, and a set of iOS Safari fixes. See the full list at the end of this file.
 - **📈 Spending Insights & Analytics** with trend analysis
 - **🎨 Modern Responsive UI** with dark/light theme toggle
 - **📱 Mobile-First Design** optimized for all devices
-- **📤 Smart Data Export** with CSV download and budget summaries
+- **📤 Smart Data Export** to Excel, with budget summaries
 - **⚡ Real-Time Updates** with instant notifications
 
 ## 🚀 Feature Overview
@@ -167,7 +167,7 @@ theme, and a set of iOS Safari fixes. See the full list at the end of this file.
 - **Smart Alerts** - Notifications at 90% and 100% budget usage
 - **Budget Analytics** - Remaining balance calculations with percentages
 - **Historical Budgets** - Month-by-month budget tracking
-- **Export Integration** - Budget information included in CSV exports
+- **Export Integration** - Budget information included in the Excel export
 
 ### 🔍 **Search & Discovery**
 - **Real-Time Search** - Instant search across all expense fields
@@ -193,7 +193,7 @@ theme, and a set of iOS Safari fixes. See the full list at the end of this file.
 - **Notification System** - Toast notifications for user feedback
 
 ### 📤 **Data Export & Backup**
-- **Comprehensive CSV Export** - All expense data with filtering support
+- **Comprehensive Excel Export** - All expense data with filtering support
 - **Smart Filename Generation** - Date range and filter-based naming
 - **Budget Integration** - Budget information included in monthly exports
 - **Flexible Exports** - Custom date ranges, billing status, and category filtering
@@ -238,11 +238,16 @@ theme, and a set of iOS Safari fixes. See the full list at the end of this file.
    - Run the SQL setup script (see Database Schema below)
    - Get your project URL and anon key from Settings > API
 
-3. **Configure Environment Variables**
-   ```javascript
-   // Update in your HTML file or use environment variables
-   const supabaseUrl = 'YOUR_SUPABASE_PROJECT_URL';
-   const supabaseKey = 'YOUR_SUPABASE_ANON_KEY';
+3. **Point it at your project** — edit [`config.js`](config.js), or set
+   `SUPABASE_URL` and `SUPABASE_ANON_KEY` in Netlify and let the build
+   rewrite it. See [Configuration](#-configuration).
+
+   ```js
+   window.APP_CONFIG = {
+       SUPABASE_URL: 'https://your-project.supabase.co',
+       SUPABASE_PROXY_URL: '',
+       SUPABASE_ANON_KEY: 'your-publishable-key'
+   };
    ```
 
 4. **Deploy**
@@ -523,21 +528,42 @@ that also enforces the block list and the signup switches.
 **2. Make yourself an admin.**
 
 ```sql
-update public.user_profiles set is_admin = true
- where email = 'you@example.com';
+select public.grant_admin('you@example.com');
 ```
 
-`is_admin` cannot be self-granted from the browser: a trigger refuses any
-change to that column that does not come from `admin_set_profile()` or the
-service role. RLS is row-level, not column-level, so the "manage your own
-profile" policy would otherwise have let anyone promote themselves from the
-console.
+Not a plain `UPDATE`. `is_admin` cannot be self-granted: a trigger refuses any
+change to that column that does not come from an admin function, and the SQL
+editor is not `service_role` either — so
+
+```sql
+update public.user_profiles set is_admin = true where email = '...';   -- refused
+```
+
+fails with *`is_admin can only be changed by an administrator`*, which is the
+guard doing its job. RLS is row-level, not column-level, so the "manage your
+own profile" policy would otherwise have let anyone promote themselves from
+the browser console.
+
+`grant_admin()` is `REVOKE`d from `anon` and `authenticated`, so it exists only
+for whoever can already open the SQL editor — who owns the database and could
+drop the trigger anyway. Use it once, for yourself; everybody after that is
+promoted from the panel, where it is audited. Pass `false` as a second
+argument to take the flag away again.
+
+If it answers *"No profile with that address"*, that account has no
+`user_profiles` row yet — section 1 of the migration backfills existing
+accounts, so check `select email from public.user_profiles;`.
 
 **3. Set two Netlify environment variables** (see [Configuration](#-configuration)).
 Without them the panel still reads and edits profiles, but blocking, creating,
 deleting, password links and *sign in as* all report that they are not
 configured — those touch Supabase's own auth tables, which no SQL policy can
 reach.
+
+⚠️ `SUPABASE_URL` must be the **direct** project URL
+(`https://<ref>.supabase.co`), not the Cloudflare Worker proxy the browser
+uses. The function calls Supabase's admin auth endpoints with the service-role
+key, and those have no business going through a proxy.
 
 Then *Admin* appears in the user menu, just above Logout.
 
@@ -611,11 +637,14 @@ wait out the hour an already-issued token stays valid.
 5. View spending insights and trends
 
 ### Advanced Features
+- **Scan a receipt**: *Add New Expense → Scan receipt*, tick what counts, prefill the form
 - **Search**: Use global search for quick expense lookup
-- **Bulk Edit**: Edit multiple expenses and save together
+- **Bulk Edit**: Edit several expenses in either list and save them together
+- **Offline**: add expenses with no signal; they sync when you reconnect
 - **Theme Toggle**: Switch between light/dark modes
-- **Profile**: Update name, email, and password
+- **Profile**: Update name, email, and password — all three in Edit Profile
 - **Export**: Download filtered data with budget info
+- **Admin**: for accounts with the flag, above Logout
 
 ## 🚀 Deployment Options
 
@@ -644,26 +673,85 @@ wait out the hour an already-issued token stays valid.
 
 ## 🔧 Configuration
 
-### Environment Variables
-```javascript
-// Required Supabase configuration
-const supabaseUrl = 'https://your-project.supabase.co';
-const supabaseKey = 'your-anon-key';
+Start from the documented list:
 
-// Optional configurations
-const isDarkMode = localStorage.getItem('darkMode') === 'true';
+```bash
+cp .env.example .env      # .env is gitignored; .env.example never holds a value
 ```
 
-Set in the host (Netlify → Site settings → Environment variables), not in the
-source:
+`.env` is read by `netlify dev` — the only way to exercise `netlify/functions/`
+locally. It is **not** read by the deployed site or by `npm run dev`. What the
+deployed site reads is Netlify → Site configuration → Environment variables.
+
+### There is no `VITE_` prefix, deliberately
+
+That prefix is not decoration. It means *"safe to inline into the client
+bundle"* — Vite only exposes variables carrying it to browser code. Half the
+variables here are secrets, so being uniform about the prefix means either
+marking secrets as public or marking public values as secret. Both are worse
+than having no prefix at all, and the first is how a `service_role` key ends
+up in a bundle.
+
+The line that matters is **public vs secret**, and it is drawn by the two
+tables below. The old `VITE_SUPABASE_*` names are still read as a fallback so
+a deploy keeps working mid-rename; the build log nags until you delete them.
+
+### Public settings — [`config.js`](config.js)
+
+There is no bundler here: `index.html` loads plain files, so there is nothing
+to inline a variable into. [`config.js`](config.js) is the substitute. It is
+committed with working defaults, and
+[`scripts/build-config.mjs`](scripts/build-config.mjs) rewrites it at deploy
+time from whichever of these are set.
+
+| Variable | Sets | Also read by |
+|---|---|---|
+| `SUPABASE_URL` | The Supabase project | `netlify/functions/` — so it must be the **direct** `https://<ref>.supabase.co`, never the proxy. The build refuses anything else. |
+| `SUPABASE_PROXY_URL` | Cloudflare Worker in front of Supabase, for ISPs that will not route to `*.supabase.co`. Blank talks to Supabase directly | browser only |
+| `SUPABASE_ANON_KEY` | The publishable key | `netlify/functions/`, as the apikey header |
+
+Each is independent, and setting none is a no-op — a build that silently
+blanked them would deploy an app that cannot reach its database.
+
+**These are not secrets, and moving them to environment variables does not
+make them secret.** Whatever ends up in `config.js` is downloaded by every
+visitor. The publishable key is *designed* for that: it grants only what Row
+Level Security allows, and every table has RLS enabled. The reason to use the
+variables is to point a deploy at a different project without editing code —
+not security. The build script refuses to write a `service_role` key.
+
+### Secrets — Netlify only
+
+Read server-side by `netlify/functions/`, never written into `config.js`,
+never delivered to a browser.
 
 | Variable | Needed for | Effect if unset |
 |---|---|---|
+| `SUPABASE_SERVICE_ROLE_KEY` | The admin panel's auth actions | Block, create, delete, password links and *sign in as* report that they are not configured. Bypasses every RLS policy — Netlify's environment and nowhere else. |
 | `GEMINI_API_KEY` | The receipt scanner's cloud reader | Falls back to reading on the device. Nothing else is affected. |
 | `GEMINI_MODEL` | Pinning a model | The function walks its built-in list instead. Set it only when a newer one lands before that list is updated. |
-| `SUPABASE_URL` | The admin panel's auth actions | Blocking, creating, deleting, password links and *sign in as* report that they are not configured. |
-| `SUPABASE_SERVICE_ROLE_KEY` | The same | The same. **Never put this in the page** — it bypasses every RLS policy. It belongs in Netlify's environment and nowhere else. |
-| `SUPABASE_ANON_KEY` | Nothing, strictly | Optional. Identity comes from the caller's own bearer token either way. |
+
+`SECRETS_SCAN_ENABLED` is left **on** in `netlify.toml`: it fails the build if
+either secret turns up in a deployed file. The three public names are listed in
+`SECRETS_SCAN_OMIT_KEYS`, because they are written into `config.js` on purpose
+and the scanner would otherwise fail every build for finding exactly what it
+was told to put there. `SUPABASE_SERVICE_ROLE_KEY` and `GEMINI_API_KEY` are
+deliberately *not* omitted — catching those is the entire point.
+
+### Why the defaults stay committed
+
+`config.js` ships with real values rather than blanks. They are public
+information either way, so emptying them buys no secrecy, and it costs:
+`npm run dev` would serve an app that cannot reach any database, and a
+mis-set Netlify variable would produce a white screen instead of a working
+site. "Replace it later without touching code" is already what the variables
+above are for.
+
+One thing worth knowing if this repo is public: a fork points at *your*
+project by default. RLS means a stranger only ever sees their own rows, but
+they can still create an account and use your quota. The control for that is
+*Admin → Access → Allow new accounts*, not hiding a key that is public by
+design.
 
 ### PWA Configuration
 Update `manifest.json` with your app details:
@@ -694,7 +782,7 @@ Update `manifest.json` with your app details:
 - **Visual Feedback**: Color-coded progress bars (green → orange → red)
 - **Smart Notifications**: Alerts at 90% usage and budget exceeded
 - **Historical Data**: Month-by-month budget tracking
-- **Export Integration**: Budget summaries in CSV exports
+- **Export Integration**: Budget summaries in the Excel export
 
 ### Search Capabilities
 - **Real-time Search**: Instant results as you type
@@ -738,11 +826,41 @@ Update `manifest.json` with your app details:
 ## 🐛 Troubleshooting
 
 ### Common Issues
-1. **Login Problems**: Check Supabase URL and keys
-2. **Chart Not Loading**: Verify Chart.js CDN link
-3. **Date Issues**: Ensure proper timezone handling (IST)
-4. **Export Problems**: Check browser compatibility for downloads
-5. **PWA Not Installing**: Requires HTTPS and manifest.json
+1. **Login problems** — check `SUPABASE_URL` and the publishable key in [`config.js`](config.js). If the Worker proxy is set, check it is reachable too.
+2. **Chart not loading** — verify the Chart.js CDN link, and that the host is in the CSP `script-src`.
+3. **Date issues** — all date maths runs on `YYYY-MM-DD` strings anchored to IST; see [How dates are handled](#️-how-dates-are-handled).
+4. **Export problems** — check browser compatibility for downloads.
+5. **PWA not installing** — requires HTTPS and `manifest.json`.
+
+### After a deploy
+
+6. **Old version still loading** — bump `CACHE` in [`sw.js`](sw.js) *and* the
+   `?v=` on the assets in `index.html`, and keep both matching
+   `package.json`. `npm run audit` fails if they drift.
+7. **Config changes not taking** — `config.js` is in the service worker's
+   cached shell, so it only refreshes once `CACHE` changes.
+
+### The scanner
+
+8. **Always reads on the device** — `GEMINI_API_KEY` is not set, or the free
+   quota is spent. `GET /.netlify/functions/scan?diagnose=1` says which, and
+   which model the key can actually reach.
+9. **Tesseract never loads** — the CSP needs `'wasm-unsafe-eval'`, `blob:`,
+   and `cdn.jsdelivr.net` plus `tessdata.projectnaptha.com` in `connect-src`.
+
+### The admin panel
+
+10. **"is_admin can only be changed by an administrator"** — you ran a plain
+    `UPDATE`. Use `select public.grant_admin('you@example.com');`. See
+    [Admin](#-admin).
+11. **Admin never appears** — the migration has not been applied, or that
+    account has no flag. Check `select email, is_admin from public.user_profiles;`
+12. **"Not configured"** on block/create/delete — `SUPABASE_URL` and
+    `SUPABASE_SERVICE_ROLE_KEY` are missing from Netlify, and `SUPABASE_URL`
+    must be the direct project URL rather than the Worker proxy.
+13. **People tab empty with a network error** — if the browser reaches
+    Supabase through a proxy, it must forward `/rest/v1/rpc/`; every admin
+    read goes through RPC.
 
 ### Browser Compatibility
 - **Chrome**: Full support (recommended)
@@ -809,7 +927,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Repeat expense** — one tap to re-add a past expense dated today
 - **Delete from the dashboard** — no longer requires opening the analytics modal
 - **Quick chips** — +50/+100/+200/+500 amounts, Today/Yesterday dates
-- **Excel export** alongside CSV; both include the budget summary for single-month ranges
+- **Excel export** alongside CSV (CSV was removed in 1.2); both included the budget summary for single-month ranges
 - **Date range presets** — this month, last month, last 30 days, this year, all time
 - **Indian digit grouping** — ₹1,23,456.00 via `Intl.NumberFormat('en-IN')`
 - **Per-category colours** — a type keeps its colour in badges and in every chart

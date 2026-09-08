@@ -3,8 +3,17 @@
 --
 --  Run this once in the Supabase SQL editor, then make yourself an admin:
 --
---    update public.user_profiles set is_admin = true
---     where email = 'you@example.com';
+--    select public.grant_admin('you@example.com');
+--
+--  Not a plain UPDATE: the guard in section 4 refuses any change to is_admin
+--  that does not come from an admin function, and the SQL editor is not
+--  running as service_role, so the obvious
+--
+--    update public.user_profiles set is_admin = true where email = '...';
+--
+--  is refused by the very trigger that exists to stop a user promoting
+--  themselves from the browser console. grant_admin() is the way in, and it
+--  is revoked from every role a browser can reach.
 --
 --  Until an account has that flag the Admin item stays hidden and every
 --  function below refuses, so running this changes nothing on its own.
@@ -176,6 +185,49 @@ drop trigger if exists on_profile_admin_guard on public.user_profiles;
 create trigger on_profile_admin_guard
     before update on public.user_profiles
     for each row execute function public.guard_admin_flag();
+
+-- ---------------------------------------------------------------------------
+--  4b. Bootstrapping the first admin
+--
+--  The guard above is deliberately strict, which leaves nobody able to grant
+--  the first flag: admin_set_profile() requires you to be an admin already,
+--  and a plain UPDATE from the SQL editor is refused because that session is
+--  not service_role either.
+--
+--  This is the way in. It sets the same transaction-local marker
+--  admin_set_profile() uses, and it is REVOKEd from anon and authenticated,
+--  so it exists only for whoever can already open the SQL editor — who owns
+--  the database and could drop the trigger anyway.
+--
+--  Use it once, for yourself. Everybody after that is promoted from the
+--  panel, where it is audited.
+-- ---------------------------------------------------------------------------
+create or replace function public.grant_admin(p_email text, p_admin boolean default true)
+returns text language plpgsql security definer set search_path = public as $$
+declare addr text := lower(trim(p_email)); touched int;
+begin
+    perform set_config('expensetracker.granting_admin', 'yes', true);
+
+    update public.user_profiles
+       set is_admin = p_admin, updated_at = now()
+     where lower(email) = addr;
+    get diagnostics touched = row_count;
+
+    perform set_config('expensetracker.granting_admin', 'no', true);
+
+    if touched = 0 then
+        return 'No profile with that address. Has that account signed up yet? ' ||
+               'If it signed up before this migration, section 1 backfills it — ' ||
+               'check: select email from public.user_profiles;';
+    end if;
+
+    return addr || ' is ' || case when p_admin then 'now an administrator.'
+                                  else 'no longer an administrator.' end;
+end $$;
+
+-- Never reachable from the browser: PostgREST exposes public functions to
+-- anon and authenticated by default, and this one bypasses the guard.
+revoke all on function public.grant_admin(text, boolean) from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------------
 --  5. Signup gate

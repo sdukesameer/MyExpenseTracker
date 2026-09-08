@@ -10,12 +10,23 @@
    Config
    --------------------------------------------------------------------- */
 
-// Cloudflare Worker proxy in front of Supabase (Indian ISP compatibility)
-const DIRECT_SUPABASE_URL = 'https://hjjpjcqzslqikopsbxwh.supabase.co';
-const PROXY_URL = 'https://supabase-proxy.sdukesameer.workers.dev';
+// Both values live in config.js, which is regenerated from Netlify's
+// environment at deploy time. The fallbacks keep `npm run dev` and the test
+// harness working with no build step — see config.js for what may live there.
+const APP_CONFIG = window.APP_CONFIG || {};
 
-const supabaseUrl = PROXY_URL;
-const supabaseKey = 'sb_publishable_7dJnWY2k5asHPS1qpABHjw_MeQXUpIa';
+// The project itself. The browser normally goes through the proxy below, but
+// this is the address the proxy forwards to and the one the Netlify functions
+// talk to directly.
+const DIRECT_SUPABASE_URL = APP_CONFIG.SUPABASE_URL || '';
+
+// A Cloudflare Worker in front of Supabase, because some Indian ISPs will not
+// route to *.supabase.co reliably. Blank falls back to talking to Supabase
+// directly rather than to an empty origin.
+const PROXY_URL = APP_CONFIG.SUPABASE_PROXY_URL || '';
+
+const supabaseUrl = PROXY_URL || DIRECT_SUPABASE_URL;
+const supabaseKey = APP_CONFIG.SUPABASE_ANON_KEY || '';
 
 // All dates in this app are "calendar dates in India", independent of the
 // device clock's timezone. See the date helpers below.
@@ -556,10 +567,6 @@ document.addEventListener(window.PointerEvent ? 'pointerdown' : 'mousedown', fun
     if (closer) closer(); else closeModal(id);
 });
 
-// These used to hide the floating buttons behind modals. Modals now sit
-// above them via z-index, so the calls are harmless no-ops.
-function hideLandingIcons() { }
-function showLandingIcons() { }
 
 /* =====================================================================
    Category colours — a type keeps the same colour everywhere
