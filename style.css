@@ -3837,6 +3837,135 @@ body.signed-in .fab {
     }
 }
 
+/* =====================================================================
+   Voice entry, and the amount keypad helpers
+   ===================================================================== */
+
+.voice-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--brand-ink);
+    cursor: pointer;
+    transition: background-color 0.16s ease, border-color 0.16s ease;
+}
+
+.voice-btn:hover {
+    background: var(--brand-soft);
+    border-color: var(--brand-1);
+}
+
+.voice-btn .icon {
+    width: 17px;
+    height: 17px;
+}
+
+/* Deliberately a full-screen block: recognition stops the moment the tab
+   loses focus, so there is no useful way to carry on working underneath it. */
+.listening {
+    position: fixed;
+    inset: 0;
+    z-index: 13000;
+    display: grid;
+    place-items: center;
+    background: rgba(10, 12, 20, 0.55);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    padding: 1rem;
+}
+
+.listening-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 2rem 2.25rem;
+    border-radius: var(--r-lg);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    box-shadow: var(--shadow-lg);
+    text-align: center;
+}
+
+.listening-dot {
+    width: 54px;
+    height: 54px;
+    border-radius: 50%;
+    background: var(--brand-grad);
+    box-shadow: var(--shadow-brand);
+    animation: listeningPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes listeningPulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.14); opacity: 0.75; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .listening-dot { animation: none; }
+}
+
+.listening-text {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.listening-hint {
+    font-size: 0.84rem;
+    color: var(--muted);
+}
+
+/* The amount field, plus the two operators a decimal keypad does not give
+   you. Tabindex -1 on the buttons: they are a keypad affordance, and on a
+   real keyboard you would just type the character. */
+.amount-row {
+    display: flex;
+    align-items: stretch;
+    gap: 0.35rem;
+}
+
+.amount-row input {
+    flex: 1;
+    min-width: 0;
+}
+
+.amount-op {
+    flex: none;
+    width: 44px;
+    border: 1.5px solid var(--border-strong);
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-family: inherit;
+    font-size: 1.15rem;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+}
+
+.amount-op:hover {
+    background: var(--brand-soft);
+    border-color: var(--brand-1);
+    color: var(--brand-ink);
+}
+
+/* An amount you have actually spent, as opposed to a generic increment.
+   Marked so the two never read as the same kind of suggestion. */
+.chip.is-seen {
+    border-color: var(--brand-1);
+    background: var(--brand-soft);
+    color: var(--brand-ink);
+    font-variant-numeric: tabular-nums;
+}
+
 @media print {
 
     .floating-actions,

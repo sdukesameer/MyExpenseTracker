@@ -6,7 +6,7 @@
         "dev": "python3 -m http.server 8000",
         "start": "python3 -m http.server 8000",
         "validate": "node tests/validate.js",
-        "test": "node tests/validate.js && node tests/audit.js && node tests/scan.test.js && node tests/smoke.js",
+        "test": "node tests/validate.js && node tests/audit.js && node tests/scan.test.js && node tests/voice.test.js && node tests/smoke.js",
         "audit": "node tests/audit.js"
     },
     "devDependencies": {

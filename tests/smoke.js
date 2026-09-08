@@ -763,6 +763,123 @@ const visible = (page, sel) => page.$eval(sel, el => {
       document.getElementById('amount').value = '';
     });
 
+    /* ---- Quick add: type names, history, and the amount chips ---- */
+    console.log('\n── H2b. Quick add and the amount field');
+    await page.evaluate(() => loadRecentActivity());
+    await new Promise(r => setTimeout(r, 700));
+
+    // A word that IS a type files itself, whatever case it is typed in.
+    const swiggy = await page.evaluate(() => {
+      const s = window.__MOCK__.state.expense_types;
+      s.push({ id: 90, user_id: 'user-test-0001', name: 'Swiggy' });
+      s.push({ id: 91, user_id: 'user-test-0001', name: 'Personal Care' });
+      return loadUserTypes().then(() => parseQuickAdd('450 swiggy'));
+    });
+    check('a lower-case type name matches the type',
+      swiggy.type === 'Swiggy' && swiggy.amount === 450, JSON.stringify(swiggy));
+    check('…and becomes the note, so it is addable as it stands',
+      swiggy.note === 'Swiggy', JSON.stringify(swiggy));
+
+    const both = await page.evaluate(() => parseQuickAdd('450 swiggy office lunch'));
+    check('the type word is dropped from the note when there is more to say',
+      both.type === 'Swiggy' && both.note === 'office lunch', JSON.stringify(both));
+
+    // Word order carries no meaning: each part is found by what it is.
+    const orders = await page.evaluate(() => [
+      'swiggy 450', 'swiggy 450 office lunch', 'office 450 lunch swiggy',
+      'office lunch swiggy 450'
+    ].map(text => parseQuickAdd(text)));
+    check('the amount is found wherever it sits',
+      orders.every(p => p.amount === 450), JSON.stringify(orders.map(p => p.amount)));
+    check('the type is found wherever it sits',
+      orders.every(p => p.type === 'Swiggy'), JSON.stringify(orders.map(p => p.type)));
+    check('and what is left over is the summary, in the order typed',
+      orders.slice(1).every(p => p.note === 'office lunch'),
+      JSON.stringify(orders.map(p => p.note)));
+
+    const sums = await page.evaluate(() => parseQuickAdd('dinner 120+80'));
+    check('a sum is recognised mid-line too',
+      sums.amount === 200 && sums.note === 'dinner', JSON.stringify(sums));
+
+    // Two words that are both type names: the first is the type, the rest
+    // becomes the summary.
+    const ambiguous = await page.evaluate(() => parseQuickAdd('450 food travel'));
+    check('two type words — the first is the type, the other the summary',
+      ambiguous.type === 'Food' && ambiguous.note === 'travel', JSON.stringify(ambiguous));
+
+    // A multi-word type is matched whole, and beats a shorter match inside it.
+    const care = await page.evaluate(() => parseQuickAdd('300 personal care shampoo'));
+    check('a multi-word type name matches as one span',
+      care.type === 'Personal Care' && care.note === 'shampoo', JSON.stringify(care));
+
+    // A word seen in past notes is filed the way it was filed before. The
+    // fixture has "Cab" and "Flight" under Travel.
+    const cab = await page.evaluate(() => parseQuickAdd('45 cab'));
+    check('a word from your history picks up its type',
+      cab.type === 'Travel' && cab.amount === 45, JSON.stringify(cab));
+
+    const unknown = await page.evaluate(() => parseQuickAdd('90 something novel here'));
+    check('an unrecognised note leaves the note intact',
+      unknown.note === 'something novel here', JSON.stringify(unknown));
+
+    // The chips under Amount come from what has actually been spent.
+    await page.evaluate(() => {
+      document.getElementById('note').value = '';
+      document.getElementById('type').value = 'Travel';
+      renderAmountChips();
+    });
+    await new Promise(r => setTimeout(r, 250));
+    const travelChips = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('#amount-chips .chip.is-seen'))
+        .map(c => c.dataset.set));
+    check('Travel suggests the amounts spent on Travel',
+      travelChips.includes('1000') && travelChips.includes('2000'),
+      JSON.stringify(travelChips));
+
+    await page.evaluate(() =>
+      document.querySelector('#amount-chips .chip.is-seen').click());
+    check('tapping one sets the amount rather than adding to it',
+      (await page.$eval('#amount', e => e.value)) !== '',
+      await page.$eval('#amount', e => e.value));
+
+    // With nothing to go on, the fixed increments come back.
+    await page.evaluate(() => {
+      document.getElementById('note').value = '';
+      document.getElementById('type').value = '';
+      document.getElementById('amount').value = '';
+      renderAmountChips();
+    });
+    await new Promise(r => setTimeout(r, 250));
+    check('no history means the +50/+100/+200/+500 fallback',
+      await page.evaluate(() =>
+        Array.from(document.querySelectorAll('#amount-chips .chip'))
+          .map(c => c.textContent.trim()).join(',') === '+50,+100,+200,+500,Clear'),
+      await page.$eval('#amount-chips', e => e.textContent));
+
+    // The operators a decimal keypad does not offer.
+    await page.evaluate(() => {
+      document.getElementById('amount').value = '120';
+      appendAmountOperator('+');
+    });
+    check('the + key appends an operator',
+      (await page.$eval('#amount', e => e.value)) === '120+',
+      await page.$eval('#amount', e => e.value));
+    await page.evaluate(() => appendAmountOperator('-'));
+    check('a second operator swaps rather than stacks',
+      (await page.$eval('#amount', e => e.value)) === '120-',
+      await page.$eval('#amount', e => e.value));
+    await page.evaluate(() => {
+      document.getElementById('amount').value = '120+80+45';
+      resolveAmountExpression();
+    });
+    check('the expression still resolves',
+      (await page.$eval('#amount', e => e.value)) === '245',
+      await page.$eval('#amount', e => e.value));
+    await page.evaluate(() => {
+      document.getElementById('amount').value = '';
+      document.getElementById('note').value = '';
+    });
+
     /* ---- Filters that apply themselves ---- */
     console.log('\n── H3. Filters, offline queue, admin');
     await page.evaluate(() => showVisualizationModal());

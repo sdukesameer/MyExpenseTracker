@@ -14,7 +14,7 @@ let issues = 0;
 const fail = (cat, msg) => { issues++; console.log(`  ✗ [${cat}] ${msg}`); };
 const note = (cat, msg) => console.log(`  · [${cat}] ${msg}`);
 
-const APP_SCRIPTS = ['config.js', 'offline.js', 'scan.js', 'admin.js', 'script.js'];
+const APP_SCRIPTS = ['config.js', 'voice.js', 'offline.js', 'scan.js', 'admin.js', 'script.js'];
 const html = read('index.html');
 const css = read('style.css');
 const sources = APP_SCRIPTS.map(f => [f, read(f)]);

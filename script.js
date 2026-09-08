@@ -718,6 +718,8 @@ document.addEventListener('DOMContentLoaded', async function () {
     $('start-date').value = monthBounds(year, month).first;
 
     renderAmountChips();
+    wireAmountChips();
+    initVoiceButton();
     initImportExpensesUI();
     wireForms();
     registerServiceWorker();
@@ -790,6 +792,18 @@ function wireForms() {
     $('change-password-form').addEventListener('submit', handleChangePassword);
     $('edit-profile-form').addEventListener('submit', handleEditProfile);
     $('profile-password-form').addEventListener('submit', handleProfilePasswordChange);
+
+    // The amount suggestions are drawn from the type and the note, so they
+    // have to be redrawn whenever either changes — including when quick-add
+    // or the scanner fills them in, which is why 'change' is listened for on
+    // the note as well as 'input'.
+    const rerenderChips = debounce(renderAmountChips, 150);
+    ['note', 'type'].forEach(id => {
+        const field = $(id);
+        if (!field) return;
+        field.addEventListener('input', rerenderChips);
+        field.addEventListener('change', rerenderChips);
+    });
 
     // The analytics filters used to need an Apply button. They now re-run
     // themselves — debounced, because a date input fires `change` on every
@@ -1642,25 +1656,91 @@ async function handleDeleteType(event) {
    Add expense
    ===================================================================== */
 
+/**
+ * The amounts you have actually spent on whatever is currently in the Type
+ * and Note fields, commonest first. A generic +500 is a guess; your own
+ * ₹450 is a fact, and one tap instead of four.
+ *
+ * The note is weighted above the type: "Swiggy" tells you less than
+ * "office lunch" does.
+ */
+function suggestedAmounts(limit) {
+    const model = quickAddModel;
+    if (!model.typeAmounts) return [];
+
+    const score = {};
+    const add = (bucket, weight) => {
+        if (!bucket) return;
+        Object.keys(bucket).forEach(amount => {
+            score[amount] = (score[amount] || 0) + bucket[amount] * weight;
+        });
+    };
+
+    tokenizeNote(($('note') || {}).value || '')
+        .forEach(token => add(model.tokenAmounts[token], 3));
+    add(model.typeAmounts[($('type') || {}).value || ''], 1);
+
+    return Object.keys(score)
+        .map(Number)
+        .filter(amount => amount > 0)
+        .sort((a, b) => score[b] - score[a] || b - a)
+        .slice(0, limit || 4);
+}
+
+// A phone's decimal keypad has no + or −, which made the calculator in the
+// amount field desktop-only. These two put them within reach.
+const AMOUNT_FALLBACK_STEPS = [50, 100, 200, 500];
+
 function renderAmountChips() {
     const container = $('amount-chips');
     if (!container) return;
-    const presets = [50, 100, 200, 500];
-    container.innerHTML =
-        presets.map(value => `<button type="button" class="chip" data-add="${value}">+${value}</button>`).join('') +
-        '<button type="button" class="chip" data-clear="1">Clear</button>';
 
+    const seen = suggestedAmounts(4);
+    container.innerHTML =
+        (seen.length
+            ? seen.map(value =>
+                `<button type="button" class="chip is-seen" data-set="${attr(value)}"
+                    title="You have spent this before">${esc(moneyShort(value))}</button>`).join('')
+            : AMOUNT_FALLBACK_STEPS.map(value =>
+                `<button type="button" class="chip" data-add="${value}">+${value}</button>`).join('')) +
+        '<button type="button" class="chip" data-clear="1">Clear</button>';
+}
+
+// Delegated once, at startup: renderAmountChips() replaces the markup every
+// time the type or note changes, and a listener per render would stack up.
+function wireAmountChips() {
+    const container = $('amount-chips');
+    if (!container) return;
     container.addEventListener('click', function (event) {
         const button = event.target.closest('button');
         if (!button) return;
         const input = $('amount');
         if (button.dataset.clear) {
             input.value = '';
+        } else if (button.dataset.set) {
+            input.value = button.dataset.set;
         } else {
             const current = parseFloat(input.value) || 0;
             input.value = Math.min(current + Number(button.dataset.add), MAX_AMOUNT);
         }
+        input.focus();
     });
+}
+
+/** Append an operator, so the calculator works on a numeric keypad. */
+function appendAmountOperator(operator) {
+    const input = $('amount');
+    const value = String(input.value || '').trim();
+    if (!value) {
+        // A leading "+" is meaningless and a leading "−" would be a negative
+        // amount, which validation refuses anyway.
+        input.focus();
+        return;
+    }
+    input.value = /[+\-*/]$/.test(value)
+        ? value.slice(0, -1) + operator      // swap the operator rather than stack it
+        : value + operator;
+    input.focus();
 }
 
 /* =====================================================================
@@ -1779,7 +1859,18 @@ function buildQuickAddModel(rows) {
     const combos = new Map();
     const tokenTypes = {};
     const typeCounts = {};
+    // How often each amount has been spent, per type and per note word. This
+    // is what the chips under the Amount field are drawn from: your own
+    // ₹450 beats a generic +500 every time.
+    const typeAmounts = {};
+    const tokenAmounts = {};
     let totalNotes = 0;
+
+    function tally(bucket, key, amount) {
+        if (!isFinite(amount) || amount <= 0) return;
+        if (!bucket[key]) bucket[key] = {};
+        bucket[key][amount] = (bucket[key][amount] || 0) + 1;
+    }
 
     rows.forEach(row => {
         const note = String(row.note || '').trim();
@@ -1789,10 +1880,12 @@ function buildQuickAddModel(rows) {
 
         typeCounts[type] = (typeCounts[type] || 0) + 1;
         totalNotes++;
+        tally(typeAmounts, type, amount);
 
         tokenizeNote(note).forEach(token => {
             if (!tokenTypes[token]) tokenTypes[token] = {};
             tokenTypes[token][type] = (tokenTypes[token][type] || 0) + 1;
+            tally(tokenAmounts, token, amount);
         });
 
         if (!note || !isFinite(amount) || amount <= 0) return;
@@ -1808,8 +1901,9 @@ function buildQuickAddModel(rows) {
         .sort((a, b) => b.count - a.count || b.amount - a.amount)
         .slice(0, 6);
 
-    quickAddModel = { presets, tokenTypes, typeCounts, totalNotes };
+    quickAddModel = { presets, tokenTypes, typeCounts, typeAmounts, tokenAmounts, totalNotes };
     renderPresetChips();
+    renderAmountChips();
     updateQuickAddPreview();
 }
 
@@ -1818,6 +1912,61 @@ function buildQuickAddModel(rows) {
  * token is recognised — guessing a category on a money record is worse
  * than asking.
  */
+/**
+ * The run of words that IS one of your expense types, spelled however you
+ * like. "450 swiggy", "swiggy 450" and "swiggy lunch 450" all find it.
+ *
+ * Longest span first, so a type called "Personal Care" wins over a type
+ * called "Care" sitting inside the same phrase; then leftmost, which is what
+ * settles the case where two separate words are both type names — the first
+ * is the type and the rest of the line is the description.
+ *
+ * Reads the live <select> rather than the model, so a type added a moment
+ * ago is matchable immediately.
+ *
+ * Returns { name, at, span } or null.
+ */
+const MAX_TYPE_WORDS = 4;
+
+function matchTypeSpan(words) {
+    const select = $('type');
+    if (!select || !words.length) return null;
+
+    const byName = {};
+    for (const option of select.options) {
+        if (option.value) byName[option.value.trim().toLowerCase()] = option.value;
+    }
+
+    const longest = Math.min(words.length, MAX_TYPE_WORDS);
+    for (let span = longest; span >= 1; span--) {
+        for (let at = 0; at + span <= words.length; at++) {
+            const phrase = words.slice(at, at + span).join(' ').toLowerCase();
+            if (byName[phrase]) return { name: byName[phrase], at, span };
+        }
+    }
+    return null;
+}
+
+/**
+ * The type of the expenses whose notes contain this word. Exact and
+ * evidence-based, where inferType() below is a smoothed guess across every
+ * token — so "45 uber" lands on whatever you filed the last Ubers under,
+ * rather than on whichever type happens to be commonest overall.
+ */
+function typeFromHistory(note) {
+    const counts = {};
+    tokenizeNote(note).forEach(token => {
+        const seen = quickAddModel.tokenTypes[token];
+        if (!seen) return;
+        Object.keys(seen).forEach(type => {
+            counts[type] = (counts[type] || 0) + seen[type];
+        });
+    });
+    const found = Object.keys(counts);
+    if (!found.length) return '';
+    return found.reduce((best, type) => (counts[type] > counts[best] ? type : best), found[0]);
+}
+
 function inferType(note) {
     const types = Object.keys(quickAddModel.typeCounts);
     if (!types.length) return '';
@@ -1844,6 +1993,27 @@ function inferType(note) {
     return types.reduce((best, type) => (scores[type] > scores[best] ? type : best), types[0]);
 }
 
+/**
+ * "450 swiggy" / "swiggy 450" / "lunch 120+80" / "45 uber" into the three
+ * fields. Word order carries no meaning — each part is identified by what it
+ * IS, not by where it sits:
+ *
+ *   amount   the first token that reads as a number or a sum, wherever it is
+ *   type     the run of words that matches one of your types, wherever it is
+ *   note     everything left over
+ *
+ * The type is then resolved in order of how sure the app can be:
+ *
+ *   1. words that ARE one of your types — no guessing involved, and they are
+ *      dropped from the note, since "Swiggy · Swiggy" describes nothing;
+ *   2. a word you have used in a note before — filed the way you filed it
+ *      last time, which is what makes "45 uber" work;
+ *   3. the smoothed guess across every token.
+ *
+ * The note is never left empty when something was typed: a lone type word
+ * becomes the note as well, so "450 swiggy" is addable as it stands rather
+ * than failing validation on a blank description.
+ */
 function parseQuickAdd(text) {
     const raw = String(text || '').trim();
     if (!raw) return null;
@@ -1852,11 +2022,12 @@ function parseQuickAdd(text) {
     let amount = null;
     let amountIndex = -1;
 
+    // Anywhere in the line, not just the front.
     for (let i = 0; i < tokens.length; i++) {
         const value = parseAmountToken(tokens[i]);
         if (value !== null) { amount = value; amountIndex = i; break; }
     }
-    // Fall back to an arithmetic expression, e.g. "120+80 dinner".
+    // Fall back to an arithmetic expression, e.g. "dinner 120+80".
     if (amount === null) {
         for (let i = 0; i < tokens.length; i++) {
             const value = evalArithmetic(tokens[i]);
@@ -1864,8 +2035,25 @@ function parseQuickAdd(text) {
         }
     }
 
-    const note = tokens.filter((_, i) => i !== amountIndex).join(' ').trim();
-    return { amount, note, type: note ? inferType(note) : '' };
+    const rest = tokens.filter((_, i) => i !== amountIndex);
+
+    // 1. Words that name a type, wherever they sit.
+    let type = '';
+    let noteWords = rest;
+    const found = matchTypeSpan(rest);
+    if (found) {
+        type = found.name;
+        noteWords = rest.slice(0, found.at).concat(rest.slice(found.at + found.span));
+    }
+
+    let note = noteWords.join(' ').trim();
+    // Nothing but the type words: use their proper spelling as the description.
+    if (!note && type) note = type;
+
+    // 2 and 3, only when nothing named a type outright.
+    if (!type && note) type = typeFromHistory(note) || inferType(note);
+
+    return { amount, note, type };
 }
 
 function updateQuickAddPreview() {

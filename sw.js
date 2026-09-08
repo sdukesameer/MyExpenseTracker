@@ -17,6 +17,7 @@ const SHELL = [
     './manifest.json',
     './style.css',
     './config.js',
+    './voice.js',
     './script.js',
     './scan.js',
     './offline.js',

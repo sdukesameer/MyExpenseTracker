@@ -8,6 +8,29 @@ A comprehensive, feature-rich expense tracking web application built with vanill
 
 ## 🆕 What's new in 1.2
 
+**New — speak an expense.** A mic beside the quick-add box. Say
+*"four fifty swiggy"* and it lands in the box, parsed, for you to check and
+tap Add. Spoken numbers are handled properly: `"four fifty"` is ₹450, not ₹54,
+and `"fifty four"` is still ₹54. Nothing is filed by voice alone — speech
+recognition mishears amounts, and ₹4,500 logged instead of ₹450 is worse than
+one more tap. Where the browser has no Web Speech API the button never
+appears.
+
+**New — quick add ignores word order.** `450 swiggy`, `swiggy 450` and
+`office 450 lunch swiggy` all read the same: the number is the amount wherever
+it sits, the words matching one of your types are the type wherever they sit,
+and what is left is the summary. Multi-word type names match whole.
+`45 uber` picks up whatever you filed the last Ubers under. Anything else
+falls back to the smoothed guess across every word.
+
+**Changed — the chips under Amount are your own amounts.** Once a type or note
+is known they show what you have actually spent on it — tap to set, not to add.
+`+50/+100/+200/+500` remain as the fallback when there is nothing to go on.
+
+**New — `+` and `−` keys beside the amount.** The field has always accepted
+`120+80+45`, but a phone's decimal keypad has neither operator, so the
+calculator was desktop-only.
+
 **New — [scan a receipt](#-receipt-scanning).** Read a Zepto/Blinkit/Instamart/
 Swiggy order screenshot into an editable list, untick what you do not want, and
 the kept lines are summed into the amount and written into the note as
@@ -127,6 +150,13 @@ theme, and a set of iOS Safari fixes. See the full list at the end of this file.
 - **Block an address** - signs them out everywhere and stops them registering again
 - **Act as somebody** - a single-use sign-in link for support, recorded in the audit log
 - **Append-only audit** - every admin action, with who did it and when
+
+### ⚡ **Quick Entry**
+- **Speak it** - "four fifty swiggy" via the Web Speech API, on-device, no key needed
+- **Type it short** - `450 swiggy`, `45 uber`, `120+80 dinner`
+- **Type resolution** - an exact type name, then your own history, then a smoothed guess
+- **Amount suggestions** - the amounts you have actually spent on this type or note
+- **A calculator that works on a phone** - `+` and `−` keys for a keypad that has neither
 
 ### 💳 **Expense Management** 
 - **Quick Entry Form** - Add expenses with amount, type, date, notes, and billing status
@@ -489,6 +519,78 @@ above the list.
 
 `node tests/scan.test.js` covers all of the above against real receipts.
 
+## ⚡ Quick entry
+
+Three ways into the same parser, so they cannot disagree with each other.
+
+### Word order carries no meaning
+
+Each part is identified by what it **is**, not by where it sits:
+
+| | |
+|---|---|
+| **amount** | the first token that reads as a number or a sum, anywhere in the line |
+| **type** | the run of words matching one of your types, anywhere in the line |
+| **summary** | everything left over, in the order you typed it |
+
+```
+450 swiggy               ₹450 · Swiggy · "Swiggy"        addable as it stands
+swiggy 450               ₹450 · Swiggy · "Swiggy"        same thing, backwards
+office 450 lunch swiggy  ₹450 · Swiggy · "office lunch"  the type is plucked out
+dinner 120+80            ₹200 · …      · "dinner"        sums work mid-line too
+45 uber                  ₹45  · Travel · "uber"          however you filed the last Ubers
+300 personal care soap   ₹300 · Personal Care · "soap"   multi-word types match whole
+450 food travel          ₹450 · Food   · "travel"        see below
+```
+
+**One word** that names a type becomes the type, and its proper spelling
+becomes the summary too — otherwise the entry would fail validation on a blank
+description. A word that names no type is just the summary.
+
+**Two words where both name types** — `450 food travel` — is genuinely
+ambiguous. The **first** is taken as the type and the rest becomes the
+summary, on the grounds that you named the category before describing the
+thing. Longer type names win over shorter ones inside them, so a type called
+*Personal Care* beats a type called *Care*.
+
+The type is resolved in order of how sure the app can be:
+
+1. **Words that ARE one of your types**, case-insensitive, contiguous, up to
+   four of them. No guessing. They are dropped from the note, since
+   *"Swiggy · Swiggy"* describes nothing — unless they are all you typed, in
+   which case they become the note so the entry passes validation.
+2. **A word you have used in a note before**, filed the way you filed it last
+   time. This is what makes `45 uber` work.
+3. **`inferType()`**, a smoothed guess across every token.
+
+### Speaking it
+
+The mic beside *Add* uses the Web Speech API — free, on-device on iOS, and
+absent from some browsers, in which case the button is not rendered at all.
+
+Spoken numbers are their own small problem. `"four fifty"` is how a price is
+said out loud and means ₹450; plain word-by-word addition gives 54, which is
+wrong by a factor of eight. So a single digit followed straight by a tens word
+is read as hundreds, while `"fifty four"` and `"twenty five"` stay ordinary
+addition. A currency word ends the number, so *"forty rupees dinner for two"*
+does not fold the "two" into the amount.
+
+What is heard goes **into the quick-add box**, not into the database. You see
+the parse before it is filed. `node tests/voice.test.js` covers the number
+parsing.
+
+### The amount field
+
+The chips underneath are drawn from what you have actually spent, weighted so
+the note counts for three times the type — *"office lunch"* tells you more
+than *"Food"* does. Tap one to **set** the amount. With no history to draw on
+they fall back to `+50/+100/+200/+500`.
+
+`120+80+45` has always worked in that field, but `inputmode="decimal"` gives a
+keypad with no `+` or `−`, so the calculator was desktop-only. The two keys
+beside the field supply them; pressing the second swaps the operator rather
+than stacking it.
+
 ## 📴 Offline
 
 `sw.js` caches the app shell, so the app opens with no signal. `offline.js`
@@ -638,6 +740,7 @@ wait out the hour an already-issued token stays valid.
 
 ### Advanced Features
 - **Scan a receipt**: *Add New Expense → Scan receipt*, tick what counts, prefill the form
+- **Speak an expense**: the mic beside the quick-add box
 - **Search**: Use global search for quick expense lookup
 - **Bulk Edit**: Edit several expenses in either list and save them together
 - **Offline**: add expenses with no signal; they sync when you reconnect
