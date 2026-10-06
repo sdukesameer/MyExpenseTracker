@@ -32,6 +32,13 @@ the scanner asks what to do — naming which declined and why, with a countdown
 on *Try again* — rather than silently dropping to on-device OCR, which reads
 the ₹ sign as a digit and turns ₹100.00 into ₹10,000.
 
+**New — the Note field suggests, and the Type follows it.** Typing in Note
+offers your own past notes back (a native `<datalist>`, so the browser handles
+the filtering and the keyboard). An exact match brings its amount with it. The
+Type is predicted from the note as you type — the note's own history first,
+then the smoothed guess across every word, then your most-used type — and a
+Type you picked by hand is never overwritten.
+
 **New — step through months on the heatmap.** The daily-spend calendar in
 Spending Insights has `‹` and `›` either side of the title. Back stops at your
 earliest expense, forward stops at the current month, and the legend now
@@ -694,6 +701,30 @@ does not fold the "two" into the amount.
 What is heard goes **into the quick-add box**, not into the database. You see
 the parse before it is filed. `node tests/voice.test.js` covers the number
 parsing.
+
+### The Note field
+
+Typing offers back the notes you have used before. It is a native
+`<datalist>`: the browser does the filtering, the keyboard navigation and the
+screen-reader announcements, and on a phone it sits above the keyboard rather
+than fighting it. Each suggestion is annotated with what it was last filed as
+and for how much.
+
+The Type fills itself in from whatever is in Note, in order of certainty:
+
+1. **That exact note before** — same type, and its amount too.
+2. **A word from your history** — `cab to the station` goes to Travel because
+   the last Cabs did.
+3. **The smoothed guess** across every token.
+4. **Your most-used type**, when nothing else says anything.
+
+Two rules keep it from being annoying:
+
+- **It only ever fills an empty field.** An amount you have already typed is
+  never replaced by a remembered one.
+- **A Type you chose yourself wins permanently** — by dropdown, by quick-select
+  chip, from quick-add or from the scanner. The guess stops the moment you
+  make a decision, and resumes on the next expense.
 
 ### The amount field
 

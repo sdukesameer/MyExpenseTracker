@@ -693,34 +693,55 @@ const visible = (page, sel) => page.$eval(sel, el => {
       legend: (document.querySelector('#month-heatmap .heat-legend') || {}).textContent || ''
     }));
     // The fixture runs June to August 2026, and "now" is 31 Aug.
-    const heatTitle = () => page.$eval('#month-heatmap .panel-title', e => e.textContent.trim());
-    check('heatmap opens on the current month', (await heatTitle()).startsWith('August 2026'),
-      await heatTitle());
+    const shownMonth = () => page.$eval('.insights-month-label', e => e.textContent.trim());
+    const navs = () => page.$$eval('.insights-month .heat-nav', els => els.map(e => e.disabled));
+    check('insights open on the current month', (await shownMonth()).startsWith('August 2026'),
+      await shownMonth());
     check('…with no Next, since there is nothing after this month',
+      (await navs())[1] === true);
+    check('…and the headline card says "This month"',
       await page.evaluate(() =>
-        document.querySelectorAll('#month-heatmap .heat-nav')[1].disabled));
+        document.querySelector('.insight-card h4').textContent.trim() === 'This month'));
 
-    await page.evaluate(() => shiftHeatmapMonth(-1));
+    await page.evaluate(() => shiftInsightsMonth(-1));
     await new Promise(r => setTimeout(r, 250));
-    check('Back steps to July', (await heatTitle()).startsWith('July 2026'), await heatTitle());
+    check('Back steps to July', (await shownMonth()).startsWith('July 2026'), await shownMonth());
     check('…and a complete month counts all of its days, not today',
       await page.evaluate(() =>
         /of 31 days logged/.test(document.querySelector('#month-heatmap .heat-legend').textContent)),
       await page.$eval('#month-heatmap .heat-legend', e => e.textContent.trim()));
-    check('…with Next now live', await page.evaluate(() =>
-      !document.querySelectorAll('#month-heatmap .heat-nav')[1].disabled));
+    check('…with Next now live', (await navs())[1] === false);
 
-    await page.evaluate(() => shiftHeatmapMonth(-1));
+    // The whole page follows, not just the calendar.
+    check('…the cards retitle to the month being viewed',
+      await page.evaluate(() =>
+        document.querySelector('.insight-card h4').textContent.trim() === 'July 2026'),
+      await page.$eval('.insight-card h4', e => e.textContent.trim()));
+    check('…and their figures are July\'s, not August\'s',
+      await page.evaluate(() =>
+        document.querySelector('.insight-card .insight-value').textContent.includes('4,000')),
+      await page.$eval('.insight-card .insight-value', e => e.textContent.trim()));
+    check('…top categories follow too',
+      await page.evaluate(() =>
+        /Top categories in July 2026/.test(document.getElementById('insights-content').textContent)));
+    check('…and the comparison names the month before it',
+      await page.evaluate(() =>
+        /vs Jun/.test(document.querySelectorAll('.insight-card h4')[1].textContent)),
+      await page.$eval('.insight-card:nth-child(2) h4', e => e.textContent.trim()));
+    check('…with projection replaced, since a finished month has none',
+      await page.evaluate(() =>
+        /whole month/.test(document.querySelectorAll('.insight-card .insight-sub')[2].textContent)));
+
+    await page.evaluate(() => shiftInsightsMonth(-1));
     await new Promise(r => setTimeout(r, 250));
     check('Back again reaches June, the earliest month with data',
-      (await heatTitle()).startsWith('June 2026'), await heatTitle());
-    check('…and Back is then disabled',
-      await page.evaluate(() => document.querySelector('#month-heatmap .heat-nav').disabled));
+      (await shownMonth()).startsWith('June 2026'), await shownMonth());
+    check('…and Back is then disabled', (await navs())[0] === true);
 
-    await page.evaluate(() => { shiftHeatmapMonth(1); shiftHeatmapMonth(1); });
+    await page.evaluate(() => { shiftInsightsMonth(1); shiftInsightsMonth(1); });
     await new Promise(r => setTimeout(r, 250));
-    check('Forward returns to August', (await heatTitle()).startsWith('August 2026'),
-      await heatTitle());
+    check('Forward returns to August', (await shownMonth()).startsWith('August 2026'),
+      await shownMonth());
 
     check('heatmap renders one cell per day of August (31)', heat.cells === 31, String(heat.cells));
     check('  …days with spend are shaded', heat.filled > 0, String(heat.filled));
@@ -983,6 +1004,62 @@ const visible = (page, sel) => page.$eval(sel, el => {
     const unknown = await page.evaluate(() => parseQuickAdd('90 something novel here'));
     check('an unrecognised note leaves the note intact',
       unknown.note === 'something novel here', JSON.stringify(unknown));
+
+    // Typing a note suggests from your own history and fills the type.
+    const noteSuggestions = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('#note-suggestions option')).map(o => o.value));
+    check('past notes are offered as suggestions',
+      noteSuggestions.includes('Cab') && noteSuggestions.includes('Power bill'),
+      JSON.stringify(noteSuggestions.slice(0, 6)));
+
+    const typeOf = () => page.$eval('#type', e => e.value);
+    const typeIn = async text => {
+      await page.evaluate(t => {
+        const type = document.getElementById('type');
+        type.value = ''; type.dataset.chosen = '';
+        const amount = document.getElementById('amount');
+        amount.value = '';
+        const note = document.getElementById('note');
+        note.value = t;
+        note.dispatchEvent(new Event('input', { bubbles: true }));
+      }, text);
+      await new Promise(r => setTimeout(r, 400));
+    };
+
+    await typeIn('Cab');
+    check('an exact past note predicts its type', (await typeOf()) === 'Travel', await typeOf());
+    check('…and brings its amount with it',
+      (await page.$eval('#amount', e => e.value)) === '1000',
+      await page.$eval('#amount', e => e.value));
+
+    await typeIn('cab to the station');
+    check('a note sharing a word with your history predicts from it',
+      (await typeOf()) === 'Travel', await typeOf());
+    check('…but does not invent an amount for a note it has not seen',
+      (await page.$eval('#amount', e => e.value)) === '',
+      await page.$eval('#amount', e => e.value));
+
+    await typeIn('qwertyuiop zxcvbnm');
+    check('an unrecognisable note falls back to your most-used type',
+      (await typeOf()) === 'Food', await typeOf());
+
+    // A type picked by hand must survive whatever gets typed next.
+    await page.evaluate(() => {
+      selectTypeFromBubble('Utilities');
+      const note = document.getElementById('note');
+      note.value = 'Cab';
+      note.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await new Promise(r => setTimeout(r, 400));
+    check('a type chosen by hand is not overwritten by a guess',
+      (await typeOf()) === 'Utilities', await typeOf());
+
+    await page.evaluate(() => {
+      const type = document.getElementById('type');
+      type.value = ''; type.dataset.chosen = '';
+      document.getElementById('note').value = '';
+      document.getElementById('amount').value = '';
+    });
 
     // The chips under Amount come from what has actually been spent.
     await page.evaluate(() => {

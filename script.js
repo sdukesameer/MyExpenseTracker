@@ -805,6 +805,19 @@ function wireForms() {
         field.addEventListener('change', rerenderChips);
     });
 
+    // Picking a type by hand wins over every guess, until the form is reset.
+    const typeField = $('type');
+    if (typeField) {
+        typeField.addEventListener('change', () => {
+            typeField.dataset.chosen = typeField.value ? 'yes' : '';
+        });
+    }
+
+    // Debounced, because this runs a Bayes pass over every token on each
+    // keystroke and there is no need to do that mid-word.
+    const noteField = $('note');
+    if (noteField) noteField.addEventListener('input', debounce(suggestFromNote, 200));
+
     // The analytics filters used to need an Apply button. They now re-run
     // themselves — debounced, because a date input fires `change` on every
     // arrow-key nudge through a month and each run is a round trip.
@@ -1462,6 +1475,7 @@ function renderTypeBubblesResponsive(recentTypes) {
 
 function selectTypeFromBubble(name) {
     $('type').value = name;
+    $('type').dataset.chosen = 'yes';
     document.querySelectorAll('.type-bubble').forEach(bubble => {
         bubble.classList.toggle('active', bubble.textContent === name);
     });
@@ -1864,6 +1878,9 @@ function buildQuickAddModel(rows) {
     // ₹450 beats a generic +500 every time.
     const typeAmounts = {};
     const tokenAmounts = {};
+    // Distinct past notes, each remembering what it was usually filed as and
+    // for how much. This is what the Note field suggests from.
+    const noteIndex = new Map();
     let totalNotes = 0;
 
     function tally(bucket, key, amount) {
@@ -1888,6 +1905,15 @@ function buildQuickAddModel(rows) {
             tally(tokenAmounts, token, amount);
         });
 
+        if (note) {
+            // Rows arrive newest first, so the first sighting of a note is the
+            // most recent one — which is the amount and type worth offering
+            // back, not an average over something that changed price.
+            const seen = noteIndex.get(note.toLowerCase());
+            if (seen) seen.count++;
+            else noteIndex.set(note.toLowerCase(), { note, type, amount, count: 1 });
+        }
+
         if (!note || !isFinite(amount) || amount <= 0) return;
         const key = note.toLowerCase() + '|' + amount + '|' + type;
         const entry = combos.get(key) ||
@@ -1901,9 +1927,12 @@ function buildQuickAddModel(rows) {
         .sort((a, b) => b.count - a.count || b.amount - a.amount)
         .slice(0, 6);
 
-    quickAddModel = { presets, tokenTypes, typeCounts, typeAmounts, tokenAmounts, totalNotes };
+    quickAddModel = {
+        presets, tokenTypes, typeCounts, typeAmounts, tokenAmounts, noteIndex, totalNotes
+    };
     renderPresetChips();
     renderAmountChips();
+    renderNoteSuggestions();
     updateQuickAddPreview();
 }
 
@@ -1927,6 +1956,75 @@ function buildQuickAddModel(rows) {
  * Returns { name, at, span } or null.
  */
 const MAX_TYPE_WORDS = 4;
+
+/* ---------------------------------------------------------------------
+   Suggesting a note, and guessing the type from it
+   --------------------------------------------------------------------- */
+
+/**
+ * Past notes offered back as you type.
+ *
+ * A <datalist> rather than a hand-built dropdown: the browser does the
+ * filtering, the keyboard navigation and the screen-reader announcements, and
+ * on a phone it sits above the keyboard where a custom popup would be fighting
+ * it. The list is the whole history — the browser narrows it, not this.
+ */
+function renderNoteSuggestions() {
+    const list = $('note-suggestions');
+    if (!list || !quickAddModel.noteIndex) return;
+
+    const notes = Array.from(quickAddModel.noteIndex.values())
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 200);
+
+    list.innerHTML = notes.map(entry =>
+        `<option value="${attr(entry.note)}">${esc(entry.type)} · ${esc(moneyShort(entry.amount))}</option>`
+    ).join('');
+}
+
+/** The type used most often, for when a note says nothing about which. */
+function mostUsedType() {
+    const counts = quickAddModel.typeCounts || {};
+    const types = Object.keys(counts);
+    if (!types.length) return '';
+    return types.reduce((best, type) => (counts[type] > counts[best] ? type : best), types[0]);
+}
+
+/**
+ * Keep Type and Amount in step with what is being typed into Note.
+ *
+ * Only ever fills a field that is empty: a guess must never overwrite
+ * something deliberately chosen. Once you touch the Type select yourself,
+ * `dataset.chosen` marks it and nothing here touches it again.
+ */
+function suggestFromNote() {
+    const noteField = $('note');
+    const typeField = $('type');
+    if (!noteField || !typeField) return;
+
+    const note = noteField.value.trim();
+    const known = quickAddModel.noteIndex &&
+        quickAddModel.noteIndex.get(note.toLowerCase());
+
+    // An exact match on something filed before brings its amount with it —
+    // that is the whole value of recognising the note.
+    const amountField = $('amount');
+    if (known && amountField && !amountField.value.trim()) {
+        amountField.value = known.amount;
+        renderAmountChips();
+    }
+
+    if (typeField.dataset.chosen === 'yes') return;
+
+    const guess = note
+        ? (known && known.type) || typeFromHistory(note) || inferType(note) || mostUsedType()
+        : '';
+    if (!guess) return;
+    if (!Array.prototype.some.call(typeField.options, o => o.value === guess)) return;
+
+    typeField.value = guess;
+    renderAmountChips();
+}
 
 function matchTypeSpan(words) {
     const select = $('type');
@@ -2097,7 +2195,8 @@ async function submitQuickAdd() {
 
     if (parsed.note) $('note').value = parsed.note;
     if (parsed.amount !== null) $('amount').value = parsed.amount;
-    if (parsed.type) $('type').value = parsed.type;
+    if (parsed.type) { $('type').value = parsed.type; $('type').dataset.chosen = 'yes'; }
+    renderAmountChips();
 
     input.value = '';
     updateQuickAddPreview();
@@ -2326,8 +2425,10 @@ async function handleAddExpense(event) {
         $('expense-form').reset();
         $('date').value = todayISO();
         $('type').value = type;
+        $('type').dataset.chosen = '';
         resetBillingToggle();
         updateDateDisplay();
+        renderAmountChips();
         $('note').focus();
     } finally {
         button.disabled = false;
@@ -4382,7 +4483,7 @@ let velocitySource = [];
 function showInsightsModal() {
     openModal('insights-modal');
     // Always opens on the month you are in, whatever you were browsing last.
-    heatmapMonth = null;
+    insightsMonth = null;
     $('insights-content').innerHTML = '<div class="skeleton-row" style="height:320px"></div>';
     loadSpendingInsights();
 }
@@ -4407,7 +4508,8 @@ async function loadSpendingInsights() {
             .from('expenses').select('note, amount, date, type, billed')
             .order('date', { ascending: false });
         if (error) throw error;
-        displayInsights(calculateInsights(data || []), data || []);
+        insightsSource = data || [];
+        displayInsights(calculateInsights(insightsSource, insightsMonth), insightsSource);
     } catch (error) {
         console.error('Failed to load insights:', error);
         $('insights-content').innerHTML =
@@ -4415,8 +4517,21 @@ async function loadSpendingInsights() {
     }
 }
 
-function calculateInsights(expenses) {
-    const { year, month, day } = todayParts();
+/**
+ * Everything the insights page shows for one month.
+ *
+ * `target` is {year, month}; it defaults to the one we are in. The page's
+ * month stepper passes a past month, and every figure below follows it —
+ * "this month" on screen means the month on screen, not today's.
+ */
+function calculateInsights(expenses, target) {
+    const now = todayParts();
+    const { year, month } = target || now;
+    const isCurrent = year === now.year && month === now.month;
+    // Days elapsed in the month being shown. A finished month is all of it;
+    // dividing a completed July by today's date in August would understate
+    // its daily average by however far into August we are.
+    const day = isCurrent ? now.day : daysInMonth(year, month);
     const bounds = monthBounds(year, month);
     const prev = previousMonth(year, month);
     const prevBounds = monthBounds(prev.year, prev.month);
@@ -4466,6 +4581,8 @@ function calculateInsights(expenses) {
     });
 
     return {
+        year, month, isCurrent,
+        prevLabel: monthLabel(prev.year, prev.month, true),
         thisMonthTotal, lastMonthTotal, monthlyChange, topCategories,
         dailyAverage, projectedMonthly, highestExpense, lowestExpense,
         totalExpenses: thisMonth.length,
@@ -4479,17 +4596,25 @@ function calculateInsights(expenses) {
  * entry — the point is to make the gaps visible so you backfill them.
  */
 /* ---------------------------------------------------------------------
-   The daily-spend heatmap, one month at a time
+   Browsing a month
 
-   Which month is on screen. Null means "the one we are in", which is what
-   every open starts on; the arrows walk it backwards and forwards.
+   The stepper governs the whole page, not just the calendar under it. Every
+   figure labelled "this month" — the four cards, the top categories, the
+   expense range, the heatmap — is about the month on screen. Leaving the
+   cards pinned to today while the calendar moved was the kind of mismatch
+   somebody reads a wrong number off.
+
+   The trend and velocity charts are deliberately left alone: one is
+   multi-month by definition and the other is about your pace right now.
+
+   Null means "the month we are in", which is what every open starts on.
    --------------------------------------------------------------------- */
 
-let heatmapMonth = null;
+let insightsMonth = null;
+let insightsSource = [];
 
-/** The month the heatmap is showing, defaulting to the current one. */
-function heatmapShowing() {
-    if (heatmapMonth) return heatmapMonth;
+function insightsShowing() {
+    if (insightsMonth) return insightsMonth;
     const { year, month } = todayParts();
     return { year, month };
 }
@@ -4497,7 +4622,7 @@ function heatmapShowing() {
 /** The earliest month with anything in it, so Back knows where to stop. */
 function earliestExpenseMonth() {
     let earliest = null;
-    (velocitySource || []).forEach(expense => {
+    (insightsSource || []).forEach(expense => {
         const parts = splitISO(expense.date);
         if (!parts) return;
         const key = parts.year * 12 + parts.month;
@@ -4506,21 +4631,26 @@ function earliestExpenseMonth() {
     return earliest;
 }
 
-function shiftHeatmapMonth(delta) {
-    const now = heatmapShowing();
+function shiftInsightsMonth(delta) {
+    const now = insightsShowing();
     let month = now.month + delta;
     let year = now.year;
     if (month < 1) { month = 12; year--; }
     if (month > 12) { month = 1; year++; }
-    heatmapMonth = { year, month };
-    renderMonthHeatmap();
+    insightsMonth = { year, month };
+
+    // Redrawn the same way the first load draws it, so there is one path and
+    // the charts are rebuilt rather than left pointing at detached canvases.
+    if (insightsChart) { insightsChart.destroy(); insightsChart = null; }
+    if (velocityChart) { velocityChart.destroy(); velocityChart = null; }
+    displayInsights(calculateInsights(insightsSource, insightsMonth), insightsSource);
 }
 
 function renderMonthHeatmap() {
     const mount = $('month-heatmap');
     if (!mount) return;
 
-    const { year, month } = heatmapShowing();
+    const { year, month } = insightsShowing();
     const now = todayParts();
     const isThisMonth = year === now.year && month === now.month;
     const total = daysInMonth(year, month);
@@ -4534,7 +4664,7 @@ function renderMonthHeatmap() {
     // Totals for whichever month is on screen, from the same list the charts
     // use — no second fetch to step back a month.
     const dailyTotals = {};
-    (velocitySource || []).forEach(expense => {
+    (insightsSource || []).forEach(expense => {
         const parts = splitISO(expense.date);
         if (!parts || parts.year !== year || parts.month !== month) return;
         dailyTotals[parts.day] = (dailyTotals[parts.day] || 0) + (parseFloat(expense.amount) || 0);
@@ -4574,26 +4704,12 @@ function renderMonthHeatmap() {
         cells.push(`<div class="${classes.join(' ')}" title="${attr(label)}">${date}</div>`);
     }
 
-    // Forward stops at the current month — there is nothing to show past it.
-    // Back stops at the first month with anything in it.
-    const earliest = earliestExpenseMonth();
-    const atStart = !earliest || (year * 12 + month) <= earliest.key;
-    const atEnd = isThisMonth;
-
     const missed = Math.max(elapsed - logged, 0);
     const monthTotal = values.reduce((sum, v) => sum + v, 0);
 
     mount.innerHTML = `
         <div class="panel">
-            <div class="heat-head">
-                <button type="button" class="heat-nav" onclick="shiftHeatmapMonth(-1)"
-                    ${atStart ? 'disabled' : ''} aria-label="Previous month"
-                    title="${atStart ? 'Nothing logged before this' : 'Previous month'}">&lsaquo;</button>
-                <div class="panel-title">${esc(monthLabel(year, month, false))} — daily spend</div>
-                <button type="button" class="heat-nav" onclick="shiftHeatmapMonth(1)"
-                    ${atEnd ? 'disabled' : ''} aria-label="Next month"
-                    title="${atEnd ? 'This is the current month' : 'Next month'}">&rsaquo;</button>
-            </div>
+            <div class="panel-title">Daily spend</div>
             <div class="heat-week-labels">
                 ${['M', 'T', 'W', 'T', 'F', 'S', 'S'].map(d =>
         `<span>${d}</span>`).join('')}
@@ -4621,27 +4737,49 @@ function displayInsights(insights, allExpenses) {
         ? `${changeUp ? '+' : ''}${insights.monthlyChange.toFixed(1)}%`
         : '—';
 
+    // Back stops at the first month with anything in it; forward stops at the
+    // current one, since there is nothing to show past today.
+    const earliest = earliestExpenseMonth();
+    const key = insights.year * 12 + insights.month;
+    const atStart = !earliest || key <= earliest.key;
+
+    // "This month" is only honest while you are looking at it.
+    const label = monthLabel(insights.year, insights.month, false);
+    const heading = insights.isCurrent ? 'This month' : esc(label);
+
     container.innerHTML = `
+        <div class="insights-month">
+            <button type="button" class="heat-nav" onclick="shiftInsightsMonth(-1)"
+                ${atStart ? 'disabled' : ''} aria-label="Previous month"
+                title="${atStart ? 'Nothing logged before this' : 'Previous month'}">&lsaquo;</button>
+            <div class="insights-month-label">${esc(label)}${insights.isCurrent
+                ? '' : ' <span class="insights-month-tag">past month</span>'}</div>
+            <button type="button" class="heat-nav" onclick="shiftInsightsMonth(1)"
+                ${insights.isCurrent ? 'disabled' : ''} aria-label="Next month"
+                title="${insights.isCurrent ? 'This is the current month' : 'Next month'}">&rsaquo;</button>
+        </div>
         <div class="insights-grid">
             <div class="insight-card c-indigo">
-                <h4>This month</h4>
+                <h4>${heading}</h4>
                 <div class="insight-value">${esc(moneyShort(insights.thisMonthTotal))}</div>
                 <div class="insight-sub">${insights.totalExpenses} transaction${insights.totalExpenses === 1 ? '' : 's'}</div>
             </div>
             <div class="insight-card ${changeUp ? 'c-rose' : 'c-green'}">
-                <h4>vs last month</h4>
+                <h4>vs ${esc(insights.prevLabel)}</h4>
                 <div class="insight-value">${esc(changeCard)}</div>
-                <div class="insight-sub">${esc(moneyShort(insights.lastMonthTotal))} last month</div>
+                <div class="insight-sub">${esc(moneyShort(insights.lastMonthTotal))} in ${esc(insights.prevLabel)}</div>
             </div>
             <div class="insight-card c-sky">
                 <h4>Daily average</h4>
                 <div class="insight-value">${esc(moneyShort(insights.dailyAverage))}</div>
-                <div class="insight-sub">Projected ${esc(moneyShort(insights.projectedMonthly))}</div>
+                <div class="insight-sub">${insights.isCurrent
+                    ? 'Projected ' + esc(moneyShort(insights.projectedMonthly))
+                    : 'Across the whole month'}</div>
             </div>
             <div class="insight-card c-amber">
                 <h4>Per transaction</h4>
                 <div class="insight-value">${esc(moneyShort(insights.avgPerTransaction))}</div>
-                <div class="insight-sub">Average this month</div>
+                <div class="insight-sub">Average in ${esc(label)}</div>
             </div>
         </div>
 
@@ -4676,7 +4814,7 @@ function displayInsights(insights, allExpenses) {
 
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1rem;margin-top:1.5rem;">
             <div class="panel">
-                <div class="panel-title">Top categories this month</div>
+                <div class="panel-title">Top categories in ${esc(label)}</div>
                 ${insights.topCategories.length ? insights.topCategories.map(([category, amount], index) => `
                     <div class="rank-row">
                         <span class="rank-name"><span class="rank-num">${index + 1}</span>${esc(category)}</span>
@@ -4698,7 +4836,7 @@ function displayInsights(insights, allExpenses) {
                         <div class="extreme-value">${esc(money(insights.lowestExpense.amount))}</div>
                         <div class="extreme-note">${esc(insights.lowestExpense.note) || 'No description'}</div>
                         <div class="extreme-meta">${esc(insights.lowestExpense.type)} · ${esc(formatDate(insights.lowestExpense.date))}</div>
-                    </div>` : '<p class="muted-sm">No expenses this month.</p>'}
+                    </div>` : '<p class="muted-sm">No expenses in ${esc(label)}.</p>'}
             </div>
         </div>`;
 

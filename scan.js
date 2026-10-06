@@ -677,6 +677,7 @@ function applyScan() {
         const guess = inferType(note);
         if (guess && Array.prototype.some.call(typeSelect.options, o => o.value === guess)) {
             typeSelect.value = guess;
+            typeSelect.dataset.chosen = 'yes';
         }
     }
 

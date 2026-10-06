@@ -399,7 +399,10 @@
                     <div class="form-group">
                         <label for="note">Note</label>
                         <input id="note" required placeholder="Summary / description" type="text" maxlength="500"
-                            autocomplete="off" />
+                            autocomplete="off" list="note-suggestions" />
+                        <!-- Filled from your own past notes. The browser does the
+                             filtering and the keyboard handling. -->
+                        <datalist id="note-suggestions"></datalist>
                     </div>
                     <div class="form-row two">
                         <div class="form-group">

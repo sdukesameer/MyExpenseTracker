@@ -2305,6 +2305,38 @@ body.simple-mode .import-preview-table .col-billed {
     margin-bottom: 0.85rem;
 }
 
+/* Month stepper. It governs the whole insights page, so it sits at the top of
+   it rather than over the calendar it used to belong to. */
+.insights-month {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 1rem;
+}
+
+.insights-month-label {
+    flex: 1;
+    text-align: center;
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--text);
+}
+
+.insights-month-tag {
+    display: inline-block;
+    margin-left: 0.4rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: var(--r-pill);
+    background: var(--surface-3);
+    color: var(--muted);
+    font-size: 0.62rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    vertical-align: middle;
+}
+
 /* Month stepper over the heatmap. The title keeps its own bottom margin, so
    the row zeroes it and carries the spacing itself. */
 .heat-head {
