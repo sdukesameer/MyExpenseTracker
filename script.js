@@ -4381,6 +4381,8 @@ let velocitySource = [];
 
 function showInsightsModal() {
     openModal('insights-modal');
+    // Always opens on the month you are in, whatever you were browsing last.
+    heatmapMonth = null;
     $('insights-content').innerHTML = '<div class="skeleton-row" style="height:320px"></div>';
     loadSpendingInsights();
 }
@@ -4476,12 +4478,68 @@ function calculateInsights(expenses) {
  * Calendar heatmap of the current month. Blank cells are days with no
  * entry — the point is to make the gaps visible so you backfill them.
  */
-function renderMonthHeatmap(dailyTotals) {
+/* ---------------------------------------------------------------------
+   The daily-spend heatmap, one month at a time
+
+   Which month is on screen. Null means "the one we are in", which is what
+   every open starts on; the arrows walk it backwards and forwards.
+   --------------------------------------------------------------------- */
+
+let heatmapMonth = null;
+
+/** The month the heatmap is showing, defaulting to the current one. */
+function heatmapShowing() {
+    if (heatmapMonth) return heatmapMonth;
+    const { year, month } = todayParts();
+    return { year, month };
+}
+
+/** The earliest month with anything in it, so Back knows where to stop. */
+function earliestExpenseMonth() {
+    let earliest = null;
+    (velocitySource || []).forEach(expense => {
+        const parts = splitISO(expense.date);
+        if (!parts) return;
+        const key = parts.year * 12 + parts.month;
+        if (earliest === null || key < earliest.key) earliest = { key, ...parts };
+    });
+    return earliest;
+}
+
+function shiftHeatmapMonth(delta) {
+    const now = heatmapShowing();
+    let month = now.month + delta;
+    let year = now.year;
+    if (month < 1) { month = 12; year--; }
+    if (month > 12) { month = 1; year++; }
+    heatmapMonth = { year, month };
+    renderMonthHeatmap();
+}
+
+function renderMonthHeatmap() {
     const mount = $('month-heatmap');
     if (!mount) return;
 
-    const { year, month, day: today } = todayParts();
+    const { year, month } = heatmapShowing();
+    const now = todayParts();
+    const isThisMonth = year === now.year && month === now.month;
     const total = daysInMonth(year, month);
+
+    // Days that have happened. A past month is complete; the current one
+    // stops at today, so "3 of 31 logged" does not read as a bad month when
+    // it is only the 3rd.
+    const elapsed = isThisMonth ? now.day : total;
+    const today = isThisMonth ? now.day : 0;
+
+    // Totals for whichever month is on screen, from the same list the charts
+    // use — no second fetch to step back a month.
+    const dailyTotals = {};
+    (velocitySource || []).forEach(expense => {
+        const parts = splitISO(expense.date);
+        if (!parts || parts.year !== year || parts.month !== month) return;
+        dailyTotals[parts.day] = (dailyTotals[parts.day] || 0) + (parseFloat(expense.amount) || 0);
+    });
+
     // Monday-first column index for the 1st of the month.
     const firstWeekday = (new Date(Date.UTC(year, month - 1, 1)).getUTCDay() + 6) % 7;
 
@@ -4496,7 +4554,7 @@ function renderMonthHeatmap(dailyTotals) {
 
     for (let date = 1; date <= total; date++) {
         const amount = dailyTotals[date] || 0;
-        const future = date > today;
+        const future = isThisMonth && date > today;
         if (amount > 0) logged++;
 
         // Square-root scale, not linear: one big outlier (rent) would
@@ -4516,17 +4574,33 @@ function renderMonthHeatmap(dailyTotals) {
         cells.push(`<div class="${classes.join(' ')}" title="${attr(label)}">${date}</div>`);
     }
 
-    const missed = Math.max(today - logged, 0);
+    // Forward stops at the current month — there is nothing to show past it.
+    // Back stops at the first month with anything in it.
+    const earliest = earliestExpenseMonth();
+    const atStart = !earliest || (year * 12 + month) <= earliest.key;
+    const atEnd = isThisMonth;
+
+    const missed = Math.max(elapsed - logged, 0);
+    const monthTotal = values.reduce((sum, v) => sum + v, 0);
+
     mount.innerHTML = `
         <div class="panel">
-            <div class="panel-title">${esc(monthLabel(year, month, false))} — daily spend</div>
+            <div class="heat-head">
+                <button type="button" class="heat-nav" onclick="shiftHeatmapMonth(-1)"
+                    ${atStart ? 'disabled' : ''} aria-label="Previous month"
+                    title="${atStart ? 'Nothing logged before this' : 'Previous month'}">&lsaquo;</button>
+                <div class="panel-title">${esc(monthLabel(year, month, false))} — daily spend</div>
+                <button type="button" class="heat-nav" onclick="shiftHeatmapMonth(1)"
+                    ${atEnd ? 'disabled' : ''} aria-label="Next month"
+                    title="${atEnd ? 'This is the current month' : 'Next month'}">&rsaquo;</button>
+            </div>
             <div class="heat-week-labels">
                 ${['M', 'T', 'W', 'T', 'F', 'S', 'S'].map(d =>
         `<span>${d}</span>`).join('')}
             </div>
             <div class="heat-grid">${cells.join('')}</div>
             <div class="heat-legend">
-                <span>${logged} of ${today} day${today === 1 ? '' : 's'} logged${missed ? ` · ${missed} blank` : ''}</span>
+                <span>${logged} of ${elapsed} day${elapsed === 1 ? '' : 's'} logged${missed ? ` · ${missed} blank` : ''}${monthTotal ? ` · ${esc(moneyShort(monthTotal))}` : ''}</span>
                 <span class="heat-scale">
                     less
                     ${[0, 1, 2, 3, 4].map(l => `<i class="heat-cell level-${l}"></i>`).join('')}
@@ -4535,6 +4609,7 @@ function renderMonthHeatmap(dailyTotals) {
             </div>
         </div>`;
 }
+
 
 function displayInsights(insights, allExpenses) {
     const container = $('insights-content');
@@ -4628,7 +4703,10 @@ function displayInsights(insights, allExpenses) {
         </div>`;
 
     wireRadioPills();
-    renderMonthHeatmap(insights.dailyTotals || {});
+    // Set before the heatmap draws: it reads this list to build whichever
+    // month is on screen, not just the current one.
+    velocitySource = allExpenses;
+    renderMonthHeatmap();
 
     if (!chartsAvailable()) return;
 
@@ -4638,7 +4716,6 @@ function displayInsights(insights, allExpenses) {
         .slice(-12);
 
     insightsChartData = { sortedMonths, monthlyData: insights.monthlyData };
-    velocitySource = allExpenses;
 
     renderMonthlyTrendChart('bar');
     renderVelocityChart(currentDay, 'bar');

@@ -692,6 +692,36 @@ const visible = (page, sel) => page.$eval(sel, el => {
       today: document.querySelectorAll('#month-heatmap .heat-grid .heat-cell.is-today').length,
       legend: (document.querySelector('#month-heatmap .heat-legend') || {}).textContent || ''
     }));
+    // The fixture runs June to August 2026, and "now" is 31 Aug.
+    const heatTitle = () => page.$eval('#month-heatmap .panel-title', e => e.textContent.trim());
+    check('heatmap opens on the current month', (await heatTitle()).startsWith('August 2026'),
+      await heatTitle());
+    check('…with no Next, since there is nothing after this month',
+      await page.evaluate(() =>
+        document.querySelectorAll('#month-heatmap .heat-nav')[1].disabled));
+
+    await page.evaluate(() => shiftHeatmapMonth(-1));
+    await new Promise(r => setTimeout(r, 250));
+    check('Back steps to July', (await heatTitle()).startsWith('July 2026'), await heatTitle());
+    check('…and a complete month counts all of its days, not today',
+      await page.evaluate(() =>
+        /of 31 days logged/.test(document.querySelector('#month-heatmap .heat-legend').textContent)),
+      await page.$eval('#month-heatmap .heat-legend', e => e.textContent.trim()));
+    check('…with Next now live', await page.evaluate(() =>
+      !document.querySelectorAll('#month-heatmap .heat-nav')[1].disabled));
+
+    await page.evaluate(() => shiftHeatmapMonth(-1));
+    await new Promise(r => setTimeout(r, 250));
+    check('Back again reaches June, the earliest month with data',
+      (await heatTitle()).startsWith('June 2026'), await heatTitle());
+    check('…and Back is then disabled',
+      await page.evaluate(() => document.querySelector('#month-heatmap .heat-nav').disabled));
+
+    await page.evaluate(() => { shiftHeatmapMonth(1); shiftHeatmapMonth(1); });
+    await new Promise(r => setTimeout(r, 250));
+    check('Forward returns to August', (await heatTitle()).startsWith('August 2026'),
+      await heatTitle());
+
     check('heatmap renders one cell per day of August (31)', heat.cells === 31, String(heat.cells));
     check('  …days with spend are shaded', heat.filled > 0, String(heat.filled));
     check('  …today is marked exactly once', heat.today === 1, String(heat.today));

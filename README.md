@@ -32,6 +32,13 @@ the scanner asks what to do — naming which declined and why, with a countdown
 on *Try again* — rather than silently dropping to on-device OCR, which reads
 the ₹ sign as a digit and turns ₹100.00 into ₹10,000.
 
+**New — step through months on the heatmap.** The daily-spend calendar in
+Spending Insights has `‹` and `›` either side of the title. Back stops at your
+earliest expense, forward stops at the current month, and the legend now
+carries that month's total. A completed month counts all of its days rather
+than stopping at today's date, so July does not read as "3 of 31" when it is
+actually finished.
+
 **New — paste from Excel.** Open *Import Expenses*, copy the cells out of
 Excel, Sheets or Numbers, and press Ctrl+V. No saving to a file first. The
 clipboard carries them as tab-separated text, which the spreadsheet library

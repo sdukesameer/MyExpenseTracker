@@ -2305,6 +2305,47 @@ body.simple-mode .import-preview-table .col-billed {
     margin-bottom: 0.85rem;
 }
 
+/* Month stepper over the heatmap. The title keeps its own bottom margin, so
+   the row zeroes it and carries the spacing itself. */
+.heat-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.85rem;
+}
+
+.heat-head .panel-title {
+    flex: 1;
+    margin-bottom: 0;
+    text-align: center;
+}
+
+.heat-nav {
+    flex: none;
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--text-2);
+    font-family: inherit;
+    font-size: 1.15rem;
+    line-height: 1;
+    cursor: pointer;
+    transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+}
+
+.heat-nav:hover:not(:disabled) {
+    background: var(--brand-soft);
+    border-color: var(--brand-1);
+    color: var(--brand-ink);
+}
+
+.heat-nav:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
 .rank-row {
     display: flex;
     justify-content: space-between;
