@@ -8,12 +8,35 @@ A comprehensive, feature-rich expense tracking web application built with vanill
 
 ## 🆕 What's new in 1.2
 
-**New — the scanner has three cloud readers.** Gemini, then OpenAI, then
+**Removed — on-device OCR.** Tesseract is gone entirely, not kept as a
+fallback. It read the ₹ symbol as a digit and lost decimal points, turning
+₹100.00 into ₹10,000, and a total wrong by a hundredfold saved without anyone
+noticing which reader produced it is worse than no scan. That deleted 486
+lines, a test file and four CSP entries.
+
+**New — six cloud readers, and model names that keep themselves current.**
+Gemini, Groq, Mistral, OpenRouter, OpenAI and Claude. Each provider's model
+list is fetched live and filtered by what the provider publishes about each
+model, then sorted newest-first by the digits in the id — so a new version
+gets picked up with no code change. Proven in testing: the committed list said
+`gemini-3.6-flash`, discovery found and used `gemini-3.8-flash`.
+
+**New — the scanner names its reader.** *Read by Gemini · gemini-3.8-flash*
+sits above the item list, because when a scan comes out wrong the first useful
+question is which model read it.
+
+**Superseded — the scanner has three cloud readers.** Gemini, then OpenAI, then
 Claude; the first that answers wins, and a provider that is out of quota is
 skipped for a minute instead of costing a round trip. When *all* of them fail
 the scanner asks what to do — naming which declined and why, with a countdown
 on *Try again* — rather than silently dropping to on-device OCR, which reads
 the ₹ sign as a digit and turns ₹100.00 into ₹10,000.
+
+**New — paste from Excel.** Open *Import Expenses*, copy the cells out of
+Excel, Sheets or Numbers, and press Ctrl+V. No saving to a file first. The
+clipboard carries them as tab-separated text, which the spreadsheet library
+already loaded for the file path parses, so there is one code path and one set
+of rules.
 
 **Changed — import takes an export.** Same column names, same order
 (`Date, Type, Note, Amount, Billed`), and the importer now accepts ISO dates,
@@ -498,30 +521,71 @@ press *Add Expense*. There is no image storage on either path.
 
 ### The readers
 
-| | Where it runs | Needs | Accuracy |
-|---|---|---|---|
-| **Gemini → OpenAI → Claude** | `netlify/functions/scan.mjs` | any one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Reads the *layout*: knows the right-hand column is money and that a struck-through number is the old MRP |
-| **Tesseract** | The device, via `cdn.jsdelivr.net` | nothing | Character recognition only; the parser in `scan.js` repairs what it can |
+There is **no on-device fallback any more**. Tesseract was removed outright,
+not demoted: it reads the ₹ symbol as a digit and loses decimal points, so
+₹100.00 becomes ₹10,000. A total wrong by a factor of a hundred, saved without
+anyone noticing which reader produced it, is worse than a scanner that admits
+it cannot read the receipt today. Removing it deleted 486 lines, a test file
+and four CSP entries.
 
-Providers are tried in order and the first that answers wins; each walks its
-own list of model names, because providers retire them and the failure looks
-like a broken scanner rather than a renamed model. A 429 puts that provider on
-a cooldown (its `Retry-After`, or 60s) so the next scan skips straight past it.
+Providers are tried in order, first answer wins:
 
-**What happens when the cloud cannot be used depends on why:**
+| | Free tier | Tested |
+|---|---|---|
+| **Gemini** | yes | ✅ 14/14 exact, 6/6 scans, no rate limit hit |
+| **Groq** | yes | ⚠️ no vision model in its catalogue today — correctly skipped |
+| **Mistral** | yes | ⚠️ instant 429 on this account's free tier |
+| **OpenRouter** | `:free` models | ⚠️ 429, shared upstream pool is saturated |
+| **OpenAI** | no | paid |
+| **Claude** | no | paid |
 
-- **No provider key at all** → on-device OCR, silently. There is nothing to
-  wait for.
-- **Keys set, every reader failed** → the scanner *asks*. It names which
-  provider declined and why, counts down the cooldown on a disabled *Try
-  again*, and offers *Read it on this device* next to it.
+### Model names keep themselves current
 
-That distinction matters. On-device OCR mistakes the ₹ sign for a digit and
-loses decimal points — ₹100.00 becomes ₹10,000 — so dropping to it silently is
-how a wrong total gets saved without anyone noticing which reader produced it.
+This is the part that used to need hand-editing every few months. Nothing here
+names a model as gospel:
+
+1. Each provider's model list is **fetched live** and filtered by what the
+   provider itself publishes about each model — Mistral's `capabilities.vision`,
+   OpenRouter's `architecture.input_modalities` plus `pricing.prompt == 0`,
+   Gemini's `supportedGenerationMethods`. Name-matching is the last resort, for
+   the providers that publish nothing (OpenAI, Groq).
+2. Survivors are sorted by **the digits in the id**, newest first — so
+   `gemini-3.8-flash` beats `gemini-3.6-flash`, and `claude-haiku-4-5-20251001`
+   beats the same model's older snapshot, with nobody editing a list.
+3. If discovery works and finds **nothing** that can see an image, the provider
+   is skipped rather than wasting round trips on stale names. That is exactly
+   what happens to Groq today.
+4. `GEMINI_MODEL`, `GROQ_MODEL`, … pin one model and skip discovery entirely.
+
+Live proof: the committed fallback list said `gemini-3.6-flash`; discovery
+found and used `gemini-3.8-flash` without a code change.
+
+### What testing found
+
+Run against a real 14-item Blinkit screenshot with struck-through MRPs:
+
+- **Accuracy.** Gemini got 14/14 exact — the paid price rather than the struck
+  MRP every time, `Lady Finger ×2` as a quantity rather than a pack size, and
+  both FREE fees correctly left out. ₹792 to the rupee.
+- **Multiple images work.** 2, 3 and 5 screenshots in one scan all succeed, and
+  the model deduplicates — the prompt says consecutive shots are one order, and
+  sending the same image five times still returned 14 rows, not 70.
+- **Rate limits are not the problem; latency is.** Six scans back to back never
+  hit a limit. But one took 68 seconds, because the newest flash model is also
+  the most contended and the chain walks down through 503s.
+- **503 is per-model, 429 is per-key.** An overloaded `gemini-3.8-flash` says
+  nothing about `gemini-3.5-flash-lite`, so a 503 advances the model while a
+  429 cools the whole provider. Before this distinction the scanner gave up on
+  Gemini entirely whenever its newest model was busy.
+- **Netlify would have killed it.** Functions time out at 10s by default, 26s
+  maximum. `netlify.toml` now sets `timeout = 26` and the chain keeps its own
+  21s budget — enforced *per attempt*, not just between them, because one slow
+  call was enough to turn a 21s budget into a 68s request.
 
 `GET /.netlify/functions/scan?diagnose=1` lists every provider, whether it is
-configured, the models it will try, and any cooldown still running.
+configured, the models it will actually try today in order, and any cooldown
+still running. That is the one call to make when a scan picks a model you did
+not expect.
 
 ### What the parser has to survive
 
@@ -855,15 +919,20 @@ never delivered to a browser.
 | Variable | Needed for | Effect if unset |
 |---|---|---|
 | `SUPABASE_SERVICE_ROLE_KEY` | The admin panel's auth actions | Block, create, delete, password links and *sign in as* report that they are not configured. Bypasses every RLS policy — Netlify's environment and nowhere else. |
-| `GEMINI_API_KEY` | The receipt scanner | Skipped. Set at least one provider or scanning falls back to on-device OCR. |
+| `GEMINI_API_KEY` | The receipt scanner | Skipped. With none of the six set, scanning is unavailable — there is no on-device fallback. |
+| `GROQ_API_KEY` | The same | Skipped. |
+| `MISTRAL_API_KEY` | The same | Skipped. |
+| `OPENROUTER_API_KEY` | The same | Skipped. |
 | `OPENAI_API_KEY` | The same | Skipped. |
 | `ANTHROPIC_API_KEY` | The same | Skipped. |
-| `GEMINI_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | Pinning a model | Each provider walks its own built-in list instead. Set one only when a newer model lands before that list is updated. |
+| `GEMINI_MODEL`, `GROQ_MODEL`, … | Pinning a model | Each provider discovers its own, newest first. Set one only to override that. |
+| `SCAN_MAX_IMAGES` | Screenshots per scan | Defaults to 5. |
+| `SCAN_TIME_BUDGET_MS` | How long the chain may take | Defaults to 24000, just under Netlify's 26s ceiling. |
 
-The three scanner providers are tried **in that order** and the first that
-answers wins, so one being out of quota does not drop you to the worst reader.
-A provider that returns 429 is skipped for a minute (or whatever `Retry-After`
-asks for) rather than costing a round trip each time.
+Providers are tried **in that order** and the first that answers wins. A 429
+puts that provider on a cooldown; "no credits remaining" is told apart from a
+rate limit and cooled for an hour, because waiting a minute will not add money
+to an account.
 
 `SECRETS_SCAN_ENABLED` is left **on** in `netlify.toml`: it fails the build if
 either secret turns up in a deployed file. The three public names are listed in

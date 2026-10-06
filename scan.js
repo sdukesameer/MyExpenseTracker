@@ -1,405 +1,18 @@
 /* =====================================================================
    Receipt scanning — read a bill, tick what counts, prefill the form
 
-   Two readers. Where GEMINI_API_KEY is configured the screenshots go to a
-   vision model, which understands that the right-hand column is money and
-   that a crossed-out number is the old price. Where one is not, Tesseract
-   reads them on the device and the parser below picks the result apart.
+   Every reader is a vision model. There used to be an on-device Tesseract
+   fallback and it was worse than nothing: character recognition has never
+   been shown a ₹, so it reads the symbol as a digit, and it drops decimal
+   points, turning ₹100.00 into ₹10,000. A total that is wrong by a factor of
+   a hundred, saved without anyone noticing which reader produced it, is worse
+   than a scanner that says it cannot read the receipt today.
 
-   Tesseract is honest-to-goodness character recognition, not a layout model
-   — it does not even know the ₹ glyph — so the parser is deliberately
-   forgiving and everything either reader produces is editable before it is
-   used. No image is stored by either path: what comes out is an amount and
-   a one-line summary, which land in the Add Expense form for you to check.
+   So the providers are tried in turn and the first that answers wins. When
+   every one of them fails the scanner says so and offers the keyboard.
 
-   Loaded BEFORE script.js so MODAL_CLOSERS can name closeScanModal without
-   a forward reference.
+   Loaded before script.js so MODAL_CLOSERS can name closeScanModal.
    ===================================================================== */
-
-/* =====================================================================
-   Line classification
-   ===================================================================== */
-
-// Rows that are never items: order metadata, totals, savings banners.
-const SCAN_NOISE = new RegExp([
-    '^(sub\\s*)?total', '^grand\\s*total', '^to\\s*pay', '^amount\\s*payable',
-    '^payable', '^bill\\s*(total|details)', '^item\\s*total', '^order\\s*(id|no|summary)',
-    '^invoice', '^gst\\s*(no|in)', '^address', '^deliver(ed|y)\\s*(to|in|by)',
-    '^arriv', '^eta\\b', '^paid\\s*(via|using)', '^payment', '^thank',
-    '^you\\s*sav', '^sav(ed|ings)', '^discount', '^coupon', '^promo',
-    '^mrp\\b', '^cart\\s*total', '^grand\\b', '^\\W*$',
-    // Screenshot chrome. A phone screenshot of an order carries the app's
-    // header and footer and the phone's own status bar, and every one of
-    // those lines ends in a number that is not an amount.
-    '^order\\s*[#:]', '^order\\s*(again|details|placed)', '^\\d+\\s*items?\\b',
-    '^items?\\s*in\\s*order', '^(get|need)\\s*help', '^rate\\s*(order|us)',
-    '^repeat\\s*order', '^track\\s*order', '^view\\s*(invoice|bill|details)',
-    '^download\\s*invoice', '^\\d{1,2}:\\d{2}\\s*(am|pm)?\\b',
-    '^\\d+(\\.\\d+)?\\s*(kb|mb)/s\\b', '^delivered\\b', '^refund'
-].join('|'), 'i');
-
-// Rows that are a charge rather than a thing you bought. Nothing is
-// distributed here, so a fee is just a row you can untick — but it is worth
-// labelling, because it is the row most often untypical of the expense.
-const SCAN_FEE = new RegExp([
-    'handling', 'delivery\\s*(fee|charge|partner)', 'platform\\s*fee',
-    'small\\s*cart', 'surge', 'rain\\s*fee', 'packaging', 'packing',
-    'convenience', '\\btip\\b', '\\bgst\\b', '\\btax(es)?\\b',
-    'service\\s*(charge|fee)', 'cgst', 'sgst', 'round\\s*off'
-].join('|'), 'i');
-
-// Units that follow a number, so "500 g" is a weight and not ₹500.
-const SCAN_UNIT_AFTER = /^(g|gm|gms|kg|kgs|ml|l|ltr|litre|pc|pcs|piece|pieces|pack|packs|nos?|units?|dozen|combo|sachet|bottle|can|box|bag)\b/i;
-
-// The same words, plus the filler around them, for deciding whether a line
-// is *only* a size — "1 pc • 1 unit", "250 - 275 g • 2 units".
-const SCAN_SIZE_WORD = /^(g|gm|gms|kg|kgs|ml|l|ltr|litre|lit|pc|pcs|piece|pieces|packet|pack|packs|no|nos|unit|units|dozen|combo|sachet|bottle|can|box|bag|approx|each|of|per|x|gram|grams|kilo|kilos|litres|liters)$/i;
-
-// Zepto, Blinkit and Instamart all print the size on its own row beneath the
-// item, with the struck-out MRP beside it. That row is not an item and its
-// amount is not what anybody paid.
-function scanIsDescriptor(name) {
-    const words = String(name).split(/\s+/).filter(Boolean);
-    if (!words.length) return false;
-    let sawSize = false;
-    for (let i = 0; i < words.length; i++) {
-        const w = words[i].replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
-        if (!w) continue;
-        if (/^\d+(\.\d+)?$/.test(w)) continue;
-        if (SCAN_SIZE_WORD.test(w)) { sawSize = true; continue; }
-        const glued = w.match(/^(\d+(?:\.\d+)?)([A-Za-z]+)$/);   // "275g"
-        if (glued && SCAN_SIZE_WORD.test(glued[2])) { sawSize = true; continue; }
-        return false;
-    }
-    return sawSize;
-}
-
-/* =====================================================================
-   The missing rupee
-
-   Tesseract's English model has never been shown a ₹, so it substitutes
-   whatever glyph it thinks is closest — and it is perfectly consistent about
-   it within one screenshot. On a Blinkit order it reads every ₹ as a "2",
-   which silently turns ₹35 into 235 and a ₹469 basket into ₹53,727.
-
-   Nothing in the line itself can tell 235 from ₹35. The whole document can:
-   if not one real currency mark survived anywhere, and every amount in the
-   right-hand column carries the same leading character, and that character
-   is one a ₹ plausibly collapses into — then that character IS the ₹.
-   ===================================================================== */
-
-const SCAN_MISREAD = /^[2356789zZsS$%?!|*&€¥£RrFfTtEe\]\}"']$/;
-const SCAN_REAL_MARK = /₹|₨|\brs\.?\s*\d|\binr\b/i;
-
-// Only the amount column counts as evidence: one stray character, then at
-// least two digits, at the end of a line. A genuine bare "45" is one digit
-// after its first, so it never votes.
-const SCAN_COLUMN = /(?:^|\s)(\S)(\d\d[\d,]*(?:\.\d{1,2})?)\s*$/;
-
-function scanEscapeRe(ch) { return ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-function detectRupeeGlyph(lines) {
-    if (lines.some(l => SCAN_REAL_MARK.test(l))) return null;
-    let glyph = null;
-    let votes = 0;
-    for (let i = 0; i < lines.length; i++) {
-        if (SCAN_NOISE.test(lines[i])) continue;
-        const m = lines[i].match(SCAN_COLUMN);
-        if (!m) continue;
-        if (!SCAN_MISREAD.test(m[1])) return null;         // one dissenter is enough
-        if (glyph === null) glyph = m[1];
-        else if (glyph !== m[1]) return null;
-        votes++;
-    }
-    return votes >= 4 ? glyph : null;
-}
-
-// Rewrite only the run of amounts at the end of a line, so a "200 g" in the
-// middle of a name is left alone while a struck MRP sitting beside the
-// payable amount is not.
-function scanRestoreRupees(lines, glyph) {
-    const g = scanEscapeRe(glyph);
-    const tail = new RegExp('((?:(?:^|\\s)' + g + '\\d\\d[\\d,]*(?:\\.\\d{1,2})?)+)\\s*$');
-    const one = new RegExp('(^|\\s)' + g + '(\\d)', 'g');
-    return lines.map(l => l.replace(tail, run => run.replace(one, '$1₹$2')));
-}
-
-/* =====================================================================
-   Prices and quantities
-
-   Everything is carried in paise. Forty rows of floating-point rupees drift;
-   integers do not, and the total is turned back into rupees exactly once, on
-   the way into the form.
-   ===================================================================== */
-
-function scanToPaise(text) {
-    const cleaned = String(text).replace(/,/g, '');
-    if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
-    const n = parseFloat(cleaned);
-    // Guard against OCR turning a barcode into a price.
-    if (!isFinite(n) || n <= 0 || n > 1000000) return null;
-    return Math.round(n * 100);
-}
-
-function scanPricesIn(line) {
-    const found = [];
-
-    // Anchored to a currency mark — the most reliable signal. OCR renders ₹
-    // variously as ₹, ₨, Rs, INR, or a stray R.
-    const anchored = /(?:₹|₨|rs\.?|inr|r5)\s*([\d,]+(?:\.\d{1,2})?)/gi;
-    let m;
-    while ((m = anchored.exec(line)) !== null) {
-        const v = scanToPaise(m[1]);
-        if (v !== null) found.push(v);
-    }
-    if (found.length) return found;
-
-    // Otherwise a bare number at the very end of the line is the amount
-    // column — unless it is welded to letters, which makes it a reference
-    // rather than an amount. "Order #HGTKKOIU49669" is not ₹49,669. A single
-    // letter in front is fine: that is a ₹ the reader did not recognise.
-    const trailing = line.match(/(\S*?)([\d,]+(?:\.\d{1,2})?)\s*$/);
-    if (trailing && !/[A-Za-z]{2}|#/.test(trailing[1]) && !/^[xX×]$/.test(trailing[1])) {
-        const v = scanToPaise(trailing[2]);
-        if (v !== null) found.push(v);
-    }
-    return found;
-}
-
-// A discounted row carries two amounts: what it cost, and the struck-out
-// MRP. Which comes first depends on the app — Blinkit puts the payable above
-// the MRP, Swiggy after it — but the payable is always the smaller of the
-// two. A line doing arithmetic ("2 x 50 = 100") is left alone.
-function scanPickPrice(prices, line) {
-    if (prices.length === 2 && !/\d\s*[x×@=]\s*[\d₹]/i.test(line)) {
-        return Math.min(prices[0], prices[1]);
-    }
-    return prices[prices.length - 1];
-}
-
-// "12 x 70 g" is a pack size; "x2" is how many were bought. Telling them
-// apart is the whole difficulty: a count is never followed by a unit, and an
-// "N x" count is never followed by another number.
-function scanQuantityCandidates(line) {
-    const found = [];
-
-    // "x2" — the near-universal marker, so it wins.
-    const after = /(?:^|\s)x\s*(\d{1,2})(?=\s|$)/gi;
-    let m;
-    while ((m = after.exec(line)) !== null) {
-        const rest = line.slice(m.index + m[0].length).trim();
-        if (SCAN_UNIT_AFTER.test(rest)) continue;          // "x 70 g" is a pack size
-        found.push({ n: parseInt(m[1], 10), at: m.index, form: 'after' });
-    }
-    if (found.length) return found;
-
-    // "2 x Dairy Milk" — only when what follows is neither a unit nor
-    // another number, which is what "12 x 70 g" looks like.
-    const before = /(?:^|\s)(\d{1,2})\s*x(?=\s|$)/gi;
-    while ((m = before.exec(line)) !== null) {
-        const rest = line.slice(m.index + m[0].length).trim();
-        if (SCAN_UNIT_AFTER.test(rest) || /^\d/.test(rest)) continue;
-        found.push({ n: parseInt(m[1], 10), at: m.index, form: 'before' });
-    }
-    return found;
-}
-
-function scanQuantityIn(line) {
-    const candidates = scanQuantityCandidates(line);
-    if (candidates.length) {
-        const q = candidates[candidates.length - 1].n;
-        if (q >= 1 && q <= 99) return q;
-    }
-
-    const m = line.match(/\bqty\.?\s*[:\-]?\s*(\d{1,2})\b/i) ||
-              line.match(/(?:^|\s)(\d{1,2})\s*units?\b/i) ||
-              line.match(/\((\d{1,2})\)\s*$/);
-    if (!m) return 1;
-    const q = parseInt(m[1], 10);
-    return q >= 1 && q <= 99 ? q : 1;
-}
-
-// The item thumbnail in a Zepto or Blinkit screenshot is read as a short run
-// of nonsense to the left of the name: "& Bottle Gourd", "t3 Baby Apple
-// Shimla", "© ..& Tomato Local". Everything before the first real word goes,
-// as long as a real name is left behind.
-function scanStripLeadingJunk(name) {
-    const words = name.split(' ');
-    let i = 0;
-    while (i < words.length - 1 && !/^[A-Za-z]{3,}/.test(words[i])) i++;
-    const rest = words.slice(i).join(' ');
-    return /[A-Za-z]{3}/.test(rest) ? rest : name;
-}
-
-function scanBareName(text) {
-    return text
-        // Currency-marked amounts first.
-        .replace(/(?:₹|₨|rs\.?|inr|r5)\s*[\d,]+(?:\.\d{1,2})?/gi, ' ')
-        // Then the quantity — BEFORE the trailing-number pass, which would
-        // otherwise eat the digits of "x2" and leave a stray "x" behind. Only
-        // a real count is removed, so "12 x 70 g" stays in the name.
-        .replace(/(?:^|\s)x\s*\d{1,2}(?=\s|$)/gi, function (match, offset, whole) {
-            const rest = whole.slice(offset + match.length).trim();
-            return SCAN_UNIT_AFTER.test(rest) ? match : ' ';
-        })
-        .replace(/(?:^|\s)\d{1,2}\s*x(?=\s|$)/gi, function (match, offset, whole) {
-            const rest = whole.slice(offset + match.length).trim();
-            return (SCAN_UNIT_AFTER.test(rest) || /^\d/.test(rest)) ? match : ' ';
-        })
-        .replace(/\bqty\.?\s*[:\-]?\s*\d{1,2}\b/gi, ' ')
-        .replace(/\(\d{1,2}\)\s*$/, ' ')
-        // Finally a bare amount sitting in the last column.
-        .replace(/([\d,]+(?:\.\d{1,2})?)\s*$/, ' ')
-        .replace(/[|•·>«»]+/g, ' ')
-        .replace(/\s{2,}/g, ' ')
-        .replace(/^[\s\-–—.,:]+|[\s\-–—.,:]+$/g, '')
-        .trim();
-}
-
-function scanCleanName(text) {
-    return scanStripLeadingJunk(scanBareName(text));
-}
-
-/* =====================================================================
-   The parser
-
-   Returns { rows, merged, skipped, glyph } where each row is
-   { name, qty, totalPaise, kind: 'item' | 'fee' }.
-   ===================================================================== */
-
-function parseReceipt(text) {
-    const lines = String(text || '')
-        .split(/\r?\n/)
-        .map(l => l.replace(/\s+/g, ' ').trim())
-        .filter(l => l.length > 0);
-
-    // Put the rupee sign back before anything is read, if the reader lost it.
-    const glyph = detectRupeeGlyph(lines);
-    const readable = glyph ? scanRestoreRupees(lines, glyph) : lines;
-
-    const rows = [];
-    let pending = [];      // name fragments awaiting a price on a later line
-    let skipped = 0;
-
-    function flushPending(totalPaise, qtyHint) {
-        const name = scanCleanName(pending.join(' '));
-        pending = [];
-        if (!name) return false;
-        push(name, qtyHint || scanQuantityIn(name), totalPaise);
-        return true;
-    }
-
-    function push(name, qty, totalPaise) {
-        const nice = scanCleanName(name);
-        if (!nice || totalPaise == null) return -1;
-        rows.push({
-            name: nice,
-            qty: qty,
-            totalPaise: totalPaise,
-            kind: SCAN_FEE.test(nice) ? 'fee' : 'item'
-        });
-        return rows.length - 1;
-    }
-
-    // A long product name wraps, and the half that spills onto the next line
-    // lands beside the struck-out MRP: "Ganesh Whole Wheat Chakki Pure Atta |"
-    // then "No Maida  ₹56". Without this that ₹56 becomes a "Maida" nobody
-    // bought. The separator left hanging at the wrap is what gives it away.
-    const WRAP_END = /[|/&]\s*$/;
-    let continueInto = -1;
-
-    function looksLikeContinuation(name) {
-        const words = name.split(' ').filter(Boolean);
-        return words.length > 0 && words.length <= 4 && !/\d/.test(name);
-    }
-
-    readable.forEach(function (line) {
-        if (SCAN_NOISE.test(line)) {
-            // A noise line also breaks any half-built item.
-            if (pending.length) { pending = []; skipped++; }
-            skipped++;
-            return;
-        }
-
-        const prices = scanPricesIn(line);
-        const base = scanBareName(line);
-
-        if (continueInto > -1) {
-            const carry = continueInto;
-            continueInto = -1;
-            if (!pending.length && looksLikeContinuation(base)) {
-                rows[carry].name = scanCleanName(rows[carry].name + ' ' + base);
-                rows[carry].kind = SCAN_FEE.test(rows[carry].name) ? 'fee' : 'item';
-                skipped++;                 // its amount was the MRP, not a price
-                return;
-            }
-        }
-
-        // Whether anything survives once currency markers and amounts are
-        // stripped. "Rs 38" and "₹42" leave nothing, so they are price-only
-        // lines; "500 g" leaves a weight, so it belongs to the name above it.
-        const named = base.length > 0;
-
-        if (prices.length && named) {
-            const amount = scanPickPrice(prices, line);
-
-            // A size row carrying an amount — "1 pc • 1 unit  ₹99". If a name
-            // is still waiting then this is its size and its price. If not,
-            // the item above already took its price and this is the struck-out
-            // MRP printed underneath it, which nobody paid.
-            if (scanIsDescriptor(base)) {
-                if (pending.length) { pending.push(base); flushPending(amount); }
-                else skipped++;
-                return;
-            }
-
-            // Name and amount on the same line — the common case.
-            if (pending.length) flushPending(null);
-            const at = push(line, scanQuantityIn(line), amount);
-            if (at > -1 && WRAP_END.test(line.replace(/(?:₹|₨|rs\.?|inr|r5)?\s*[\d,]+(?:\.\d{1,2})?\s*$/i, ''))) {
-                continueInto = at;
-            }
-            return;
-        }
-
-        if (prices.length && !named) {
-            // A price on its own line, belonging to the name above it — which
-            // is how Zepto and Blinkit lay their rows out.
-            if (!flushPending(scanPickPrice(prices, line))) skipped++;
-            return;
-        }
-
-        if (named) {
-            // A name, or a weight line under one. Hold it.
-            pending.push(line);
-            // Never let a runaway block of prose become one giant item name.
-            if (pending.length > 3) { pending.shift(); skipped++; }
-            return;
-        }
-
-        skipped++;
-    });
-
-    if (pending.length) skipped++;
-
-    // Fold away exact repeats: the same thing at the same price twice is
-    // almost always the screenshot showing a row twice, not a double buy.
-    const seen = {};
-    const deduped = [];
-    let merged = 0;
-    rows.forEach(function (r) {
-        const key = r.name.toLowerCase() + '|' + r.qty + '|' + r.totalPaise;
-        if (seen[key]) { merged++; return; }
-        seen[key] = true;
-        deduped.push(r);
-    });
-
-    // Fees last, in the order they were found.
-    const items = deduped.filter(r => r.kind === 'item');
-    const fees = deduped.filter(r => r.kind === 'fee');
-
-    return { rows: items.concat(fees), merged: merged, skipped: skipped, glyph: glyph };
-}
 
 /* =====================================================================
    The summary line
@@ -434,10 +47,9 @@ function scanSummary(rows, limit) {
 }
 
 /* =====================================================================
-   Readers — the cloud one, then the one on this device
+   The readers
    ===================================================================== */
 
-const SCAN_TESSERACT_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 const SCAN_CLOUD_URL = '/.netlify/functions/scan';
 const SCAN_MAX_SHOTS = 5;
 
@@ -457,6 +69,11 @@ let scanCloudNote = '';
 // { message, tried: [{ label, error, retryInMs }], retryInMs }. Null when the
 // cloud was never configured, which is a different situation entirely.
 let scanCloudFailure = null;
+
+// Which provider and model produced the rows now on screen, e.g.
+// "Gemini · gemini-3.6-flash". Shown above the list: when a scan comes out
+// wrong, the first useful question is which reader produced it.
+let scanReadBy = '';
 
 // A detached input, so the picker can be opened from anywhere without a
 // hidden element having to already exist on the screen.
@@ -544,8 +161,8 @@ function scanProbeCloud() {
         .catch(() => 'unknown');
 }
 
-// Returns rows, or null if this deploy has no reader configured — in which
-// case the caller falls back to on-device OCR rather than failing.
+// Returns rows, or null when no reader could produce any. The caller decides
+// what to tell you, which depends on whether anything was configured at all.
 async function scanReadInCloud(files) {
     scanCloudNote = '';
     scanCloudFailure = null;
@@ -566,9 +183,7 @@ async function scanReadInCloud(files) {
     if (res.status === 501 || res.status === 404) { scanCloudReader = 'no'; return null; }
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-        // Every configured reader was tried and none worked. Do not quietly
-        // drop to Tesseract: "they are all busy, wait a minute" and "this
-        // deploy has no key" want different answers from you.
+        // Every configured reader was tried and none worked.
         if (body.fallback) {
             scanCloudFailure = {
                 message: body.error || 'The reader could not be used just now.',
@@ -581,10 +196,12 @@ async function scanReadInCloud(files) {
     }
     scanCloudReader = 'yes';
     const got = Array.isArray(body.rows) ? body.rows : [];
-    // Nothing found is not an answer worth keeping: let the on-device reader
-    // have a go before telling somebody their receipt has no items in it.
+    scanReadBy = String(body.by || '');
     if (!got.length) {
-        scanCloudNote = 'Nothing was found in those, so they were read here instead.';
+        scanCloudFailure = {
+            message: 'No reader could find anything in those images.',
+            tried: Array.isArray(body.tried) ? body.tried : [], retryInMs: 0
+        };
         return null;
     }
     return got;
@@ -592,48 +209,6 @@ async function scanReadInCloud(files) {
 
 // Loaded on first use only: the OCR engine pulls several megabytes of wasm
 // and language data, which nobody should pay for just to open the app.
-function scanLoadTesseract() {
-    if (window.Tesseract) return Promise.resolve();
-    return new Promise(function (resolve, reject) {
-        const tag = document.createElement('script');
-        tag.src = SCAN_TESSERACT_SRC;
-        tag.onload = resolve;
-        tag.onerror = function () {
-            reject(new Error('Could not load the scanner. Check your connection.'));
-        };
-        document.head.appendChild(tag);
-    });
-}
-
-// One worker for all of the images: loading it is the slow part, and the
-// pages are read into a single block of text so an item split across two
-// screenshots still has its name and its price together.
-async function scanReadOnDevice(files, progress, say) {
-    let worker;
-    try {
-        await scanLoadTesseract();
-        progress(0.18);
-
-        worker = await window.Tesseract.createWorker('eng', 1, {
-            logger: function (m) {
-                if (m.status === 'recognizing text') progress(0.25 + m.progress * 0.7);
-            }
-        });
-
-        const pages = [];
-        for (let i = 0; i < files.length; i++) {
-            if (files.length > 1) say('Reading screenshot ' + (i + 1) + ' of ' + files.length + '.');
-            const result = await worker.recognize(files[i]);
-            pages.push(result.data.text);
-        }
-        progress(1);
-        return parseReceipt(pages.join('\n'));
-    } finally {
-        // Free the wasm worker either way; the image itself is never kept.
-        if (worker) { try { await worker.terminate(); } catch (e) { /* ignore */ } }
-    }
-}
-
 /* =====================================================================
    The scanner modal
    ===================================================================== */
@@ -687,18 +262,15 @@ function renderScanPick() {
         where.textContent = state === 'yes'
             ? 'Screenshots are sent to be read and are not stored anywhere. ' +
               'Nothing reaches the form until you have checked the list.'
-            : 'Screenshots are read on this device and never uploaded. Nothing ' +
-              'reaches the form until you have checked the list.';
+            : 'No reader is configured on this deploy, so scanning is ' +
+              'unavailable. You can still enter the items by hand.';
     });
 }
 
 /* ---- stage 2: read the images ---- */
 
-// Two readers. The cloud one understands that the right-hand column is money
-// and that a crossed-out number is the old price; Tesseract only knows
-// shapes. So try the first, and quietly use the second when this deploy has
-// no key, the free quota is spent, or the network is not there — because a
-// scanner that refuses to scan is worse than one that needs a row corrected.
+// Each provider is tried in turn and the first that answers wins, so one
+// being out of quota is not the end of the scan.
 async function scanReadReceipt(files, append) {
     const many = files.length > 1;
     scanStage().innerHTML =
@@ -709,17 +281,30 @@ async function scanReadReceipt(files, append) {
             '<div class="scan-bar"><span id="scan-prog"></span></div>' +
         '</div>';
 
+    // The bar is a reassurance, not a measurement: the server walks a chain of
+    // providers and cannot report back mid-request. It creeps toward 90% and
+    // waits there, which is honest enough — what it must not do is sit at zero
+    // for twenty seconds while a congested free tier is worked through.
+    let crept = 0.08;
+    const creep = setInterval(function () {
+        crept = Math.min(0.9, crept + 0.06);
+        scanProgress(crept);
+        if (crept > 0.5) scanSay('Still going — trying the next reader.');
+    }, 1200);
+
     let found = null;
     try {
-        scanProgress(0.12);
+        scanProgress(crept);
         found = await scanReadInCloud(files);
     } catch (error) {
+        clearInterval(creep);
         return renderScanFailed(error);
     }
+    clearInterval(creep);
 
     if (found) {
         scanProgress(1);
-        return scanApplyRows(found, { merged: 0 }, append);
+        return scanApplyRows(found, { merged: 0, by: scanReadBy }, append);
     }
 
     // Every configured cloud reader was tried and all of them failed. Ask
@@ -728,8 +313,8 @@ async function scanReadReceipt(files, append) {
     // noticing it was the second-best reader that produced it.
     if (scanCloudFailure) return renderScanAllBusy(files, append);
 
-    // Nothing configured at all — nothing to wait for, so just read it here.
-    return scanReadOnDeviceStage(files, append);
+    // Nothing configured at all. There is no second reader to fall back to.
+    return renderScanUnconfigured();
 }
 
 function scanProgress(fraction) {
@@ -742,24 +327,23 @@ function scanSay(text) {
     if (hint) hint.textContent = text;
 }
 
-async function scanReadOnDeviceStage(files, append) {
+/* ---- no reader configured at all ---- */
+
+function renderScanUnconfigured() {
     scanStage().innerHTML =
         '<div class="scan-state">' +
-            '<div class="scan-art">📱</div>' +
-            '<h4>Reading it on this device</h4>' +
-            '<p id="scan-hint">The first scan downloads the reader.</p>' +
-            '<div class="scan-bar"><span id="scan-prog"></span></div>' +
+            '<div class="scan-art">🔌</div>' +
+            '<h4>No reader is set up</h4>' +
+            '<p>Scanning needs at least one vision model configured on the ' +
+               'server. Until then you can enter the items by hand, which ' +
+               'still adds them up and writes the summary for you.</p>' +
+            '<button type="button" class="btn" id="scan-unconf-hand">' +
+                'Enter the items by hand</button>' +
         '</div>';
-    try {
-        const parsed = await scanReadOnDevice(files, scanProgress, scanSay);
-        scanApplyRows(parsed.rows, {
-            merged: parsed.merged,
-            glyph: parsed.glyph,
-            note: scanCloudNote || (scanCloudFailure && scanCloudFailure.message) || ''
-        }, append);
-    } catch (error) {
-        renderScanFailed(error);
-    }
+    $('scan-unconf-hand').addEventListener('click', function () {
+        scanRows = [];
+        renderScanReview({ manual: true });
+    });
 }
 
 /* ---- every cloud reader is down ---- */
@@ -779,28 +363,20 @@ function renderScanAllBusy(files, append) {
             '<div class="scan-art">⏳</div>' +
             '<h4>' + esc(failure.message) + '</h4>' +
             (detail ? '<p class="scan-tried">' + detail + '</p>' : '') +
-            '<p>You can wait and try again, or read it on this device. ' +
-               'The on-device reader never leaves your phone, but it mistakes ' +
-               'the ₹ sign for a digit and loses decimal points, so check the ' +
-               'amounts before you use them.</p>' +
+            '<p>Wait for one of them to come back, or enter the items ' +
+               'yourself.</p>' +
             '<button type="button" class="btn" id="scan-retry-cloud"' +
                 (waitFor > 0 ? ' disabled' : '') + '>' +
                 (waitFor > 0 ? 'Try again in ' + waitFor + 's' : 'Try again') +
             '</button>' +
-            '<button type="button" class="btn btn-secondary" id="scan-use-device">' +
-                'Read it on this device</button>' +
-            '<button type="button" class="scan-link" id="scan-busy-hand">' +
-                'Or enter the items by hand</button>' +
+            '<button type="button" class="btn btn-secondary" id="scan-busy-hand">' +
+                'Enter the items by hand</button>' +
         '</div>';
 
     const retry = $('scan-retry-cloud');
     retry.addEventListener('click', function () {
         clearInterval(scanRetryTimer);
         scanReadReceipt(files, append);
-    });
-    $('scan-use-device').addEventListener('click', function () {
-        clearInterval(scanRetryTimer);
-        scanReadOnDeviceStage(files, append);
     });
     $('scan-busy-hand').addEventListener('click', function () {
         clearInterval(scanRetryTimer);
@@ -901,14 +477,10 @@ function renderScanReview(meta) {
               (meta.merged === 1 ? ' repeated row' : ' repeated rows') +
               '. Add it back below if it was a genuine second buy.</div>'
             : '') +
-        // Tesseract does not know the ₹ glyph and puts something else in its
-        // place. That is undone before the amounts are read, but it is worth
-        // saying so, because it is the one failure that looks like a price.
-        (meta.glyph
-            ? '<div class="scan-warn">The reader saw every ₹ as "' + esc(meta.glyph) +
-              '", which has been undone. Worth a glance down the amounts.</div>'
-            : '') +
         (meta.note ? '<div class="scan-warn">' + esc(meta.note) + '</div>' : '') +
+        (meta.by
+            ? '<div class="scan-by">Read by <strong>' + esc(meta.by) + '</strong></div>'
+            : '') +
         (meta.added === 0
             ? '<div class="scan-warn">Nothing new in those — every line was ' +
               'already on the list.</div>'
@@ -948,6 +520,19 @@ function scanBlankRow() {
 
 function scanRupees(paise) {
     return (paise / 100).toFixed(2);
+}
+
+/**
+ * Rupees as typed into paise. Everything the scanner adds up is an integer:
+ * forty rows of floating-point rupees drift, and the total is turned back
+ * into rupees exactly once, on the way into the form.
+ */
+function scanToPaise(text) {
+    const cleaned = String(text).replace(/,/g, '');
+    if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
+    const n = parseFloat(cleaned);
+    if (!isFinite(n) || n <= 0 || n > 1000000) return null;
+    return Math.round(n * 100);
 }
 
 // The amount field accepts anything; only digits and one decimal point mean

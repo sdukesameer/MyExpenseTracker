@@ -5067,6 +5067,24 @@ function initImportExpensesUI() {
         event.preventDefault();
         downloadSampleCsv();
     });
+
+    // Ctrl/Cmd-V anywhere in the modal. Excel, Sheets and Numbers all put the
+    // selection on the clipboard as tab-separated text with the header row on
+    // top, so there is nothing to save to a file first.
+    //
+    // Listening on the document rather than a textarea: the natural gesture is
+    // to open the window and paste, not to find a box to paste into. A paste
+    // aimed at a real input is left alone.
+    document.addEventListener('paste', event => {
+        const modal = $('import-expenses-modal');
+        if (!modal || !modal.classList.contains('open')) return;
+        if (/^(INPUT|TEXTAREA)$/.test((event.target.tagName || '').toUpperCase())) return;
+        const text = event.clipboardData && event.clipboardData.getData('text/plain');
+        if (!text || !text.trim()) return;
+        event.preventDefault();
+        resetImportModal();
+        handleImportPaste(text);
+    });
 }
 
 function downloadSampleCsv() {
@@ -5076,6 +5094,76 @@ function downloadSampleCsv() {
         .concat(tracking ? ['No'] : []).join(',');
     downloadBlob(new Blob([header + '\n' + example + '\n'], { type: 'text/csv' }),
         'expense_import_sample.csv');
+}
+
+/**
+ * One route in for both a dropped file and a pasted block of cells: whatever
+ * produced the workbook, the columns are matched by name from here on.
+ */
+function importWorkbook(workbook, emptyMessage) {
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    // dateNF, and it is load-bearing. A spreadsheet stores 2026-08-05 as a
+    // date serial, and rendering it without a format gives "8/5/26" — which
+    // is not only unparseable here but ambiguous between US and Indian
+    // ordering. Forcing ISO means what the export wrote is what validation
+    // reads back.
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+        defval: '', raw: false, dateNF: 'yyyy-mm-dd'
+    });
+
+    if (!rows.length) {
+        showAlert('import-alert', emptyMessage, 'error');
+        return;
+    }
+
+    const headers = Object.keys(rows[0]).map(header => header.trim());
+    const missing = BASE_IMPORT_HEADERS
+        .filter(header => headers.indexOf(header) === -1);
+    if (trackingBilling() &&
+        !BILLED_IMPORT_ALIASES.some(name => headers.indexOf(name) > -1)) {
+        missing.push(BILLED_IMPORT_HEADER);
+    }
+    if (missing.length) {
+        showAlert('import-alert',
+            'Missing required column(s): ' + missing.join(', ') +
+            '. Found: ' + (headers.join(', ') || 'nothing') + '.', 'error');
+        return;
+    }
+
+    importParsedRows = rows;
+    runImportValidation(rows);
+}
+
+/**
+ * Cells copied straight out of Excel, Sheets or Numbers.
+ *
+ * The clipboard carries them as tab-separated text with the header row on
+ * top, which is the same thing a CSV is with a different delimiter — so the
+ * spreadsheet library already loaded for the file path parses it, rather than
+ * this growing its own quoted-field parser.
+ */
+function handleImportPaste(text) {
+    if (typeof XLSX === 'undefined') {
+        showAlert('import-alert',
+            'The spreadsheet library did not load. Reload the page and try again.', 'error');
+        return;
+    }
+    const trimmed = String(text || '').replace(/\r\n/g, '\n').trim();
+    if (!trimmed) return;
+    if (trimmed.indexOf('\n') === -1) {
+        showAlert('import-alert',
+            'That is a single line. Copy the header row and the rows beneath it ' +
+            'together.', 'error');
+        return;
+    }
+    try {
+        importWorkbook(XLSX.read(trimmed, {
+            type: 'string', cellDates: true, dateNF: 'yyyy-mm-dd'
+        }), 'Nothing usable in what was pasted.');
+    } catch (error) {
+        console.error('Import paste error:', error);
+        showAlert('import-alert', 'Could not read what was pasted.', 'error');
+    }
 }
 
 function handleImportFile(file) {
@@ -5091,29 +5179,9 @@ function handleImportFile(file) {
             // readAsArrayBuffer, not readAsBinaryString: the latter is
             // deprecated and unreliable in Safari.
             const bytes = new Uint8Array(event.target.result);
-            const workbook = XLSX.read(bytes, { type: 'array', cellDates: false });
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
-
-            if (!rows.length) {
-                showAlert('import-alert', 'The file appears to be empty.', 'error');
-                return;
-            }
-
-            const headers = Object.keys(rows[0]).map(header => header.trim());
-            const missing = BASE_IMPORT_HEADERS
-                .filter(header => headers.indexOf(header) === -1);
-            if (trackingBilling() &&
-                !BILLED_IMPORT_ALIASES.some(name => headers.indexOf(name) > -1)) {
-                missing.push(BILLED_IMPORT_HEADER);
-            }
-            if (missing.length) {
-                showAlert('import-alert', 'Missing required column(s): ' + missing.join(', '), 'error');
-                return;
-            }
-
-            importParsedRows = rows;
-            runImportValidation(rows);
+            importWorkbook(XLSX.read(bytes, {
+                type: 'array', cellDates: true, dateNF: 'yyyy-mm-dd'
+            }), 'The file appears to be empty.');
         } catch (error) {
             console.error('Import parse error:', error);
             showAlert('import-alert',
@@ -5181,7 +5249,13 @@ function validateImportRow(raw, validTypes) {
     const note = String(raw['Note'] || '').trim();
     const typeInput = String(raw['Type'] || '').trim();
     const amountRaw = String(raw['Amount'] || '').trim().replace(/[,\s₹]/g, '');
-    const dateRaw = String(raw['Date'] || '').trim();
+    // A spreadsheet cell can arrive as a Date object; toAppDateISO keeps it on
+    // the same calendar day the sheet showed, rather than whatever the
+    // browser's timezone makes of midnight.
+    const dateCell = raw['Date'];
+    const dateRaw = dateCell instanceof Date
+        ? toAppDateISO(dateCell)
+        : String(dateCell || '').trim();
     const billedRaw = String(
         BILLED_IMPORT_ALIASES.map(name => raw[name]).find(Boolean) || ''
     ).trim().toLowerCase();
@@ -5211,6 +5285,7 @@ function validateImportRow(raw, validTypes) {
     }
 
     const isoDate = splitISO(dateRaw) ? dateRaw : parseDDMMYYYY(dateRaw);
+
     if (!isoDate) issues.push('Invalid date (use YYYY-MM-DD or DD/MM/YYYY)');
 
     let billed = false;
@@ -5249,7 +5324,7 @@ function showImportReview(rows) {
             <td>${esc(row.displayDate || row.date)}</td>
             <td>${esc(row.type)}</td>
             <td>${esc(row.note)}</td>
-            <td>${isNaN(row.amount) ? '—' : esc(moneyShort(row.amount))}</td>
+            <td>${isNaN(row.amount) ? '—' : esc(money(row.amount))}</td>
             <td class="col-billed"${tracking ? '' : ' style="display:none"'}>${row.billed ? 'Billed' : 'Unbilled'}</td>
             <td style="color:var(--red-ink);font-size:.8rem;">${esc(row.issues.join(', '))}</td>
         </tr>`).join('');

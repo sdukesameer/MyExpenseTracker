@@ -13,6 +13,11 @@
 # OCR; with keys set but all of them failing it returns 503 and the app asks.
 [functions]
   directory = "netlify/functions"
+  # The scanner walks a chain of providers, and a congested free tier can take
+  # tens of seconds to say no. 26 is Netlify's ceiling for a synchronous
+  # function; scan.mjs keeps its own budget just under it so it answers rather
+  # than being killed mid-request.
+  timeout = 26
 
 [build.environment]
   NODE_VERSION = "18"
@@ -46,7 +51,7 @@
     X-Content-Type-Options = "nosniff"
     X-XSS-Protection = "1; mode=block"
     Referrer-Policy = "strict-origin-when-cross-origin"
-    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' blob: https://*.supabase.co https://*.workers.dev https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; font-src 'self' data:;"
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https://*.supabase.co https://*.workers.dev; font-src 'self' data:;"
 
 # index.html must never be served stale: it is what points at the versioned
 # script.js / style.css.

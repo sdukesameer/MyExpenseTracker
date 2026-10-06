@@ -3118,6 +3118,34 @@ body.signed-in .fab {
     color: var(--muted);
 }
 
+kbd {
+    display: inline-block;
+    padding: 0.05rem 0.35rem;
+    border: 1px solid var(--border-strong);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.74em;
+}
+
+/* Which reader produced the rows on screen. When a scan comes out wrong the
+   first useful question is which model read it. */
+.scan-by {
+    margin-bottom: 0.6rem;
+    padding: 0.4rem 0.7rem;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+.scan-by strong {
+    color: var(--brand-ink);
+    font-weight: 650;
+}
+
 /* Which readers were tried and why each declined. Small, because it is a
    diagnostic, not the message. */
 .scan-tried {

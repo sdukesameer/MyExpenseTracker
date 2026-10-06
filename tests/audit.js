@@ -206,12 +206,19 @@ for (const m of fnSources.matchAll(/const \{([^}]+)\} = process\.env/g))
 for (const m of read('scripts/build-config.mjs').matchAll(/^\s{2}([A-Z0-9_]+):/gm))
   usedEnv.add(m[1]);
 for (const m of fnSources.matchAll(/\benv:\s*'([A-Z0-9_]+)'/g)) usedEnv.add(m[1]);
+// scan.mjs builds its per-provider override names by concatenation —
+// process.env[id.toUpperCase() + '_MODEL'] — so a documented NAME_MODEL is
+// read even though no literal spells it out.
+const suffixes = [...fnSources.matchAll(/process\.env\[[^\]]*?\+\s*'(_[A-Z0-9_]+)'/g)]
+  .map(m => m[1]);
 const documented = new Set([...exampleEnv.matchAll(/^([A-Z0-9_]+)=/gm)].map(m => m[1]));
 [...usedEnv].sort().forEach(v => {
   if (!documented.has(v)) fail('env', `${v} is read by a function but absent from .env.example`);
 });
 [...documented].sort().forEach(v => {
-  if (!usedEnv.has(v)) fail('env', `${v} is documented in .env.example but nothing reads it`);
+  if (usedEnv.has(v)) return;
+  if (suffixes.some(suffix => v.endsWith(suffix))) return;
+  fail('env', `${v} is documented in .env.example but nothing reads it`);
 });
 note('env', `${usedEnv.size} variables read, all documented`);
 

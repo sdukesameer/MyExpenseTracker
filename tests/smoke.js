@@ -803,6 +803,59 @@ const visible = (page, sel) => page.$eval(sel, el => {
       document.getElementById('amount').value = '';
     });
 
+    /* ---- Pasting cells straight out of Excel ---- */
+    console.log('\n── H1a. Import by paste');
+    await page.evaluate(() => showImportExpenses());
+    await new Promise(r => setTimeout(r, 400));
+
+    // Exactly what Excel puts on the clipboard: tab separated, header on top.
+    const tsv = [
+      'Date\tType\tNote\tAmount\tBilled',
+      '2026-08-05\tFood\tPasted lunch\t250\tNo',
+      '2026-08-06\tTravel\tPasted cab\t140.50\tYes',
+    ].join('\n');
+    await page.evaluate(text => {
+      const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'clipboardData',
+        { value: { getData: () => text } });
+      document.dispatchEvent(event);
+    }, tsv);
+    await new Promise(r => setTimeout(r, 1200));
+
+    check('pasted cells reach the review step', await visible(page, '#import-step-review'));
+    check('…both rows parsed and valid',
+      await page.evaluate(() =>
+        document.querySelectorAll('#import-preview-body tr').length === 2 &&
+        document.querySelectorAll('#import-preview-body .import-row-status.valid').length === 2),
+      await page.$eval('#import-summary-banner', e => e.textContent));
+    check('…decimals and Yes/No survive the paste',
+      await page.evaluate(() => {
+        const text = document.getElementById('import-preview-body').textContent;
+        return text.includes('Pasted cab') && text.includes('140.50') &&
+               text.includes('Billed') && text.includes('Unbilled');
+      }),
+      await page.$eval('#import-preview-body', e => e.textContent.replace(/\s+/g, ' ')));
+
+    // A single line is a mis-paste, not data.
+    await page.evaluate(() => { resetImportModal(); handleImportPaste('just one line'); });
+    await new Promise(r => setTimeout(r, 300));
+    check('a one-line paste is refused with a reason',
+      await page.evaluate(() =>
+        /single line/i.test(document.getElementById('import-alert').textContent)));
+
+    // Comma-separated pastes work the same way.
+    await page.evaluate(() => {
+      resetImportModal();
+      handleImportPaste('Date,Type,Note,Amount,Billed\n2026-08-07,Food,Pasted csv,99,No');
+    });
+    await new Promise(r => setTimeout(r, 900));
+    check('a comma-separated paste works too',
+      await page.evaluate(() =>
+        document.querySelectorAll('#import-preview-body .import-row-status.valid').length === 1));
+
+    await page.evaluate(() => closeImportExpensesModal());
+    await new Promise(r => setTimeout(r, 300));
+
     /* ---- Every cloud reader is down ---- */
     console.log('\n── H1b. Scanner fallback choice');
     scanMode = 'busy';
@@ -817,7 +870,7 @@ const visible = (page, sel) => page.$eval(sel, el => {
     });
     await new Promise(r => setTimeout(r, 1200));
     check('all readers busy shows a choice, not a silent downgrade',
-      await visible(page, '#scan-retry-cloud') && await visible(page, '#scan-use-device'),
+      await visible(page, '#scan-retry-cloud') && await visible(page, '#scan-busy-hand'),
       await page.$eval('#scan-stage', e => e.textContent.slice(0, 120)));
     check('…naming which readers declined and why',
       (await page.$eval('#scan-stage', e => e.textContent)).includes('Gemini') &&
@@ -830,7 +883,9 @@ const visible = (page, sel) => page.$eval(sel, el => {
       await page.$eval('#scan-retry-cloud', e => e.textContent));
     check('…and a way out that does not wait',
       await page.evaluate(() =>
-        document.getElementById('scan-use-device').textContent.includes('this device')));
+        document.getElementById('scan-busy-hand').textContent.includes('by hand')));
+    check('…and never offers on-device OCR, which no longer exists',
+      !(await page.$eval('#scan-stage', e => /this device|Tesseract/i.test(e.textContent))));
     await page.evaluate(() => { clearInterval(scanRetryTimer); closeScanModal(); });
     // Chrome logs every non-2xx response, and the 503 above is the thing being
     // tested. Drop just that one so the end-of-run assertion stays meaningful.
