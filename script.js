@@ -5002,8 +5002,14 @@ async function handleEmailChangeConfirmation() {
 let importParsedRows = [];
 let importValidRows = [];
 
-const BASE_IMPORT_HEADERS = ['Note', 'Type', 'Amount', 'Date'];
-const BILLED_IMPORT_HEADER = 'Billed/Unbilled';
+// Same order and same names the Excel export writes, so a file that came out
+// of this app goes straight back in. Columns are matched by name, not
+// position, so any order actually works — this is what the sample and the
+// error message show.
+const BASE_IMPORT_HEADERS = ['Date', 'Type', 'Note', 'Amount'];
+const BILLED_IMPORT_HEADER = 'Billed';
+// What older templates called it.
+const BILLED_IMPORT_ALIASES = ['Billed', 'Billed/Unbilled'];
 
 function showImportExpenses() {
     resetImportModal();
@@ -5066,8 +5072,8 @@ function initImportExpensesUI() {
 function downloadSampleCsv() {
     const tracking = trackingBilling();
     const header = BASE_IMPORT_HEADERS.concat(tracking ? [BILLED_IMPORT_HEADER] : []).join(',');
-    const example = ['Lunch with team', 'Food', '500', '01/01/2026']
-        .concat(tracking ? ['Unbilled'] : []).join(',');
+    const example = ['2026-01-01', 'Food', 'Lunch with team', '500']
+        .concat(tracking ? ['No'] : []).join(',');
     downloadBlob(new Blob([header + '\n' + example + '\n'], { type: 'text/csv' }),
         'expense_import_sample.csv');
 }
@@ -5095,9 +5101,12 @@ function handleImportFile(file) {
             }
 
             const headers = Object.keys(rows[0]).map(header => header.trim());
-            const required = BASE_IMPORT_HEADERS.concat(
-                trackingBilling() ? [BILLED_IMPORT_HEADER] : []);
-            const missing = required.filter(header => headers.indexOf(header) === -1);
+            const missing = BASE_IMPORT_HEADERS
+                .filter(header => headers.indexOf(header) === -1);
+            if (trackingBilling() &&
+                !BILLED_IMPORT_ALIASES.some(name => headers.indexOf(name) > -1)) {
+                missing.push(BILLED_IMPORT_HEADER);
+            }
             if (missing.length) {
                 showAlert('import-alert', 'Missing required column(s): ' + missing.join(', '), 'error');
                 return;
@@ -5173,7 +5182,9 @@ function validateImportRow(raw, validTypes) {
     const typeInput = String(raw['Type'] || '').trim();
     const amountRaw = String(raw['Amount'] || '').trim().replace(/[,\s₹]/g, '');
     const dateRaw = String(raw['Date'] || '').trim();
-    const billedRaw = String(raw[BILLED_IMPORT_HEADER] || '').trim().toLowerCase();
+    const billedRaw = String(
+        BILLED_IMPORT_ALIASES.map(name => raw[name]).find(Boolean) || ''
+    ).trim().toLowerCase();
 
     const issues = [];
     if (!note) issues.push('Missing note');
@@ -5191,22 +5202,22 @@ function validateImportRow(raw, validTypes) {
     let amount = NaN;
     if (!amountRaw) {
         issues.push('Missing amount');
-    } else if (!/^\d+$/.test(amountRaw)) {
-        issues.push('Amount must be a whole number (no decimals)');
+    } else if (!/^\d+(\.\d{1,2})?$/.test(amountRaw)) {
+        issues.push('Amount must be a number, with at most two decimal places');
     } else {
-        amount = parseInt(amountRaw, 10);
+        amount = Math.round(parseFloat(amountRaw) * 100) / 100;
         if (amount <= 0) issues.push('Invalid amount');
         else if (amount > MAX_AMOUNT) issues.push('Amount exceeds ₹10,00,000');
     }
 
-    const isoDate = parseDDMMYYYY(dateRaw);
-    if (!isoDate) issues.push('Invalid date (use DD/MM/YYYY)');
+    const isoDate = splitISO(dateRaw) ? dateRaw : parseDDMMYYYY(dateRaw);
+    if (!isoDate) issues.push('Invalid date (use YYYY-MM-DD or DD/MM/YYYY)');
 
     let billed = false;
     if (tracking) {
-        if (billedRaw === 'billed') billed = true;
-        else if (billedRaw === 'unbilled') billed = false;
-        else issues.push('Billed/Unbilled must be "Billed" or "Unbilled"');
+        if (['billed', 'yes', 'true', 'y'].indexOf(billedRaw) > -1) billed = true;
+        else if (['unbilled', 'no', 'false', 'n'].indexOf(billedRaw) > -1) billed = false;
+        else issues.push('Billed must be "Yes"/"No" or "Billed"/"Unbilled"');
     }
 
     return {
@@ -5235,10 +5246,10 @@ function showImportReview(rows) {
     $('import-preview-body').innerHTML = rows.map(row => `
         <tr class="${row.valid ? '' : 'row-invalid'}">
             <td><span class="import-row-status ${row.valid ? 'valid' : 'invalid'}">${row.valid ? '✓ Valid' : '✕ Failed'}</span></td>
-            <td>${esc(row.note)}</td>
-            <td>${esc(row.type)}</td>
-            <td>${isNaN(row.amount) ? '—' : esc(moneyShort(row.amount))}</td>
             <td>${esc(row.displayDate || row.date)}</td>
+            <td>${esc(row.type)}</td>
+            <td>${esc(row.note)}</td>
+            <td>${isNaN(row.amount) ? '—' : esc(moneyShort(row.amount))}</td>
             <td class="col-billed"${tracking ? '' : ' style="display:none"'}>${row.billed ? 'Billed' : 'Unbilled'}</td>
             <td style="color:var(--red-ink);font-size:.8rem;">${esc(row.issues.join(', '))}</td>
         </tr>`).join('');

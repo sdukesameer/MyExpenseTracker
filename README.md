@@ -8,6 +8,19 @@ A comprehensive, feature-rich expense tracking web application built with vanill
 
 ## 🆕 What's new in 1.2
 
+**New — the scanner has three cloud readers.** Gemini, then OpenAI, then
+Claude; the first that answers wins, and a provider that is out of quota is
+skipped for a minute instead of costing a round trip. When *all* of them fail
+the scanner asks what to do — naming which declined and why, with a countdown
+on *Try again* — rather than silently dropping to on-device OCR, which reads
+the ₹ sign as a digit and turns ₹100.00 into ₹10,000.
+
+**Changed — import takes an export.** Same column names, same order
+(`Date, Type, Note, Amount, Billed`), and the importer now accepts ISO dates,
+decimal amounts and `Yes`/`No` alongside the old `DD/MM/YYYY`,
+whole numbers and `Billed`/`Unbilled`. Columns were always matched by name, so
+any order still works.
+
 **New — speak an expense.** A mic beside the quick-add box. Say
 *"four fifty swiggy"* and it lands in the box, parsed, for you to check and
 tap Add. Spoken numbers are handled properly: `"four fifty"` is ₹450, not ₹54,
@@ -483,21 +496,32 @@ Milk Maid ×2 + Potato ×1 + Handling Fee ×1
 Nothing is saved by the scanner. It fills the form; you still review it and
 press *Add Expense*. There is no image storage on either path.
 
-### Two readers
+### The readers
 
 | | Where it runs | Needs | Accuracy |
 |---|---|---|---|
-| **Vision model** | `netlify/functions/scan.mjs` → Gemini | `GEMINI_API_KEY` | Reads the *layout*: knows the right-hand column is money and that a struck-through number is the old MRP |
+| **Gemini → OpenAI → Claude** | `netlify/functions/scan.mjs` | any one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Reads the *layout*: knows the right-hand column is money and that a struck-through number is the old MRP |
 | **Tesseract** | The device, via `cdn.jsdelivr.net` | nothing | Character recognition only; the parser in `scan.js` repairs what it can |
 
-The cloud reader is tried first and the on-device one picks up whenever it
-cannot be used — no key configured, free quota spent, network gone, or nothing
-found — so a deploy with no key still scans. The picker says which one is
-about to run *before* you choose an image, so it never claims the picture
-stays on the phone when it does not.
+Providers are tried in order and the first that answers wins; each walks its
+own list of model names, because providers retire them and the failure looks
+like a broken scanner rather than a renamed model. A 429 puts that provider on
+a cooldown (its `Retry-After`, or 60s) so the next scan skips straight past it.
 
-`GET /.netlify/functions/scan?diagnose=1` reports whether the key is set and
-which model it will actually reach.
+**What happens when the cloud cannot be used depends on why:**
+
+- **No provider key at all** → on-device OCR, silently. There is nothing to
+  wait for.
+- **Keys set, every reader failed** → the scanner *asks*. It names which
+  provider declined and why, counts down the cooldown on a disabled *Try
+  again*, and offers *Read it on this device* next to it.
+
+That distinction matters. On-device OCR mistakes the ₹ sign for a digit and
+loses decimal points — ₹100.00 becomes ₹10,000 — so dropping to it silently is
+how a wrong total gets saved without anyone noticing which reader produced it.
+
+`GET /.netlify/functions/scan?diagnose=1` lists every provider, whether it is
+configured, the models it will try, and any cooldown still running.
 
 ### What the parser has to survive
 
@@ -831,8 +855,15 @@ never delivered to a browser.
 | Variable | Needed for | Effect if unset |
 |---|---|---|
 | `SUPABASE_SERVICE_ROLE_KEY` | The admin panel's auth actions | Block, create, delete, password links and *sign in as* report that they are not configured. Bypasses every RLS policy — Netlify's environment and nowhere else. |
-| `GEMINI_API_KEY` | The receipt scanner's cloud reader | Falls back to reading on the device. Nothing else is affected. |
-| `GEMINI_MODEL` | Pinning a model | The function walks its built-in list instead. Set it only when a newer one lands before that list is updated. |
+| `GEMINI_API_KEY` | The receipt scanner | Skipped. Set at least one provider or scanning falls back to on-device OCR. |
+| `OPENAI_API_KEY` | The same | Skipped. |
+| `ANTHROPIC_API_KEY` | The same | Skipped. |
+| `GEMINI_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | Pinning a model | Each provider walks its own built-in list instead. Set one only when a newer model lands before that list is updated. |
+
+The three scanner providers are tried **in that order** and the first that
+answers wins, so one being out of quota does not drop you to the worst reader.
+A provider that returns 429 is skipped for a minute (or whatever `Retry-After`
+asks for) rather than costing a round trip each time.
 
 `SECRETS_SCAN_ENABLED` is left **on** in `netlify.toml`: it fails the build if
 either secret turns up in a deployed file. The three public names are listed in

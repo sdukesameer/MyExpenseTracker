@@ -591,15 +591,16 @@
                     <p><strong>File format:</strong> the first row (header) must contain exactly these columns, in
                         any order:</p>
                     <div class="import-header-pills" id="import-header-pills">
-                        <span class="header-pill">Note</span>
-                        <span class="header-pill">Type</span>
-                        <span class="header-pill">Amount</span>
                         <span class="header-pill">Date</span>
-                        <span class="header-pill" id="import-pill-billed">Billed/Unbilled</span>
+                        <span class="header-pill">Type</span>
+                        <span class="header-pill">Note</span>
+                        <span class="header-pill">Amount</span>
+                        <span class="header-pill" id="import-pill-billed">Billed</span>
                     </div>
-                    <p style="margin: 0.75rem 0 0;">Date in <code>DD/MM/YYYY</code> format, Amount as a whole number
-                        (no decimals)<span id="import-billed-hint">, and Billed/Unbilled as <code>Billed</code> or
-                            <code>Unbilled</code></span>.</p>
+                    <p style="margin: 0.75rem 0 0;">Same columns the Excel export writes, so a file exported from
+                        here goes straight back in. Date as <code>YYYY-MM-DD</code> or <code>DD/MM/YYYY</code>,
+                        Amount with at most two decimals<span id="import-billed-hint">, and Billed as
+                            <code>Yes</code>/<code>No</code> or <code>Billed</code>/<code>Unbilled</code></span>.</p>
                     <a href="#" id="download-sample-csv" class="sample-csv-link">⬇ Download sample CSV</a>
                 </div>
 
@@ -631,10 +632,10 @@
                         <thead>
                             <tr>
                                 <th>Status</th>
-                                <th>Note</th>
-                                <th>Type</th>
-                                <th>Amount</th>
                                 <th>Date</th>
+                                <th>Type</th>
+                                <th>Note</th>
+                                <th>Amount</th>
                                 <th class="col-billed">Billed</th>
                                 <th>Issue</th>
                             </tr>

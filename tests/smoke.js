@@ -27,6 +27,8 @@ function check(name, ok, detail) {
   else { failures.push(name + (detail ? ' — ' + detail : '')); console.log('  ✗ ' + name + (detail ? ' — ' + detail : '')); }
 }
 
+let scanMode = 'unconfigured';
+
 function serve() {
   return new Promise(resolve => {
     const server = http.createServer((req, res) => {
@@ -52,6 +54,21 @@ function serve() {
       }
 
       if (route === '/.netlify/functions/scan') {
+        // Default is a deploy with no provider key, which is the state most
+        // installs are in. scanMode flips it to "configured, but every reader
+        // is rate limited" so the choice screen is reachable.
+        if (scanMode === 'busy') {
+          res.writeHead(req.method === 'GET' ? 200 : 503, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify(req.method === 'GET'
+            ? { ready: true, providers: ['Gemini', 'Claude'] }
+            : {
+                error: 'Every reader is busy right now',
+                tried: [{ id: 'gemini', label: 'Gemini', error: 'out of quota', retryInMs: 60000 },
+                        { id: 'anthropic', label: 'Claude', error: 'out of quota', retryInMs: 60000 }],
+                retryInMs: 60000,
+                fallback: true,
+              }));
+        }
         res.writeHead(req.method === 'GET' ? 200 : 501, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify(req.method === 'GET'
           ? { ready: false }
@@ -603,6 +620,29 @@ const visible = (page, sel) => page.$eval(sel, el => {
     check('quotes and commas survive into the export matrix',
       awkward && awkward[2] === 'Chai, "extra" sugar', JSON.stringify(awkward));
 
+    // The whole point of matching the export's columns: a file that came out
+    // of here goes straight back in.
+    const roundTrip = await page.evaluate(async () => {
+      const { rows, startDate, endDate } = await fetchExportRows();
+      const m = await buildExportMatrix(rows, startDate, endDate);
+      const headers = m[0];
+      const body = m.slice(1).filter(r => r[0]);           // drop blanks and totals
+      const asObjects = body.map(r =>
+        Object.fromEntries(headers.map((h, i) => [h, String(r[i])])));
+      const types = await loadTypesForEdit();
+      return asObjects.map(o => validateImportRow(o, types))
+        .map(v => ({ valid: v.valid, issues: v.issues }));
+    });
+    // An "Unknown type" here is the validator doing its job on a fixture type
+    // that was never added to the account's list. What is on trial is the
+    // format: date, amount and the Billed column.
+    const formatIssues = roundTrip
+      .flatMap(r => r.issues)
+      .filter(issue => !/^Unknown type/.test(issue));
+    check('every exported row re-imports with no format complaint',
+      roundTrip.length > 0 && formatIssues.length === 0,
+      JSON.stringify(formatIssues.slice(0, 3)));
+
     // Same check with billing tracking off (4-column layout).
     await page.evaluate(() => saveSettings({ trackBilling: false }).then(applyBillingMode));
     await new Promise(r => setTimeout(r, 400));
@@ -762,6 +802,43 @@ const visible = (page, sel) => page.$eval(sel, el => {
       document.getElementById('note').value = '';
       document.getElementById('amount').value = '';
     });
+
+    /* ---- Every cloud reader is down ---- */
+    console.log('\n── H1b. Scanner fallback choice');
+    scanMode = 'busy';
+    await page.evaluate(() => { scanCloudReader = 'unknown'; openScanModal(); });
+    await new Promise(r => setTimeout(r, 400));
+    // A one-pixel PNG is enough: the stub never looks at it.
+    await page.evaluate(async () => {
+      const blob = await (await fetch('data:image/png;base64,iVBORw0KGgoAAAANSUhEUg' +
+        'AAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==')).blob();
+      const file = new File([blob], 'shot.png', { type: 'image/png' });
+      return scanReadReceipt([file], false);
+    });
+    await new Promise(r => setTimeout(r, 1200));
+    check('all readers busy shows a choice, not a silent downgrade',
+      await visible(page, '#scan-retry-cloud') && await visible(page, '#scan-use-device'),
+      await page.$eval('#scan-stage', e => e.textContent.slice(0, 120)));
+    check('…naming which readers declined and why',
+      (await page.$eval('#scan-stage', e => e.textContent)).includes('Gemini') &&
+      (await page.$eval('#scan-stage', e => e.textContent)).includes('out of quota'));
+    check('…with the retry held until the cooldown elapses',
+      await page.evaluate(() => {
+        const b = document.getElementById('scan-retry-cloud');
+        return b.disabled && /Try again in \d+s/.test(b.textContent);
+      }),
+      await page.$eval('#scan-retry-cloud', e => e.textContent));
+    check('…and a way out that does not wait',
+      await page.evaluate(() =>
+        document.getElementById('scan-use-device').textContent.includes('this device')));
+    await page.evaluate(() => { clearInterval(scanRetryTimer); closeScanModal(); });
+    // Chrome logs every non-2xx response, and the 503 above is the thing being
+    // tested. Drop just that one so the end-of-run assertion stays meaningful.
+    for (let i = errors.length - 1; i >= 0; i--) {
+      if (errors[i].includes('503')) errors.splice(i, 1);
+    }
+    scanMode = 'unconfigured';
+    await new Promise(r => setTimeout(r, 300));
 
     /* ---- Quick add: type names, history, and the amount chips ---- */
     console.log('\n── H2b. Quick add and the amount field');

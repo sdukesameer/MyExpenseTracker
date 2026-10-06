@@ -201,9 +201,11 @@ const fnSources = fs.readdirSync(ROOT + 'netlify/functions')
 const usedEnv = new Set([...fnSources.matchAll(/process\.env\.([A-Z0-9_]+)/g)].map(m => m[1]));
 for (const m of fnSources.matchAll(/const \{([^}]+)\} = process\.env/g))
   m[1].split(',').map(s => s.trim()).filter(Boolean).forEach(v => usedEnv.add(v));
-// build-config.mjs indexes process.env by a name from a lookup table.
+// build-config.mjs and scan.mjs both index process.env by a name held in a
+// lookup table, which no process.env.NAME regex can see.
 for (const m of read('scripts/build-config.mjs').matchAll(/^\s{2}([A-Z0-9_]+):/gm))
   usedEnv.add(m[1]);
+for (const m of fnSources.matchAll(/\benv:\s*'([A-Z0-9_]+)'/g)) usedEnv.add(m[1]);
 const documented = new Set([...exampleEnv.matchAll(/^([A-Z0-9_]+)=/gm)].map(m => m[1]));
 [...usedEnv].sort().forEach(v => {
   if (!documented.has(v)) fail('env', `${v} is read by a function but absent from .env.example`);

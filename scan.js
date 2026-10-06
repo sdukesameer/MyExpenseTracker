@@ -453,6 +453,11 @@ let scanCloudReader = 'unknown';       // 'unknown' | 'yes' | 'no'
 // fallback is what makes "the key is set but nothing uses it" so hard to see.
 let scanCloudNote = '';
 
+// Set when every configured cloud reader was tried and all of them failed:
+// { message, tried: [{ label, error, retryInMs }], retryInMs }. Null when the
+// cloud was never configured, which is a different situation entirely.
+let scanCloudFailure = null;
+
 // A detached input, so the picker can be opened from anywhere without a
 // hidden element having to already exist on the screen.
 function scanPickFiles(onPicked) {
@@ -543,6 +548,7 @@ function scanProbeCloud() {
 // case the caller falls back to on-device OCR rather than failing.
 async function scanReadInCloud(files) {
     scanCloudNote = '';
+    scanCloudFailure = null;
     if (scanCloudReader === 'no') return null;
 
     const images = [];
@@ -560,10 +566,15 @@ async function scanReadInCloud(files) {
     if (res.status === 501 || res.status === 404) { scanCloudReader = 'no'; return null; }
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-        // Recoverable — no quota, a refusal, a model that has been retired.
-        // Fall back, but say that is what happened.
+        // Every configured reader was tried and none worked. Do not quietly
+        // drop to Tesseract: "they are all busy, wait a minute" and "this
+        // deploy has no key" want different answers from you.
         if (body.fallback) {
-            scanCloudNote = body.error || 'The reader could not be used just now.';
+            scanCloudFailure = {
+                message: body.error || 'The reader could not be used just now.',
+                tried: Array.isArray(body.tried) ? body.tried : [],
+                retryInMs: Number(body.retryInMs) || 0
+            };
             return null;
         }
         throw new Error(body.error || 'The reader could not read that.');
@@ -698,37 +709,123 @@ async function scanReadReceipt(files, append) {
             '<div class="scan-bar"><span id="scan-prog"></span></div>' +
         '</div>';
 
-    const bar = $('scan-prog');
-    function progress(pct) { if (bar) bar.style.width = Math.round(pct * 100) + '%'; }
-    function say(text) {
-        const hint = $('scan-hint');
-        if (hint) hint.textContent = text;
-    }
-
     let found = null;
-    const meta = { merged: 0 };
-
     try {
-        progress(0.12);
+        scanProgress(0.12);
         found = await scanReadInCloud(files);
-        if (found) progress(1);
     } catch (error) {
         return renderScanFailed(error);
     }
 
-    if (!found) {
-        try {
-            say('Reading it on this device. The first scan downloads the reader.');
-            const parsed = await scanReadOnDevice(files, progress, say);
-            found = parsed.rows;
-            meta.merged = parsed.merged;
-            meta.glyph = parsed.glyph;
-            meta.note = scanCloudNote;
-        } catch (error) {
-            return renderScanFailed(error);
-        }
+    if (found) {
+        scanProgress(1);
+        return scanApplyRows(found, { merged: 0 }, append);
     }
 
+    // Every configured cloud reader was tried and all of them failed. Ask
+    // rather than assume: dropping silently to the reader that cannot tell
+    // ₹100.00 from ₹10,000 is how a wrong total gets saved without anyone
+    // noticing it was the second-best reader that produced it.
+    if (scanCloudFailure) return renderScanAllBusy(files, append);
+
+    // Nothing configured at all — nothing to wait for, so just read it here.
+    return scanReadOnDeviceStage(files, append);
+}
+
+function scanProgress(fraction) {
+    const bar = $('scan-prog');
+    if (bar) bar.style.width = Math.round(fraction * 100) + '%';
+}
+
+function scanSay(text) {
+    const hint = $('scan-hint');
+    if (hint) hint.textContent = text;
+}
+
+async function scanReadOnDeviceStage(files, append) {
+    scanStage().innerHTML =
+        '<div class="scan-state">' +
+            '<div class="scan-art">📱</div>' +
+            '<h4>Reading it on this device</h4>' +
+            '<p id="scan-hint">The first scan downloads the reader.</p>' +
+            '<div class="scan-bar"><span id="scan-prog"></span></div>' +
+        '</div>';
+    try {
+        const parsed = await scanReadOnDevice(files, scanProgress, scanSay);
+        scanApplyRows(parsed.rows, {
+            merged: parsed.merged,
+            glyph: parsed.glyph,
+            note: scanCloudNote || (scanCloudFailure && scanCloudFailure.message) || ''
+        }, append);
+    } catch (error) {
+        renderScanFailed(error);
+    }
+}
+
+/* ---- every cloud reader is down ---- */
+
+let scanRetryTimer = null;
+
+function renderScanAllBusy(files, append) {
+    const failure = scanCloudFailure || { message: 'No reader could be used.', tried: [] };
+    const waitFor = Math.ceil((failure.retryInMs || 0) / 1000);
+
+    const detail = (failure.tried || [])
+        .map(t => esc(t.label || t.id) + ' — ' + esc(t.error || 'failed'))
+        .join('<br>');
+
+    scanStage().innerHTML =
+        '<div class="scan-state">' +
+            '<div class="scan-art">⏳</div>' +
+            '<h4>' + esc(failure.message) + '</h4>' +
+            (detail ? '<p class="scan-tried">' + detail + '</p>' : '') +
+            '<p>You can wait and try again, or read it on this device. ' +
+               'The on-device reader never leaves your phone, but it mistakes ' +
+               'the ₹ sign for a digit and loses decimal points, so check the ' +
+               'amounts before you use them.</p>' +
+            '<button type="button" class="btn" id="scan-retry-cloud"' +
+                (waitFor > 0 ? ' disabled' : '') + '>' +
+                (waitFor > 0 ? 'Try again in ' + waitFor + 's' : 'Try again') +
+            '</button>' +
+            '<button type="button" class="btn btn-secondary" id="scan-use-device">' +
+                'Read it on this device</button>' +
+            '<button type="button" class="scan-link" id="scan-busy-hand">' +
+                'Or enter the items by hand</button>' +
+        '</div>';
+
+    const retry = $('scan-retry-cloud');
+    retry.addEventListener('click', function () {
+        clearInterval(scanRetryTimer);
+        scanReadReceipt(files, append);
+    });
+    $('scan-use-device').addEventListener('click', function () {
+        clearInterval(scanRetryTimer);
+        scanReadOnDeviceStage(files, append);
+    });
+    $('scan-busy-hand').addEventListener('click', function () {
+        clearInterval(scanRetryTimer);
+        scanRows = [];
+        renderScanReview({ manual: true });
+    });
+
+    if (waitFor > 0) {
+        let left = waitFor;
+        clearInterval(scanRetryTimer);
+        scanRetryTimer = setInterval(function () {
+            // The stage is replaced wholesale on every transition, so a button
+            // that is gone means this screen is gone with it.
+            if (!document.body.contains(retry)) return clearInterval(scanRetryTimer);
+            left--;
+            if (left > 0) { retry.textContent = 'Try again in ' + left + 's'; return; }
+            clearInterval(scanRetryTimer);
+            retry.disabled = false;
+            retry.textContent = 'Try again';
+        }, 1000);
+    }
+}
+
+/** Fold whatever was read into the editable list. */
+function scanApplyRows(found, meta, append) {
     const fresh = found.map(r => ({
         name: r.name, qty: r.qty, totalPaise: r.totalPaise, kind: r.kind, on: true
     }));

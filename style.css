@@ -3118,6 +3118,14 @@ body.signed-in .fab {
     color: var(--muted);
 }
 
+/* Which readers were tried and why each declined. Small, because it is a
+   diagnostic, not the message. */
+.scan-tried {
+    font-size: 0.78rem !important;
+    color: var(--muted);
+    line-height: 1.6;
+}
+
 .scan-link {
     background: none;
     border: 0;

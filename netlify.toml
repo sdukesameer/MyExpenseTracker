@@ -8,8 +8,9 @@
   # that is not a Supabase project URL.
   command = "node scripts/build-config.mjs"
 
-# The receipt scanner's cloud reader. Unconfigured (no GEMINI_API_KEY), it
-# returns 501 and the app falls back to reading on the device.
+# The receipt scanner's cloud readers and the admin auth actions. With no
+# provider key set the scanner returns 501 and the app falls back to on-device
+# OCR; with keys set but all of them failing it returns 503 and the app asks.
 [functions]
   directory = "netlify/functions"
 
@@ -17,8 +18,8 @@
   NODE_VERSION = "18"
 
   # Left ON deliberately. It is what would catch SUPABASE_SERVICE_ROLE_KEY or
-  # GEMINI_API_KEY ending up in the deployed files, which is the one mistake
-  # here that would actually matter.
+  # any of the model provider keys ending up in the deployed files, which is
+  # the one mistake here that would actually matter.
   #
   # The omitted keys are public by design — the publishable key, the project
   # URL and the proxy are written into config.js on purpose and are delivered
