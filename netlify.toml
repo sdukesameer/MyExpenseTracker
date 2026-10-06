@@ -13,11 +13,10 @@
 # OCR; with keys set but all of them failing it returns 503 and the app asks.
 [functions]
   directory = "netlify/functions"
-  # The scanner walks a chain of providers, and a congested free tier can take
-  # tens of seconds to say no. 26 is Netlify's ceiling for a synchronous
-  # function; scan.mjs keeps its own budget just under it so it answers rather
-  # than being killed mid-request.
-  timeout = 26
+  # No timeout key here: Netlify treats any other name in [functions] as a
+  # per-function scope, so `timeout = 26` is a parse error that fails the
+  # build. A synchronous function gets 10s and that is not configurable from
+  # this file — scan.mjs keeps its own budget under it instead.
 
 [build.environment]
   NODE_VERSION = "18"

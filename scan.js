@@ -108,7 +108,18 @@ function scanLoadImage(file) {
 // Full-page screenshots are tall. 1600px keeps small print legible while
 // staying well inside what a function body can carry; quality is traded away
 // before dimensions, because it costs far less to legibility.
-async function scanPrepareImage(file, maxDim, maxBytes) {
+/**
+ * Shrink a screenshot for upload, capped on WIDTH rather than the longest
+ * side.
+ *
+ * A receipt screenshot is tall and narrow — the one this was tested against
+ * is 714×2576 — and scaling by the longest side to fit 1600 squeezed the
+ * width down to 443px. Width is where the text is, so that threw away exactly
+ * the resolution the reader needs while leaving the useless vertical
+ * dimension intact. Height now runs as long as it likes; the byte cap is what
+ * keeps the upload sane.
+ */
+async function scanPrepareImage(file, maxWidth, maxBytes) {
     if (!/^image\//.test(file.type || '')) throw new Error('Pick an image file.');
 
     const img = await scanLoadImage(file);
@@ -116,11 +127,11 @@ async function scanPrepareImage(file, maxDim, maxBytes) {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('This browser cannot resize images.');
 
-    let dim = maxDim;
+    let dim = maxWidth;
     for (let attempt = 0; attempt < 4; attempt++) {
         const w = img.naturalWidth || img.width;
         const h = img.naturalHeight || img.height;
-        const scale = Math.min(1, dim / Math.max(w, h));
+        const scale = Math.min(1, dim / w);
         canvas.width = Math.max(1, Math.round(w * scale));
         canvas.height = Math.max(1, Math.round(h * scale));
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -170,7 +181,10 @@ async function scanReadInCloud(files) {
 
     const images = [];
     for (let i = 0; i < files.length; i++) {
-        const blob = await scanPrepareImage(files[i], 1600, 900 * 1024);
+        // 1100px wide keeps small print legible on a phone screenshot without
+        // sending anything a vision model cannot use; 900KB is well inside
+        // what a function body carries.
+        const blob = await scanPrepareImage(files[i], 1100, 900 * 1024);
         images.push({ mime: 'image/jpeg', data: await scanToBase64(blob) });
     }
 

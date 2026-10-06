@@ -30,14 +30,15 @@ const MAX_IMAGES = Number(process.env.SCAN_MAX_IMAGES) || 5;
 // returns a "busy, try again" the client can act on — a timeout kills the
 // request and the client gets nothing to explain.
 //
-// ponytail: 24s is all a synchronous Netlify function gets, and a successful
-// read off a congested free tier measured 13-21s in testing — so there is
-// room for roughly one good attempt plus a few fast failures (a 429 or a bad
-// key answers in about a second). When the first provider is slow AND busy,
-// this returns "too slow, try again" and the client offers a retry button.
-// If that becomes common, the fix is a background function plus polling, not
-// a bigger number here.
-const TIME_BUDGET_MS = Number(process.env.SCAN_TIME_BUDGET_MS) || 24000;
+// A synchronous Netlify function is killed at 10s, and that is not
+// configurable from netlify.toml. It is enough: a model that is not
+// overloaded answers this prompt in about three seconds. What used to eat the
+// clock was walking 503s from the newest model down, which lastGood below
+// fixes by going straight back to whatever last worked.
+//
+// ponytail: if a chain of fast failures ever genuinely needs more than 9s,
+// the fix is a background function plus polling, not a bigger number here.
+const TIME_BUDGET_MS = Number(process.env.SCAN_TIME_BUDGET_MS) || 9000;
 const MAX_BYTES = 5 * 1024 * 1024;       // per image, after the client shrinks it
 const DEFAULT_COOLDOWN_MS = 60 * 1000;
 const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
@@ -297,7 +298,21 @@ function versionKey(id) {
   return (String(id).match(/\d+/g) || []).map(Number);
 }
 
-function newerFirst(a, b) {
+// Reading a receipt is not frontier work. The small variants scored 14/14 on
+// a real Blinkit screenshot in 3 seconds, while the flagship of the same
+// family returned 503 after 503 — it is the one everybody else is also
+// queuing for. So: smallest capable first, newest among equals.
+// Deliberately not "flash": the whole family is flash, so matching it ranks
+// nothing. What distinguishes the quiet model from the contended one is the
+// size suffix on top of it.
+// Anchored to a separator, which is load-bearing: an unanchored "mini"
+// matches "geMINI", and every Gemini model then ranked as small — which
+// silently turned this ordering into a no-op.
+const SMALL = /(?:^|[-_.\/])(lite|mini|nano|small|8b|3b|haiku|scout)(?:[-_.]|$)/i;
+
+function bestFirst(a, b) {
+  const small = (SMALL.test(b) ? 1 : 0) - (SMALL.test(a) ? 1 : 0);
+  if (small) return small;
   const x = versionKey(a);
   const y = versionKey(b);
   for (let i = 0; i < Math.max(x.length, y.length); i++) {
@@ -344,7 +359,7 @@ async function candidatesFor(provider, key) {
   if (!live) return provider.fallback.slice(0, 4);
 
   const ids = live.map(idOf);
-  const discovered = live.filter(provider.vision).map(idOf).sort(newerFirst);
+  const discovered = live.filter(provider.vision).map(idOf).sort(bestFirst);
 
   // Discovery worked and this provider has nothing that can see an image.
   // Groq's catalogue, for one, is audio and text today. Trying the static
@@ -355,14 +370,14 @@ async function candidatesFor(provider, key) {
   // behind the newest.
   const backstop = provider.fallback.filter(id => ids.includes(id));
 
-  // Deep enough to get past a congested top of the list — the newest flash
-  // model is also the most contended, and the -lite variants below it are
-  // usually idle — but not so deep that walking 503s eats the whole time
-  // budget before anything is tried.
+  // Whatever worked last time goes first, then newest-first for everything
+  // else. Deep enough to get past a congested top of the list, shallow enough
+  // that walking 503s cannot eat the whole budget.
+  const proven = lastGood.get(provider.id);
   const seen = new Set();
-  return [...discovered, ...backstop]
-    .filter(id => id && !seen.has(id) && seen.add(id))
-    .slice(0, 5);
+  return [proven, ...discovered, ...backstop]
+    .filter(id => id && ids.includes(id) && !seen.has(id) && seen.add(id))
+    .slice(0, 3);
 }
 
 /* ---------------------------------------------------------------------------
@@ -378,6 +393,15 @@ async function candidatesFor(provider, key) {
 
 const cooldowns = new Map();
 
+// The model that last actually returned rows, per provider.
+//
+// Newest-first is the right default and the wrong habit: the newest flash
+// model is also the most contended, so on a free tier it 503s while an older
+// sibling answers in three seconds. Measured: walking the list cost 13-21s,
+// going straight to the known-good model costs 3. A model only earns this
+// slot by succeeding, and loses it the moment it stops.
+const lastGood = new Map();
+
 function coolingFor(id) {
   return Math.max(0, (cooldowns.get(id) || 0) - Date.now());
 }
@@ -385,7 +409,7 @@ function coolingFor(id) {
 // "You have no credits remaining" also arrives as a 429, and it will still be
 // true in sixty seconds. Telling somebody to try again in a minute, forever,
 // is worse than telling them the account needs topping up.
-const OUT_OF_CREDIT = /insufficient_quota|credit_balance|no credits|billing|payment/i;
+const OUT_OF_CREDIT = /insufficient_quota|credit_balance_exhausted|no credits remaining/i;
 
 function startCooldown(id, retryAfter, body) {
   if (OUT_OF_CREDIT.test(String(body || ''))) {
@@ -544,6 +568,7 @@ export default async (request) => {
         // Nothing found is not an answer worth keeping: let the next reader
         // have a go before telling somebody their receipt has no items in it.
         if (!rows.length) { lastError = 'found nothing in those images'; continue; }
+        lastGood.set(provider.id, model);
         return json({ rows, by: provider.label + ' · ' + model, tried });
       } catch (err) {
         lastError = err.message || String(err);
@@ -552,9 +577,11 @@ export default async (request) => {
           // A retired or misspelt name: try the next model, same provider.
           if (err.status === 404 || err.status === 400) continue;
           // 503 is one model buckling under demand, not the key running out:
-          // gemini-3.8-flash being swamped says nothing about gemini-3.7.
-          // Only move on from the provider once its list is exhausted.
-          if (err.status === 503) continue;
+          // one model being swamped says nothing about its siblings.
+          if (err.status === 503) {
+            if (lastGood.get(provider.id) === model) lastGood.delete(provider.id);
+            continue;
+          }
           if (err.status === 429 || err.status === 529) {
             const cool = startCooldown(provider.id, err.retryAfter, err.message);
             tried.push({

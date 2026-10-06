@@ -560,27 +560,48 @@ names a model as gospel:
 Live proof: the committed fallback list said `gemini-3.6-flash`; discovery
 found and used `gemini-3.8-flash` without a code change.
 
+### Picking a model: smallest that can do the job, not newest
+
+Measured against a real 14-item Blinkit screenshot:
+
+| | Time | Score |
+|---|---|---|
+| `gemini-3.5-flash-lite` | **3s** | 14/14 exact |
+| `gemini-3.8-flash` | — | `503` every time |
+
+The newest flagship is also the one everyone else is queuing for. Reading a
+receipt is not frontier work, so candidates are ordered **small first, newest
+among equals** — and whatever actually returned rows last time is tried ahead
+of everything, so a warm function goes straight to the model it knows works.
+
+That alone took a scan from 13–21 seconds (occasionally 68) to **under three**.
+
 ### What testing found
 
-Run against a real 14-item Blinkit screenshot with struck-through MRPs:
-
-- **Accuracy.** Gemini got 14/14 exact — the paid price rather than the struck
-  MRP every time, `Lady Finger ×2` as a quantity rather than a pack size, and
-  both FREE fees correctly left out. ₹792 to the rupee.
-- **Multiple images work.** 2, 3 and 5 screenshots in one scan all succeed, and
-  the model deduplicates — the prompt says consecutive shots are one order, and
-  sending the same image five times still returned 14 rows, not 70.
-- **Rate limits are not the problem; latency is.** Six scans back to back never
-  hit a limit. But one took 68 seconds, because the newest flash model is also
-  the most contended and the chain walks down through 503s.
-- **503 is per-model, 429 is per-key.** An overloaded `gemini-3.8-flash` says
-  nothing about `gemini-3.5-flash-lite`, so a 503 advances the model while a
-  429 cools the whole provider. Before this distinction the scanner gave up on
-  Gemini entirely whenever its newest model was busy.
-- **Netlify would have killed it.** Functions time out at 10s by default, 26s
-  maximum. `netlify.toml` now sets `timeout = 26` and the chain keeps its own
-  21s budget — enforced *per attempt*, not just between them, because one slow
-  call was enough to turn a 21s budget into a 68s request.
+- **Accuracy.** 14/14 exact across every run — the paid price rather than the
+  struck MRP, `Lady Finger ×2` as a quantity rather than a pack size, both
+  FREE fees correctly left out. ₹792 to the rupee.
+- **Multiple images work.** 2, 3 and 5 screenshots in one scan all succeed,
+  and the model deduplicates: the same image sent five times still returned 14
+  rows, not 70.
+- **Rate limits are generous; contention is the problem.** Four scans back to
+  back, 1.9–3.2s each, no limit hit. What used to cost twenty seconds was
+  queuing behind the flagship model, not quota.
+- **Racing the candidates is worse than ordering them.** Firing four models at
+  once to see which answers first burned the per-minute quota in one scan and
+  got everything rate-limited. Serial, well ordered, wins.
+- **503 is per-model, 429 is per-key.** An overloaded model says nothing about
+  its siblings, so a 503 advances the model while a 429 cools the provider.
+- **"No credits" is not a rate limit.** OpenAI returns both as 429. Waiting
+  sixty seconds does not add money to an account, so the two are told apart —
+  one cools for a minute, the other for an hour and says what is wrong.
+- **Netlify kills a synchronous function at 10s**, and that is *not*
+  configurable from `netlify.toml` — a `timeout` key there is a parse error
+  that fails the build. The chain keeps a 9s budget instead, enforced per
+  attempt rather than only between them.
+- **Scale screenshots by width, not longest side.** A 714×2576 receipt fitted
+  to 1600 on its longest side comes out 443px wide, throwing away the
+  dimension the text lives in and keeping the one that does not matter.
 
 `GET /.netlify/functions/scan?diagnose=1` lists every provider, whether it is
 configured, the models it will actually try today in order, and any cooldown
